@@ -210,6 +210,21 @@ class ChainmailGovernor:
                 "observe restrictions imposed by one another; wire a SQLiteStore "
                 "into AuditSink for durable restriction storage"
             )
+        # Unlike replay protection and restrictions, there is currently no
+        # durable-storage option for any of this -- wiring in a SQLiteStore
+        # does not change it, and production_mode does not (yet) refuse to
+        # start without it. Always reported, so production_mode=True is
+        # never mistaken for "everything survives a restart or extends
+        # across processes" when it doesn't.
+        weaknesses.append(
+            "live_authority (delegated authority), permission budgets, "
+            "fleet/per-agent step budgets, and provenance are in-memory only "
+            "with no durable-storage option yet -- a restart resets delegated "
+            "authority to the envelope ceiling and renews all budgets; running "
+            "multiple governor processes multiplies budgets and lets one "
+            "process's delegation be invisible to another's. production_mode "
+            "does not (yet) prevent this configuration -- see CHANGELOG.md"
+        )
         return {
             "governor_id": self.governor_id,
             "signature_required": self.config.require_signature,
@@ -223,6 +238,7 @@ class ChainmailGovernor:
             "dedupe_proposal_ids": self.config.dedupe_proposal_ids,
             "durable_replay_protection": durable_replay,
             "durable_restriction_protection": durable_restrictions,
+            "durable_authority_and_budgets": False,
             "production_mode": self.config.production_mode,
             "deployment_namespace": self.deployment_namespace,
             "weaknesses": weaknesses,

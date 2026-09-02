@@ -471,7 +471,8 @@ def test_security_report_flags_defaults(make_governor):
     assert report["quorum_configured"] is False
     assert report["durable_replay_protection"] is False
     assert report["durable_restriction_protection"] is False
-    assert len(report["weaknesses"]) == 5
+    assert report["durable_authority_and_budgets"] is False
+    assert len(report["weaknesses"]) == 6
 
 
 def test_security_report_clears_weaknesses_when_hardened(make_governor):
@@ -492,7 +493,19 @@ def test_security_report_clears_weaknesses_when_hardened(make_governor):
     assert report["quorum_configured"] is True
     assert report["durable_replay_protection"] is True
     assert report["durable_restriction_protection"] is True
-    assert report["weaknesses"] == []
+    # durable_authority_and_budgets has no wiring-in option yet (unlike
+    # replay/restrictions), so it -- and its weakness -- is always present
+    # regardless of how hardened everything else is.
+    assert report["durable_authority_and_budgets"] is False
+    assert report["weaknesses"] == [
+        "live_authority (delegated authority), permission budgets, "
+        "fleet/per-agent step budgets, and provenance are in-memory only "
+        "with no durable-storage option yet -- a restart resets delegated "
+        "authority to the envelope ceiling and renews all budgets; running "
+        "multiple governor processes multiplies budgets and lets one "
+        "process's delegation be invisible to another's. production_mode "
+        "does not (yet) prevent this configuration -- see CHANGELOG.md"
+    ]
 
 
 # -- envelope integrity ------------------------------------------------

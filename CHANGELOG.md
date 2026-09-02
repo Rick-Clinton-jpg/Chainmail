@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Changed — security_report() always names process-local authority/budget state as a weakness (independent audit, P1 #9)
+
+`live_authority` (delegated authority), permission budgets, fleet/per-agent
+step budgets, and provenance are still process-local: a restart resets
+delegated authority to the envelope ceiling and renews all budgets, and
+running multiple governor processes multiplies budgets and lets one
+process's delegation be invisible to another's. Unlike replay protection and
+restrictions, there is currently no durable-storage option for any of this
+-- wiring a `SQLiteStore` into `AuditSink` does not change it -- and
+`production_mode=True` does not (yet) refuse to start without it, so a
+security report reading "no weaknesses" could previously be read as "safe to
+run this way in production," which it is not.
+
+This is a transparency fix, not new durability: full persistence
+(atomic claim/consume operations for budgets, durable delegated authority)
+is real future work, tracked in HANDOFF.md's roadmap alongside `live_authority`,
+same as before. `security_report()` now unconditionally includes this in
+`weaknesses` (it cannot be cleared by any current configuration) and reports
+a new `durable_authority_and_budgets: False` field for programmatic checks.
+Existing tests updated: "fully hardened" no longer means zero weaknesses --
+it means every weakness that *can* currently be addressed has been.
+
 ### Fixed — production mode allowed TTL_STEPS restrictions, unsafe across processes (independent audit, P1 #8)
 
 A `TTL_STEPS`-policy restriction's expiry is (deliberately, per the durable
