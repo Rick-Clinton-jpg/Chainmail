@@ -505,7 +505,8 @@ def test_security_report_flags_defaults(make_governor):
 
 def test_security_report_clears_weaknesses_when_hardened(make_governor):
     from chainmail import (
-        AuditSink, CompositeVerifier, GovernorConfig, KeyRegistry, QuorumAggregator, SQLiteStore,
+        AuditSink, CompositeVerifier, Decision, GovernorConfig, GovernorVote, KeyRegistry,
+        QuorumAggregator, SQLiteStore, StaticPeerTransport,
     )
 
     g = make_governor(
@@ -513,12 +514,15 @@ def test_security_report_clears_weaknesses_when_hardened(make_governor):
         verifier=CompositeVerifier(KeyRegistry()),
         execution_boundary=DenyAllExecutionBoundary(),
         quorum=QuorumAggregator(),
+        quorum_transport=StaticPeerTransport(
+            peer_votes=[GovernorVote("peer-1", Decision.CONTINUE, "peer agrees")]),
         audit=AuditSink(sqlite_store=SQLiteStore()),
     )
     report = g.security_report()
     assert report["signature_enforced"] is True
     assert report["execution_boundary_wired"] is True
     assert report["quorum_configured"] is True
+    assert report["quorum_has_peer_transport"] is True
     assert report["durable_replay_protection"] is True
     assert report["durable_restriction_protection"] is True
     # durable_authority_and_budgets has no wiring-in option yet (unlike
@@ -534,6 +538,19 @@ def test_security_report_clears_weaknesses_when_hardened(make_governor):
         "process's delegation be invisible to another's. production_mode "
         "does not (yet) prevent this configuration -- see CHANGELOG.md"
     ]
+
+
+def test_security_report_flags_quorum_with_only_echo_transport(make_governor):
+    # A quorum aggregator with no real peer transport still lets a single
+    # governor's own vote pass on unanimity-of-one -- security_report() must
+    # not report this the same as real peer-governor review.
+    from chainmail import QuorumAggregator
+
+    g = make_governor(quorum=QuorumAggregator())
+    report = g.security_report()
+    assert report["quorum_configured"] is True
+    assert report["quorum_has_peer_transport"] is False
+    assert any("LocalSingleGovernorTransport" in w for w in report["weaknesses"])
 
 
 # -- envelope integrity ------------------------------------------------

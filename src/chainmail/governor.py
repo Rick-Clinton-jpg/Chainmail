@@ -189,10 +189,22 @@ class ChainmailGovernor:
                 "no real execution boundary is wired -- PermissiveExecutionBoundary "
                 "(or none at all) authorises every CONTINUE decision unconditionally"
             )
+        quorum_has_peers = self.quorum is not None and not isinstance(
+            self.quorum_transport, LocalSingleGovernorTransport
+        )
         if self.quorum is None:
             weaknesses.append(
                 "no quorum aggregator is configured -- this governor's CONTINUE "
                 "decisions are final with no peer-governor review"
+            )
+        elif not quorum_has_peers:
+            weaknesses.append(
+                "quorum is configured but quorum_transport is the default "
+                "LocalSingleGovernorTransport, which only echoes this governor's "
+                "own vote back to itself -- CONTINUE decisions still pass on "
+                "unanimity-of-one, with no actual peer-governor review; wire a "
+                "transport that collects votes from other governor processes for "
+                "real quorum protection"
             )
         durable_replay = self.audit.sqlite is not None
         if not durable_replay:
@@ -235,6 +247,7 @@ class ChainmailGovernor:
             ),
             "execution_boundary_wired": boundary_wired,
             "quorum_configured": self.quorum is not None,
+            "quorum_has_peer_transport": quorum_has_peers,
             "dedupe_proposal_ids": self.config.dedupe_proposal_ids,
             "durable_replay_protection": durable_replay,
             "durable_restriction_protection": durable_restrictions,

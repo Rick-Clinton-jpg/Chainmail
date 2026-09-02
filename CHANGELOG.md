@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Fixed — security_report() called a quorum "configured" even with no real peer transport (independent audit, P2)
+
+`security_report()`'s `quorum_configured` was `self.quorum is not None` —
+true the moment a caller passes `quorum=QuorumAggregator()`, regardless of
+`quorum_transport`. The default `quorum_transport` is
+`LocalSingleGovernorTransport`, which just echoes the evaluating governor's
+own vote back to itself; `QuorumAggregator.aggregate()` still requires
+unanimity to pass, so it isn't a no-op, but it is nowhere close to the
+peer-governor review the report implied by calling quorum "configured" with
+no accompanying weakness.
+
+Fix, in `src/chainmail/governor.py`: `security_report()` now distinguishes
+"quorum configured with a real peer transport" from "quorum configured with
+only the echo transport" (new `quorum_has_peer_transport` field). The latter
+adds a `weaknesses` entry naming `LocalSingleGovernorTransport` explicitly
+and explaining the unanimity-of-one behavior, instead of reporting no
+weakness at all.
+
+`tests/test_governor.py::test_security_report_clears_weaknesses_when_hardened`
+now wires a `StaticPeerTransport` with a peer vote (a "hardened" governor
+should have a real peer transport, not just an aggregator) and asserts
+`quorum_has_peer_transport is True`. New test
+`test_security_report_flags_quorum_with_only_echo_transport` covers the
+previously-unreported case directly.
+
 ### Fixed — the service CLI always started a dev-mode governor, silently (independent audit, P2)
 
 `python -m chainmail.service.server` unconditionally built `ChainmailGovernor
