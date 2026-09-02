@@ -22,8 +22,9 @@ Evaluation order (every failing gate returns HUMAN):
  12. step-budget restriction not exhausted
  13. contextual risk -> signal set -> decision
  14. audit "started"
- 15. execution boundary (only if CONTINUE)
- 16. quorum (only if CONTINUE)
+ 15. quorum (only if CONTINUE) -- MUST precede execution; a peer veto is
+     meaningless after the side effect has already happened
+ 16. execution boundary (only if CONTINUE, i.e. quorum also agreed)
  17. consume permission budget  (only if the final decision is CONTINUE)
  18. apply restriction          (only if the final decision is RESTRICT)
  19. audit "completed"
@@ -770,21 +771,10 @@ class ChainmailGovernor:
                               f"Audit start failed; action not executed: {type(exc).__name__}",
                               [RiskSignal.SANITIZATION_FAILURE], execution_id=execution_id)
 
-        # (15) execution boundary
-        execution_output: Any = None
-        if decision == Decision.CONTINUE and self.execution_boundary is not None:
-            try:
-                ok, msg, execution_output = self.execution_boundary.execute(proposal, current_auth.copy())
-                if not ok:
-                    decision = Decision.HUMAN
-                    reason_parts.append(f"Execution boundary rejected: {msg}")
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("execution boundary raised")
-                decision = Decision.HUMAN
-                reason_parts.append(f"Execution boundary error: {type(exc).__name__}")
-                signals.append(RiskSignal.VERIFIER_ERROR)
-
-        # (16) quorum
+        # (15) quorum -- MUST run before the execution boundary. A peer veto
+        # is meaningless once the side effect has already happened, so no
+        # governor process may execute a proposal before every configured
+        # vote is collected and aggregated to CONTINUE.
         quorum_votes: Optional[Dict[str, str]] = None
         if self.quorum is not None and decision == Decision.CONTINUE:
             own = GovernorVote(self.governor_id, Decision.CONTINUE, "; ".join(reason_parts))
@@ -799,6 +789,21 @@ class ChainmailGovernor:
                 decision = q_decision
                 reason_parts.append(f"quorum: {q_reason}")
                 signals.extend(q_signals)
+
+        # (16) execution boundary -- only once quorum (if configured) has
+        # also agreed to CONTINUE.
+        execution_output: Any = None
+        if decision == Decision.CONTINUE and self.execution_boundary is not None:
+            try:
+                ok, msg, execution_output = self.execution_boundary.execute(proposal, current_auth.copy())
+                if not ok:
+                    decision = Decision.HUMAN
+                    reason_parts.append(f"Execution boundary rejected: {msg}")
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("execution boundary raised")
+                decision = Decision.HUMAN
+                reason_parts.append(f"Execution boundary error: {type(exc).__name__}")
+                signals.append(RiskSignal.VERIFIER_ERROR)
 
         # (17) consume permission budget -- only on a real CONTINUE
         if decision == Decision.CONTINUE:

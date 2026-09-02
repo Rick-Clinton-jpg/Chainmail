@@ -64,3 +64,55 @@ def test_governor_hostile_peer_forces_human(make_governor):
     p = Proposal("q2", "agent_research", "gather", make_permission("research"), OBJ, 0.85)
     r = g.evaluate(p)
     assert r.decision == Decision.HUMAN
+
+
+def test_quorum_veto_prevents_execution(make_governor):
+    """A peer HUMAN vote must stop the action before it runs -- a veto that
+    only downgrades the *reported* decision after the execution boundary has
+    already fired is not a veto. Confirms both the decision and that the
+    execution boundary's side effect was never invoked."""
+    from chainmail import ExecutionBoundary
+
+    class RecordingExecutionBoundary(ExecutionBoundary):
+        def __init__(self):
+            self.executed = False
+
+        def execute(self, proposal, authority):
+            self.executed = True
+            return True, "executed", {"action": proposal.action}
+
+    boundary = RecordingExecutionBoundary()
+    transport = StaticPeerTransport([GovernorVote("peer-1", Decision.HUMAN, "suspicious")])
+    g = make_governor(quorum=QuorumAggregator(), quorum_transport=transport,
+                      execution_boundary=boundary)
+    p = Proposal("q3", "agent_research", "gather", make_permission("research"), OBJ, 0.85)
+    r = g.evaluate(p)
+    assert r.decision == Decision.HUMAN
+    assert boundary.executed is False
+
+
+def test_quorum_runs_before_execution_on_continue_too(make_governor):
+    """Even when the vote agrees, quorum must be collected and aggregated
+    strictly before execute() is called -- not merely produce the same final
+    decision by coincidence."""
+    from chainmail import ExecutionBoundary
+
+    order: list = []
+
+    class OrderRecordingTransport(StaticPeerTransport):
+        def collect(self, own):
+            order.append("quorum")
+            return super().collect(own)
+
+    class OrderRecordingBoundary(ExecutionBoundary):
+        def execute(self, proposal, authority):
+            order.append("execute")
+            return True, "executed", None
+
+    transport = OrderRecordingTransport([GovernorVote("peer-1", Decision.CONTINUE, "ok")])
+    g = make_governor(quorum=QuorumAggregator(), quorum_transport=transport,
+                      execution_boundary=OrderRecordingBoundary())
+    p = Proposal("q4", "agent_research", "gather", make_permission("research"), OBJ, 0.85)
+    r = g.evaluate(p)
+    assert r.decision == Decision.CONTINUE
+    assert order == ["quorum", "execute"]

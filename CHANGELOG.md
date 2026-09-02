@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Fixed — quorum ran after execution, not before it (independent audit, P0 #1)
+
+`ChainmailGovernor.evaluate()` called `execution_boundary.execute()` (step 15)
+*before* collecting and aggregating quorum votes (step 16). A peer governor's
+`HUMAN` veto still produced a `HUMAN` final decision, but only after the real
+side effect had already run through the execution boundary — the veto arrived
+too late to prevent anything. Reordered: quorum is now collected and
+aggregated first; the execution boundary only runs once quorum (when
+configured) has also agreed to `CONTINUE`. New tests in `tests/test_quorum.py`
+assert the execution boundary is never invoked when a peer vetoes, and that
+execution strictly follows quorum in the CONTINUE case too (not just by
+coincidence of the same final decision).
+
 Response to the independent technical assessment's Priority 0 finding
 ("Secure Behaviour Should Be the Default"): the permissive defaults needed
 for local development and testing were silent about the protections they
