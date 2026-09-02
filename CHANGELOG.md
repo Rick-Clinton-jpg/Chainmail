@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Fixed — a caller-held proposal object could be mutated after verification and before execution (independent audit, P0 #3)
+
+`Proposal` is a mutable dataclass (`sign_proposal()` itself mutates
+`.nonce`/`.signature` in place). `evaluate()` operated on the exact object
+the caller passed in, from the first check through to
+`execution_boundary.execute()`, holding no copy of its own. Anything with a
+live reference to that object -- a caller on another thread, or (as
+demonstrated in the new test) a hostile pluggable component like an
+embedding engine's `similarity()` hook that legitimately runs partway
+through evaluation -- could mutate `payload` (e.g. a verified filesystem
+path) after schema/traversal validation had already passed it, and the
+execution boundary would receive the mutated value instead of what was
+checked.
+
+Fix: `_evaluate_locked()` now deep-copies the incoming proposal as its very
+first action, before any check runs, and every subsequent check, the audit
+log, and the execution boundary all operate on that snapshot. Nothing the
+caller (or a mid-evaluation hook) does to the original object afterward can
+reach a check or the executor. New test
+(`test_post_verification_mutation_cannot_reach_execution` in
+`tests/test_governor.py`): a hostile embedding engine mutates a verified
+`"file": "repo/src/main.py"` payload to `"../../etc/passwd"` mid-evaluation;
+confirms the execution boundary still receives `"repo/src/main.py"`.
+
 ### Fixed — proposal signature didn't bind confidence or assumptions (independent audit, P0 #2)
 
 `Proposal.signing_dict()` omitted `confidence` and `assumptions`, even though

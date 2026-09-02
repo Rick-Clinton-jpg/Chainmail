@@ -574,6 +574,15 @@ class ChainmailGovernor:
             return result
 
     def _evaluate_locked(self, proposal: Proposal) -> GovernanceResult:
+        # Snapshot immediately: Proposal is a mutable dataclass (sign_proposal
+        # itself mutates .nonce/.signature in place), so the caller retains a
+        # live reference to whatever object it passed in. Every check below,
+        # the audit log, and -- critically -- the execution boundary must all
+        # observe the exact same values that were verified; deep-copying here,
+        # before any check runs, and rebinding `proposal` to the copy makes
+        # that true structurally. Nothing the caller does to its own
+        # reference after this point can reach a check or the executor.
+        proposal = deepcopy(proposal)
         execution_id = secrets.token_hex(8)
 
         # (1) envelope integrity

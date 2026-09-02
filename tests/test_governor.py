@@ -335,6 +335,48 @@ def test_execution_boundary_exception_fail_closed(make_governor):
     assert r.decision == Decision.HUMAN and RiskSignal.VERIFIER_ERROR in r.signals
 
 
+# -- proposal immutability during evaluation --------------------------
+
+def test_post_verification_mutation_cannot_reach_execution(make_governor):
+    """Proposal is a mutable dataclass; the caller keeps a live reference to
+    whatever object it passed to evaluate(). Something that runs mid-evaluate
+    (here: a hostile embedding engine's similarity() hook, invoked well after
+    the path-safety check and well before the execution boundary) must not be
+    able to mutate the *original* object and have that mutation reach the
+    execution boundary -- evaluate() snapshots at entry precisely so a path
+    that passed schema/traversal validation is what the boundary receives."""
+    from conftest import JaccardEmbeddingEngine
+
+    captured_payload = {}
+
+    class RecordingExecutionBoundary:
+        def execute(self, proposal, authority):
+            captured_payload.update(proposal.payload)
+            return True, "executed", None
+
+    proposal = prop("mut1", "agent_coder", "write_code", make_permission("code", "write"),
+                    payload={"file": "repo/src/main.py"})
+
+    class MutatingEmbeddingEngine(JaccardEmbeddingEngine):
+        def similarity(self, text_a, text_b):
+            # fires during contextual-risk evaluation, well after the path
+            # check and well before the execution boundary -- attacker's
+            # last plausible chance to swap the payload before execution
+            proposal.payload["file"] = "../../etc/passwd"
+            return super().similarity(text_a, text_b)
+
+    g = make_governor(embedding=MutatingEmbeddingEngine(),
+                      execution_boundary=RecordingExecutionBoundary())
+    r = g.evaluate(proposal)
+
+    assert r.decision == Decision.CONTINUE
+    assert captured_payload["file"] == "repo/src/main.py"
+    # the caller's original object was mutated (that's expected -- it's
+    # theirs), but it's a different object from whatever the governor
+    # evaluated and executed
+    assert proposal.payload["file"] == "../../etc/passwd"
+
+
 # -- security diagnostics -----------------------------------------------
 
 def test_security_report_flags_defaults(make_governor):
