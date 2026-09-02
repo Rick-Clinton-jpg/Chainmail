@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+### Fixed — the service CLI always started a dev-mode governor, silently (independent audit, P2)
+
+`python -m chainmail.service.server` unconditionally built `ChainmailGovernor
+(build_demo_envelope(), config=GovernorConfig(), ...)` — the built-in demo
+envelope and a non-production config with `require_signature=False` — no
+matter what flags an operator passed. Following the README's own example
+(`--socket ... --sqlite ... --hash-chain ...`) got you a durable audit trail
+wrapped around a governor that verified no signatures and enforced the demo
+app's objective/permission set, not your deployment's. The only signal
+anything was off was an internal `logger.warning` call, easy to miss at
+default log levels.
+
+Fix, in `src/chainmail/service/server.py`:
+- New `--production` flag builds `GovernorConfig.production()` instead of
+  `GovernorConfig()`. It requires `--sqlite` and at least one signing key
+  (new `--hmac-key kid:agent_id:hex_secret` / `--ed25519-pubkey
+  kid:agent_id:path_to_pem`, both repeatable) — missing either is a clear
+  `argparse` error, not a silent fallback or the governor's generic
+  `ValueError`.
+- New `_build_verifier()` turns those key flags into a `CompositeVerifier`
+  (`KeyRegistry`-backed), wired into the governor as `verifier=`.
+- The demo envelope's default `RestrictPolicy.TTL_STEPS` is incompatible with
+  `production_mode` (step-based expiry isn't durable/multi-process-safe, per
+  the P1 #8 fix) — `--production` now swaps it to `TTL_WALLCLOCK` so the flag
+  is actually usable without a hand-built envelope; a real deployment should
+  still supply its own `AuthorityEnvelope`.
+- Without `--production`, the CLI now prints an explicit warning to stderr
+  (not just the internal logger) naming exactly what's not enforced.
+- `main()` gained a private `_block=` parameter (defaults to the real
+  `threading.Event().wait()`) purely so tests can make it return without
+  patching the shared `threading.Event` class.
+
+New tests in `tests/test_service.py`: `_build_verifier` returns `None` with no
+keys, builds a working `CompositeVerifier` from an HMAC spec, and raises
+`SystemExit` on a malformed spec; `--production` without `--sqlite` and
+without a key both raise `SystemExit`; and an end-to-end CLI test asserting
+the dev-mode warning prints without `--production` and does not print with
+`--production --sqlite ... --hmac-key ...` (which must construct
+successfully). README's service example updated to show `--production`.
+
 ### Fixed — the mutation harness could execute real actions and misreport invariant coverage (independent audit, P1 #12)
 
 `MutationRunner.run()` evaluated every mutant against whatever governor the

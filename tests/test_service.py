@@ -8,9 +8,11 @@ import threading
 import pytest
 
 from chainmail import (
-    Authority, ChainmailGovernor, GovernorConfig, Proposal, TfidfEmbeddingEngine, make_permission,
+    ALGO_HMAC, Authority, ChainmailGovernor, GovernorConfig, Proposal, TfidfEmbeddingEngine,
+    make_permission, sign_proposal,
 )
 from chainmail.service import CallerIdentity, GovernorClient, GovernorClientError, UnixSocketGovernorServer
+from chainmail.service.server import _build_verifier, main
 
 OBJ = "Build a secure multi-agent governance prototype"
 
@@ -214,3 +216,66 @@ def test_concurrent_clients(running_server):
         t.join()
     assert not errors
     assert g.step_count == 5 * 20
+
+
+# -- CLI: --production must not silently fall back to a dev-mode governor --
+
+def test_build_verifier_returns_none_with_no_keys():
+    assert _build_verifier([], []) is None
+
+
+def test_build_verifier_hmac_key_verifies_a_signed_proposal():
+    secret = b"shared-secret-value"
+    verifier = _build_verifier([f"k-hmac:agent_research:{secret.hex()}"], [])
+    p = sign_proposal(
+        Proposal("s1", "agent_research", "gather", make_permission("research"), OBJ, 0.85),
+        "k-hmac", algorithm=ALGO_HMAC, hmac_secret=secret,
+    )
+    result = verifier.verify(p)
+    assert result.valid
+
+
+def test_build_verifier_rejects_malformed_spec():
+    with pytest.raises(SystemExit):
+        _build_verifier(["not-enough-parts"], [])
+
+
+def test_cli_production_requires_sqlite(short_tmpdir):
+    sock = os.path.join(short_tmpdir, "g.sock")
+    with pytest.raises(SystemExit):
+        main(["--socket", sock, "--production", "--allow-no-auth"])
+
+
+def test_cli_production_requires_a_key(short_tmpdir):
+    sock = os.path.join(short_tmpdir, "g.sock")
+    db = os.path.join(short_tmpdir, "audit.db")
+    with pytest.raises(SystemExit):
+        main(["--socket", sock, "--production", "--sqlite", db, "--allow-no-auth"])
+
+
+def _dont_block():
+    # Stands in for main()'s normal "serve forever" wait: returns immediately
+    # via the same KeyboardInterrupt path an operator's Ctrl-C would take, so
+    # the test can assert on what main() did before/around starting the
+    # server without actually blocking.
+    raise KeyboardInterrupt
+
+
+def test_cli_dev_mode_warns_and_production_starts_signature_enforcing(short_tmpdir, capsys):
+    # Dev mode (no --production): must print an explicit warning, not stay silent.
+    sock = os.path.join(short_tmpdir, "dev.sock")
+    rc = main(["--socket", sock, "--allow-no-auth"], _block=_dont_block)
+    assert rc == 0
+    assert "WITHOUT --production" in capsys.readouterr().err
+
+    # Production mode: with --sqlite and a key, construction must succeed
+    # (GovernorConfig.production() + a real verifier + durable storage) and
+    # the dev-mode warning must not print.
+    sock2 = os.path.join(short_tmpdir, "prod.sock")
+    db = os.path.join(short_tmpdir, "audit.db")
+    secret = b"shared-secret-value"
+    rc = main(["--socket", sock2, "--production", "--sqlite", db,
+              "--hmac-key", f"k-hmac:agent_research:{secret.hex()}",
+              "--allow-no-auth"], _block=_dont_block)
+    assert rc == 0
+    assert "WITHOUT --production" not in capsys.readouterr().err

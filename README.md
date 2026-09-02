@@ -277,8 +277,19 @@ CHAINMAIL_TOKEN=$(openssl rand -hex 16) \
 python -m chainmail.service.server \
     --socket /run/chainmail.sock \
     --sqlite /var/lib/chainmail/audit.db \
-    --hash-chain /var/lib/chainmail/audit.jsonl
+    --hash-chain /var/lib/chainmail/audit.jsonl \
+    --production \
+    --hmac-key k1:agent_research:$(openssl rand -hex 32)
 ```
+
+Without `--production`, the CLI starts a **development** governor: it prints a
+warning to stderr, does not require or verify signatures, and uses the
+built-in demo `AuthorityEnvelope` rather than a deployment-specific one — the
+same demo objective and permission set the tests and `demo_v5.py` use, not
+your application's actual authority boundaries. `--production` requires
+`--sqlite` and at least one `--hmac-key kid:agent_id:hex_secret` or
+`--ed25519-pubkey kid:agent_id:path_to_pem` (repeatable), and wires
+`GovernorConfig.production()` plus a real `CompositeVerifier`.
 
 ```python
 from chainmail.service import GovernorClient

@@ -30,12 +30,17 @@ import hmac
 import logging
 import os
 import socket
+import sys
 import threading
 from dataclasses import dataclass
-from typing import Dict, Optional, Union
+from typing import Callable, Dict, Optional, Union
+
+import dataclasses
 
 from ..builders import build_demo_envelope
 from ..config import GovernorConfig
+from ..core import RestrictPolicy
+from ..crypto import ALGO_ED25519, ALGO_HMAC, CompositeVerifier, KeyRegistry
 from ..governor import ChainmailGovernor
 from ..persistence import AuditSink, HashChainLog, SQLiteStore
 from .protocol import (
@@ -257,7 +262,31 @@ class UnixSocketGovernorServer:
 # CLI entry point
 # ----------------------------------------------------------------------
 
-def main(argv: Optional[list] = None) -> int:
+def _build_verifier(hmac_keys: list, ed25519_keys: list) -> Optional[CompositeVerifier]:
+    """Build a CompositeVerifier from --hmac-key/--ed25519-pubkey CLI values, or
+    None if none were supplied."""
+    if not hmac_keys and not ed25519_keys:
+        return None
+    registry = KeyRegistry()
+    for raw in hmac_keys:
+        try:
+            kid, agent_id, hex_secret = raw.split(":", 2)
+        except ValueError:
+            raise SystemExit(
+                f"--hmac-key must be kid:agent_id:hex_secret, got {raw!r}")
+        registry.add_key(kid, agent_id, ALGO_HMAC, bytes.fromhex(hex_secret))
+    for raw in ed25519_keys:
+        try:
+            kid, agent_id, pem_path = raw.split(":", 2)
+        except ValueError:
+            raise SystemExit(
+                f"--ed25519-pubkey must be kid:agent_id:path_to_pem, got {raw!r}")
+        with open(pem_path, "rb") as fh:
+            registry.add_key(kid, agent_id, ALGO_ED25519, fh.read())
+    return CompositeVerifier(registry)
+
+
+def main(argv: Optional[list] = None, *, _block: Optional[Callable[[], None]] = None) -> int:
     parser = argparse.ArgumentParser(description="Run a Chainmail v5 governor over a Unix socket.")
     parser.add_argument("--socket", required=True, help="Unix socket path to listen on")
     parser.add_argument("--token", help="single shared auth token (or set CHAINMAIL_TOKEN)")
@@ -267,6 +296,16 @@ def main(argv: Optional[list] = None) -> int:
                         help="start without authentication (loopback / testing only)")
     parser.add_argument("--sqlite", help="path to the SQLite audit DB (default: in-memory)")
     parser.add_argument("--hash-chain", help="path to the hash-chain JSONL audit log")
+    parser.add_argument("--production", action="store_true",
+                        help="use GovernorConfig.production() -- requires --sqlite and at "
+                             "least one --hmac-key/--ed25519-pubkey; refuses unsigned "
+                             "proposals and in-memory-only replay protection")
+    parser.add_argument("--hmac-key", action="append", default=[],
+                        help="kid:agent_id:hex_secret -- repeatable, registers an HMAC "
+                             "verification key")
+    parser.add_argument("--ed25519-pubkey", action="append", default=[],
+                        help="kid:agent_id:path_to_pem -- repeatable, registers an Ed25519 "
+                             "public-key verification key")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -280,11 +319,39 @@ def main(argv: Optional[list] = None) -> int:
         token_map = _json.loads(tokens_raw)
         if not isinstance(token_map, dict) or not all(isinstance(v, str) for v in token_map.values()):
             parser.error("--tokens / CHAINMAIL_TOKENS must be a JSON object of {token: label}")
+
+    verifier = _build_verifier(args.hmac_key, args.ed25519_pubkey)
+
+    if args.production:
+        if not args.sqlite:
+            parser.error("--production requires --sqlite (durable replay/restriction storage)")
+        if verifier is None:
+            parser.error("--production requires at least one --hmac-key or --ed25519-pubkey")
+        config = GovernorConfig.production()
+    else:
+        config = GovernorConfig()
+        print(
+            "chainmail service: starting WITHOUT --production -- this is a development "
+            "configuration: proposal signatures are not enforced (any caller can act as "
+            "any agent) and it uses the built-in demo authority envelope, not a "
+            "deployment-specific one. Pass --production with --sqlite and a signing key "
+            "for a real deployment.",
+            file=sys.stderr,
+        )
+
     audit = AuditSink(
         hash_chain=HashChainLog(args.hash_chain) if args.hash_chain else None,
         sqlite_store=SQLiteStore(args.sqlite) if args.sqlite else None,
     )
-    governor = ChainmailGovernor(build_demo_envelope(), config=GovernorConfig(), audit=audit)
+    envelope = build_demo_envelope()
+    if args.production and envelope.restrict_policy == RestrictPolicy.TTL_STEPS:
+        # The demo envelope's default TTL_STEPS restriction policy is
+        # rejected by production_mode (step-based expiry isn't durable or
+        # multi-process-safe) -- see ChainmailGovernor.__init__. Fall back to
+        # TTL_WALLCLOCK so --production is usable without a custom envelope;
+        # a real deployment should still supply its own AuthorityEnvelope.
+        envelope = dataclasses.replace(envelope, restrict_policy=RestrictPolicy.TTL_WALLCLOCK)
+    governor = ChainmailGovernor(envelope, config=config, audit=audit, verifier=verifier)
 
     server = UnixSocketGovernorServer(
         governor, args.socket, auth_token=token, auth_tokens=token_map,
@@ -292,7 +359,7 @@ def main(argv: Optional[list] = None) -> int:
     )
     server.start()
     try:
-        threading.Event().wait()
+        (_block or (lambda: threading.Event().wait()))()
     except KeyboardInterrupt:
         pass
     finally:
