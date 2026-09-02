@@ -379,6 +379,48 @@ def _finite_unit(value: Any) -> bool:
         and not math.isnan(value) and not math.isinf(value) and 0.0 <= value <= 1.0
 
 
+# Bounds enforced by _payload_within_limits, below.
+_PAYLOAD_MAX_DEPTH = 8
+_PAYLOAD_MAX_NODES = 10_000
+_PAYLOAD_MAX_STRING_LEN = 65_536
+_PAYLOAD_MAX_KEY_LEN = 256
+
+
+def _payload_within_limits(value: Any, *, depth: int = 0, budget: List[int]) -> bool:
+    """Bounds a proposal payload's size and shape before it reaches anything
+    that would walk or serialise it -- signature verification's
+    ``canonical_signing_bytes`` (``json.dumps`` on the full payload) and
+    schema validation's nested-payload check both run *after*
+    ``structural_problems()``, which is where this is called from. Without
+    this, a deeply nested or very large payload -- signed or not -- would be
+    fully serialised/walked before either of those ever gets a chance to
+    reject it, a real (if bounded-effort) DoS surface. ``depth`` is capped
+    directly (no risk of hitting Python's own recursion limit), and
+    ``budget`` -- a shared single-element counter, decremented per node
+    visited -- caps total work regardless of shape: deep-and-narrow,
+    shallow-and-wide, or many medium-sized siblings all hit the same total
+    ceiling."""
+    if depth > _PAYLOAD_MAX_DEPTH:
+        return False
+    budget[0] -= 1
+    if budget[0] < 0:
+        return False
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if not isinstance(k, str) or len(k) > _PAYLOAD_MAX_KEY_LEN:
+                return False
+            if not _payload_within_limits(v, depth=depth + 1, budget=budget):
+                return False
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_payload_within_limits(item, depth=depth + 1, budget=budget) for item in value)
+    if isinstance(value, str):
+        return len(value) <= _PAYLOAD_MAX_STRING_LEN
+    if value is None or isinstance(value, (bool, int, float)):
+        return True
+    return False
+
+
 @dataclass
 class Proposal:
     proposal_id: str
@@ -425,6 +467,13 @@ class Proposal:
             problems.append("payload must be a dict")
         elif any(not isinstance(k, str) for k in self.payload):
             problems.append("payload keys must be strings")
+        elif not _payload_within_limits(self.payload, budget=[_PAYLOAD_MAX_NODES]):
+            problems.append(
+                f"payload exceeds size/shape limits (max nesting depth "
+                f"{_PAYLOAD_MAX_DEPTH}, max {_PAYLOAD_MAX_NODES} total values, "
+                f"max string length {_PAYLOAD_MAX_STRING_LEN}, max key length "
+                f"{_PAYLOAD_MAX_KEY_LEN})"
+            )
         return problems
 
     def signing_dict(self) -> Dict[str, Any]:

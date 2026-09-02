@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Fixed — a proposal's payload had no size/depth bound before signature verification and schema validation ran (independent audit, P2)
+
+`Proposal.structural_problems()` -- checked at construction (`__post_init__`)
+and re-checked by the governor for a proposal that reached it without going
+through the constructor (e.g. over the wire) -- only verified `payload` was
+a dict with string keys. No size, depth, or per-value bound existed. That
+matters because `structural_problems()` runs *before* signature verification
+(`_verify_signature` → `canonical_signing_bytes` → `json.dumps` on the
+*entire* payload, signed or not, as long as `proposal.signature` is
+non-empty) and before `ActionSchema.validate()`'s own nested-payload check --
+so a deeply nested, very wide, or huge-string payload was fully serialised
+or walked before anything got a chance to reject it. A bounded-effort DoS,
+reachable by anyone who can get a `Proposal` to `evaluate()` (over the
+service socket, or in-process).
+
+Fix, in `src/chainmail/core.py`: new `_payload_within_limits()`, called from
+`structural_problems()` right after the existing dict/string-key checks --
+the earliest point in the pipeline, closing the gap regardless of whether a
+signature is present. Bounds: max nesting depth 8 (checked directly, no
+reliance on hitting Python's own recursion limit), max 10,000 total values
+visited (a single shared counter, so deep-narrow, shallow-wide, and
+many-medium-siblings shapes all hit the same ceiling), max string length
+65,536, max payload-key length 256.
+
+New `tests/test_core.py`: a normal payload is accepted; deep nesting, a wide
+flat payload, a huge string value, many medium-sized list siblings (bounded
+by the total node budget, not depth or single-value size), and an overlong
+key are each rejected with the new message; and a proposal built via
+`Proposal.__new__` (bypassing `__post_init__`) with a hostile payload is
+still caught when the governor re-validates it in `evaluate()`.
+
 ### Fixed — the service accepted unlimited concurrent connections, one thread each (independent audit, P2)
 
 `UnixSocketGovernorServer._accept_loop()` spawned a new daemon thread for
