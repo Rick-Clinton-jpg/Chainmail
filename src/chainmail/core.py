@@ -104,10 +104,32 @@ class Authority:
         return any(p.covers(required) for p in self.permissions)
 
     def _match(self, required: Permission) -> Optional[Permission]:
-        for p in self.permissions:
-            if p.covers(required):
-                return p
-        return None
+        """Return the permission in ``self.permissions`` that authorises
+        ``required``, or None.
+
+        More than one permission can cover the same requirement -- e.g. a
+        wildcard-scope permission and a specific-scope one for the same
+        name, acquired through separate delegations. ``self.permissions``
+        is a plain ``Set``, whose iteration order depends on
+        ``PYTHONHASHSEED`` (Python randomises string hashing per process by
+        default): picking "whichever comes first" would make which budget
+        governs a given action -- and therefore whether it's allowed --
+        vary between runs with no policy behind the difference. When there
+        is more than one match, this deterministically prefers the most
+        restrictive one (smallest ``max_budget``; a bounded permission
+        always outranks an unbounded one), breaking any remaining tie on
+        ``(name, scope)`` -- fail-closed and reproducible, matching the rest
+        of this module's posture."""
+        candidates = [p for p in self.permissions if p.covers(required)]
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        candidates.sort(key=lambda p: (
+            p.max_budget is None, p.max_budget if p.max_budget is not None else 0,
+            p.name, p.scope,
+        ))
+        return candidates[0]
 
     def has_budget(self, required: Permission) -> bool:
         p = self._match(required)

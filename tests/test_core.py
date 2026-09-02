@@ -1,8 +1,12 @@
-"""Proposal structural validation -- payload size/shape bounds."""
+"""Proposal structural validation (payload size/shape bounds) and Authority
+permission matching (deterministic selection among overlapping permissions)."""
 
 import pytest
 
-from chainmail import Decision, GovernorConfig, Proposal, RiskSignal, TfidfEmbeddingEngine, make_permission
+from chainmail import (
+    Authority, Decision, GovernorConfig, Permission, Proposal, RiskSignal, TfidfEmbeddingEngine,
+    make_permission,
+)
 
 OBJ = "Build a secure multi-agent governance prototype"
 
@@ -82,3 +86,47 @@ def test_governor_re_validates_a_hostile_payload_reaching_evaluate_without_const
     result = g.evaluate(p)
     assert result.decision == Decision.HUMAN
     assert RiskSignal.INVALID_PROPOSAL in result.signals
+
+
+# -- Authority._match(): deterministic selection among overlapping permissions --
+
+def test_match_is_deterministic_regardless_of_set_insertion_order():
+    wildcard = Permission("deploy", "*", max_budget=None)
+    specific = Permission("deploy", "prod", max_budget=2)
+    required = Permission("deploy", "prod")
+
+    for members in ([wildcard, specific], [specific, wildcard]):
+        matched = Authority(permissions=set(members))._match(required)
+        assert matched == specific
+
+
+def test_match_prefers_the_more_restrictive_bounded_permission_over_unbounded():
+    # Two overlapping permissions can both legitimately cover the same
+    # requirement (e.g. acquired via separate delegations). Whichever one
+    # governs a budget check must not depend on Set iteration order --
+    # the bounded one is deterministically preferred (fail-closed).
+    unbounded = Permission("deploy", "prod", max_budget=None)
+    bounded = Permission("deploy", "prod", max_budget=5)
+    a = Authority(permissions={unbounded, bounded})
+    matched = a._match(Permission("deploy", "prod"))
+    assert matched == bounded
+
+
+def test_match_picks_the_smaller_budget_among_two_bounded_matches():
+    tight = Permission("deploy", "prod", max_budget=1)
+    loose = Permission("deploy", "prod", max_budget=100)
+    for members in ({tight, loose}, {loose, tight}):
+        matched = Authority(permissions=members)._match(Permission("deploy", "prod"))
+        assert matched == tight
+
+
+def test_has_budget_and_consume_budget_use_the_deterministic_match():
+    tight = Permission("deploy", "prod", max_budget=1)
+    loose_wildcard = Permission("deploy", "*", max_budget=None)
+    a = Authority(permissions={tight, loose_wildcard})
+    required = Permission("deploy", "prod")
+    assert a.has_budget(required) is True
+    assert a.consume_budget(required) is True
+    assert a.budget_remaining[tight.key()] == 0
+    assert a.has_budget(required) is False   # the tight match is now exhausted,
+    assert a.consume_budget(required) is False  # not silently falling back to the wildcard

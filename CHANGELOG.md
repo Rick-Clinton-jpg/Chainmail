@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Fixed — Authority permission matching picked an arbitrary permission among overlapping matches (independent audit, P2)
+
+`Authority._match()` returned the first permission in `self.permissions`
+(a plain `Set[Permission]`) that `covers()` a required permission. More
+than one permission can legitimately cover the same requirement -- e.g. a
+wildcard-scope permission and a specific-scope one for the same name,
+acquired through separate delegations. Set iteration order for objects
+whose hash depends on strings varies with `PYTHONHASHSEED`, which Python
+randomises per process by default: which permission "won" -- and therefore
+which `max_budget`/remaining count governed `has_budget()` /
+`consume_budget()` / `is_subset_of()` / `clamp_to_ceiling()` for that
+requirement -- could differ between runs of the identical program with no
+policy behind the difference.
+
+Fix, in `src/chainmail/core.py`: `Authority._match()` now collects every
+covering permission and, when there's more than one, deterministically
+picks the most restrictive: a bounded (`max_budget` is not `None`)
+permission always outranks an unbounded one, and among bounded matches the
+smaller `max_budget` wins; remaining ties break on `(name, scope)`. Same
+result every run, independent of hash seed or insertion order, and
+fail-closed when genuinely ambiguous.
+
+New tests in `tests/test_core.py`: the match is identical across both
+insertion orders of an ambiguous {wildcard, specific} pair; a bounded
+permission is preferred over an overlapping unbounded one; the smaller of
+two bounded matches wins; and `has_budget()`/`consume_budget()` are shown
+to actually use the deterministic match (exhausting the tight permission's
+budget does not silently fall back to an overlapping wildcard).
+
 ### Fixed — a proposal's payload had no size/depth bound before signature verification and schema validation ran (independent audit, P2)
 
 `Proposal.structural_problems()` -- checked at construction (`__post_init__`)
