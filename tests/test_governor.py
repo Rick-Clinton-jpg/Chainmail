@@ -343,22 +343,27 @@ def test_security_report_flags_defaults(make_governor):
     assert report["signature_enforced"] is False
     assert report["execution_boundary_wired"] is False
     assert report["quorum_configured"] is False
-    assert len(report["weaknesses"]) == 3
+    assert report["durable_replay_protection"] is False
+    assert len(report["weaknesses"]) == 4
 
 
 def test_security_report_clears_weaknesses_when_hardened(make_governor):
-    from chainmail import CompositeVerifier, GovernorConfig, KeyRegistry, QuorumAggregator
+    from chainmail import (
+        AuditSink, CompositeVerifier, GovernorConfig, KeyRegistry, QuorumAggregator, SQLiteStore,
+    )
 
     g = make_governor(
         config=GovernorConfig(require_signature=True),
         verifier=CompositeVerifier(KeyRegistry()),
         execution_boundary=DenyAllExecutionBoundary(),
         quorum=QuorumAggregator(),
+        audit=AuditSink(sqlite_store=SQLiteStore()),
     )
     report = g.security_report()
     assert report["signature_enforced"] is True
     assert report["execution_boundary_wired"] is True
     assert report["quorum_configured"] is True
+    assert report["durable_replay_protection"] is True
     assert report["weaknesses"] == []
 
 

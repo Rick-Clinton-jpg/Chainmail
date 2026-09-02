@@ -52,6 +52,62 @@ with no change in behaviour:
   docstring no longer names Armour as the thing it wraps — it wraps any
   compatible `(proposal, authority) -> (ok, message, output)` callable.
 
+### New — durable nonce / proposal-ID replay protection
+
+Response to Priority 1 ("Durable Governance State") from the independent
+technical assessment, scoped to nonces and proposal IDs only (restrictions
+and budgets are unchanged, tracked separately). Previously, `_seen_nonces`
+and `_seen_proposal_ids` lived only in process RAM: a restart silently
+dropped replay protection, and nothing prevented two governor processes
+sharing one SQLite database from both accepting the same identifier.
+
+- `SQLiteStore` schema bumped to v2: new `replay_nonces` and
+  `replay_proposal_ids` tables, each with a `UNIQUE (scope, identifier)`
+  constraint. An older v1 database is migrated in place (additive-only:
+  existing tables and rows are untouched) the next time it's opened.
+- `SQLiteStore.claim_nonce()` / `claim_proposal_id()` — a claim is a single
+  atomic `INSERT`; there is no separate check-then-insert. A `UNIQUE`
+  conflict (`sqlite3.IntegrityError`) *is* the replay signal, so two
+  governor processes racing on the same identifier against a shared
+  database cannot both win. Any other `sqlite3.Error` propagates to the
+  caller as a persistence failure, not a "not a replay" result.
+- When a `ChainmailGovernor` is constructed with a `SQLiteStore` wired into
+  its `AuditSink`, nonce and proposal-ID claims become durable
+  automatically — no extra opt-in. Without one, behaviour is unchanged
+  (in-memory only), and `security_report()` now flags that as a weakness.
+- Claims happen only *after* a proposal's signature (if any) is verified,
+  so an attacker who cannot forge a valid signature can never claim (and so
+  can never poison) an identifier a legitimate, correctly-signed proposal
+  will need later.
+- Fail-closed: if the durable store cannot commit a claim (disk full,
+  locked, corrupt, ...), the governor returns `HUMAN` /
+  `REPLAY_STORE_UNAVAILABLE` — never `CONTINUE` — and best-effort records
+  the failure to the hash-chain log if one is configured.
+- An in-memory LRU cache still front-runs the durable store for speed (a
+  cache hit is always backed by a prior durable claim, so it's safe to
+  trust; a cache miss always falls through to the atomic DB claim — cache
+  eviction never weakens the guarantee).
+- Documented scope: nonce uniqueness is **per agent** (bound to
+  `deployment_namespace` + envelope/policy fingerprint + `agent_id` — not
+  `key_id`, so a nonce stays blocked across that agent's key rotation).
+  Proposal-ID uniqueness is **fleet-wide** (namespace + envelope fingerprint
+  only), matching the pre-durability in-memory behaviour. Both reset on a
+  genuine envelope/policy change (the fingerprint changes). New
+  `ChainmailGovernor(..., deployment_namespace="default")` constructor
+  parameter lets multiple deployments share one physical database file.
+- The non-durable in-memory nonce cache is now also scoped per agent (it
+  previously was not, which was inconsistent with the documented durable
+  scope and could over-block two different agents that happened to pick the
+  same nonce string).
+- New `RiskSignal.REPLAY_STORE_UNAVAILABLE`.
+- 12 new tests in `tests/test_replay_persistence.py`: survival across a
+  simulated restart (separate `SQLiteStore` instances over the same file),
+  two governors racing on one nonce, an invalid signature failing to poison
+  a nonce, a forced persistence failure never reaching `CONTINUE`, migration
+  of a hand-built v1 database, cache eviction not weakening protection, and
+  the documented scope (per-agent nonces, fleet-wide proposal IDs, survival
+  across key rotation, reset on envelope change).
+
 ## v5.1.0
 
 Hardening pulled from the sibling projects (all PolyForm NC 1.0.0):

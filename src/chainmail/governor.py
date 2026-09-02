@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+import sqlite3
 import threading
 import time
 from collections import Counter, OrderedDict
@@ -73,10 +74,12 @@ class ChainmailGovernor:
         quorum_transport: Optional[VoteTransport] = None,
         governor_id: str = "governor-0",
         auto_embedding: bool = True,
+        deployment_namespace: str = "default",
     ) -> None:
         self.envelope = envelope
         self.config = config or GovernorConfig()
         self.governor_id = governor_id
+        self.deployment_namespace = deployment_namespace
         self.execution_boundary = execution_boundary
         self.audit = audit or AuditSink()
         self.verifier: ApprovalVerifier = verifier or NullApprovalVerifier()
@@ -166,6 +169,14 @@ class ChainmailGovernor:
                 "no quorum aggregator is configured -- this governor's CONTINUE "
                 "decisions are final with no peer-governor review"
             )
+        durable_replay = self.audit.sqlite is not None
+        if not durable_replay:
+            weaknesses.append(
+                "nonce and proposal-ID replay protection is in-memory only -- a "
+                "restart or crash silently drops it, and it offers no protection "
+                "across multiple governor processes; wire a SQLiteStore into "
+                "AuditSink for durable, atomic replay protection"
+            )
         return {
             "governor_id": self.governor_id,
             "signature_required": self.config.require_signature,
@@ -177,6 +188,8 @@ class ChainmailGovernor:
             "execution_boundary_wired": boundary_wired,
             "quorum_configured": self.quorum is not None,
             "dedupe_proposal_ids": self.config.dedupe_proposal_ids,
+            "durable_replay_protection": durable_replay,
+            "deployment_namespace": self.deployment_namespace,
             "weaknesses": weaknesses,
         }
 
@@ -213,6 +226,103 @@ class ChainmailGovernor:
         table.move_to_end(key)
         while len(table) > cap:
             table.popitem(last=False)
+
+    def _nonce_cache_key(self, agent_id: str, nonce: str) -> str:
+        # Nonce scope is per-agent (see SQLiteStore.claim_nonce); the
+        # in-memory cache key must match so a cache hit/miss means the same
+        # thing the durable store would say.
+        return f"{agent_id}:{nonce}"
+
+    def _claim_replay_identifiers(self, proposal: Proposal, durable: bool,
+                                  execution_id: Optional[str]) -> Optional[GovernanceResult]:
+        """Claim ``proposal.nonce`` and (if enabled) ``proposal.proposal_id``.
+
+        Returns a denial ``GovernanceResult`` on replay or persistence
+        failure, else ``None`` on success (the identifiers are claimed as a
+        side effect). See ``SQLiteStore.claim_nonce`` / ``claim_proposal_id``
+        for the durable path's scope and atomicity guarantees -- this method
+        never does a separate check-then-insert against the store; a claim
+        is a single atomic call, and a UNIQUE conflict *is* the replay
+        signal.
+        """
+        if durable:
+            envelope_fp = self.envelope._construction_fingerprint
+            key_id = proposal.signature.split(":", 1)[0] if proposal.signature and ":" in proposal.signature else None
+
+            if proposal.nonce:
+                # A local cache hit is trustworthy -- the cache is only ever
+                # populated after a claim durably succeeded -- so it short-
+                # circuits repeat replay attempts without a DB round trip. A
+                # cache miss is NOT proof the nonce is free (another governor
+                # instance sharing this store may hold it), so it always
+                # falls through to the authoritative atomic claim below. The
+                # cache key includes agent_id to match nonce scope being
+                # per-agent (see SQLiteStore.claim_nonce).
+                cache_key = self._nonce_cache_key(proposal.agent_id, proposal.nonce)
+                if cache_key in self._seen_nonces:
+                    return self._deny(Decision.HUMAN, "Replay detected: nonce already consumed",
+                                      [RiskSignal.REPLAY_DETECTED], execution_id=execution_id)
+                try:
+                    claimed = self.audit.sqlite.claim_nonce(
+                        namespace=self.deployment_namespace, envelope_fingerprint=envelope_fp,
+                        agent_id=proposal.agent_id, nonce=proposal.nonce, key_id=key_id,
+                    )
+                except sqlite3.Error as exc:
+                    return self._replay_store_failure(proposal, exc, execution_id)
+                if not claimed:
+                    return self._deny(Decision.HUMAN, "Replay detected: nonce already consumed",
+                                      [RiskSignal.REPLAY_DETECTED], execution_id=execution_id)
+                self._remember(self._seen_nonces, cache_key, self.config.max_seen_nonces)
+
+            if self.config.dedupe_proposal_ids:
+                if proposal.proposal_id in self._seen_proposal_ids:
+                    return self._deny(Decision.HUMAN,
+                                      f"Duplicate proposal_id '{proposal.proposal_id}'",
+                                      [RiskSignal.PROPOSAL_DUPLICATE], execution_id=execution_id)
+                try:
+                    claimed = self.audit.sqlite.claim_proposal_id(
+                        namespace=self.deployment_namespace, envelope_fingerprint=envelope_fp,
+                        proposal_id=proposal.proposal_id, agent_id=proposal.agent_id,
+                    )
+                except sqlite3.Error as exc:
+                    return self._replay_store_failure(proposal, exc, execution_id)
+                if not claimed:
+                    return self._deny(Decision.HUMAN,
+                                      f"Duplicate proposal_id '{proposal.proposal_id}'",
+                                      [RiskSignal.PROPOSAL_DUPLICATE], execution_id=execution_id)
+                self._remember(self._seen_proposal_ids, proposal.proposal_id,
+                               self.config.proposal_log_max)
+            return None
+
+        # non-durable: the in-memory cache is both the check and the record,
+        # protected only by this process's lock -- fine single-process, not
+        # durable across a restart or meaningful across multiple processes.
+        # Same per-agent nonce scope as the durable path, for one consistent
+        # meaning of "replay" regardless of whether persistence is wired in.
+        if proposal.nonce:
+            cache_key = self._nonce_cache_key(proposal.agent_id, proposal.nonce)
+            if cache_key in self._seen_nonces:
+                return self._deny(Decision.HUMAN, "Replay detected: nonce already consumed",
+                                  [RiskSignal.REPLAY_DETECTED], execution_id=execution_id)
+            self._remember(self._seen_nonces, cache_key, self.config.max_seen_nonces)
+        if self.config.dedupe_proposal_ids:
+            self._remember(self._seen_proposal_ids, proposal.proposal_id, self.config.proposal_log_max)
+        return None
+
+    def _replay_store_failure(self, proposal: Proposal, exc: Exception,
+                              execution_id: Optional[str]) -> GovernanceResult:
+        logger.exception("durable replay-protection store is unavailable")
+        try:
+            if self.audit.hash_chain is not None:
+                self.audit.hash_chain.append("replay_store_failure", {
+                    "agent_id": proposal.agent_id, "proposal_id": proposal.proposal_id,
+                    "error": type(exc).__name__,
+                }, phase="failed", execution_id=execution_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to record replay-store failure to hash chain")
+        return self._deny(Decision.HUMAN,
+                          f"Durable replay-protection store is unavailable: {type(exc).__name__}",
+                          [RiskSignal.REPLAY_STORE_UNAVAILABLE], execution_id=execution_id)
 
     def _get_live_auth(self, agent_id: str) -> Authority:
         return self.live_authority.get(agent_id, Authority())
@@ -397,8 +507,14 @@ class ChainmailGovernor:
                               f"Action '{proposal.action}' is not on the envelope allow-list",
                               [RiskSignal.UNKNOWN_ACTION], execution_id=execution_id)
 
-        # (4) proposal-id dedupe
-        if self.config.dedupe_proposal_ids and proposal.proposal_id in self._seen_proposal_ids:
+        # (4) proposal-id dedupe -- a cache lookup only (never a claim). With a
+        # durable replay store configured this pre-check is skipped: a
+        # check-then-later-claim here would be exactly the race a second
+        # governor instance sharing the store could win against (see (6)), so
+        # the durable path defers to the atomic claim below instead.
+        durable_replay = self.audit.sqlite is not None
+        if (not durable_replay and self.config.dedupe_proposal_ids
+                and proposal.proposal_id in self._seen_proposal_ids):
             return self._deny(Decision.HUMAN,
                               f"Duplicate proposal_id '{proposal.proposal_id}'",
                               [RiskSignal.PROPOSAL_DUPLICATE], execution_id=execution_id)
@@ -413,16 +529,15 @@ class ChainmailGovernor:
             return self._deny(Decision.HUMAN, "Proposal is unsigned but signatures are required",
                               [RiskSignal.SIGNATURE_MISSING], execution_id=execution_id)
 
-        # (6) replay -- only meaningful once the signature (if any) is trusted
-        if proposal.nonce:
-            if proposal.nonce in self._seen_nonces:
-                return self._deny(Decision.HUMAN, "Replay detected: nonce already consumed",
-                                  [RiskSignal.REPLAY_DETECTED], execution_id=execution_id)
-            self._remember(self._seen_nonces, proposal.nonce, self.config.max_seen_nonces)
+        # (6) replay -- claim the nonce and proposal_id only now that the
+        # signature (if any) is trusted; an unauthenticated proposal can
+        # never claim (and so can never poison) an identifier a legitimate,
+        # signed proposal will need later.
+        denial = self._claim_replay_identifiers(proposal, durable_replay, execution_id)
+        if denial is not None:
+            return denial
 
         # commit: this is a real evaluation attempt
-        if self.config.dedupe_proposal_ids:
-            self._remember(self._seen_proposal_ids, proposal.proposal_id, self.config.proposal_log_max)
         self.step_count += 1
         self._agent_steps[proposal.agent_id] += 1
         self.proposal_log.append(proposal)
