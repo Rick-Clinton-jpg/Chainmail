@@ -216,14 +216,20 @@ def test_budget_consumption(governor):
 
 
 def test_budget_not_consumed_on_non_continue(governor):
-    # Low-confidence proposals are RESTRICTed and must NOT spend deploy budget.
+    # A low-confidence proposal is RESTRICTed and must NOT spend deploy budget.
     perm = make_permission("deploy", "staging")
-    for i in range(4):
-        r = governor.evaluate(prop(f"lb{i}", "agent_deploy", "push", perm, OBJ, 0.1))
-        assert r.decision == Decision.RESTRICT
+    r = governor.evaluate(prop("lb0", "agent_deploy", "push", perm, OBJ, 0.1))
+    assert r.decision == Decision.RESTRICT
     live = governor.live_authority["agent_deploy"]
     assert live.budget_remaining.get("deploy:staging", 5) == 5
     assert live.has_budget(perm)
+    # the restriction now actually blocks further use of this permission --
+    # it is not a no-op that lets the agent keep trying (and keep landing on
+    # a fresh RESTRICT) indefinitely -- and budget is still never touched
+    # because the permission check fails before the budget check runs.
+    r2 = governor.evaluate(prop("lb1", "agent_deploy", "push", perm, OBJ, 0.9))
+    assert r2.decision == Decision.HUMAN and RiskSignal.AUTHORITY_ABUSE in r2.signals
+    assert live.budget_remaining.get("deploy:staging", 5) == 5
 
 
 def test_fleet_step_budget(make_governor, envelope):
@@ -255,6 +261,29 @@ def test_restrict_ttl_steps(make_governor, envelope):
     for i in range(2):
         g.evaluate(prop(f"fill{i}", "agent_research", "research", make_permission("research")))
     assert g._effective_authority("agent_coder").can(make_permission("code", "write"))
+
+
+def test_restriction_removal_uses_coverage_not_exact_equality(make_governor, envelope):
+    """A restriction is recorded against whatever Permission the restricted
+    proposal declared (required_permission) -- which need not be
+    object-identical to the base authority's actual stored permission for
+    that name/scope (e.g. a different max_budget). Removal must match by
+    name/scope coverage, the same relation used to grant authority in the
+    first place -- not exact Permission equality, which would silently keep
+    the base permission (and so leave the restriction with no effect) the
+    moment the two differ in any field."""
+    perm_no_budget = make_permission("deploy", "staging")  # max_budget=None
+    # demo envelope's agent_deploy actually holds deploy:staging with max_budget=5
+    assert envelope.agent_authorities["agent_deploy"]._match(perm_no_budget).max_budget == 5
+
+    g = make_governor(config=GovernorConfig(low_confidence_max=0.9))
+    imposing = g.evaluate(prop("cov1", "agent_deploy", "push", perm_no_budget, OBJ, 0.1))
+    assert imposing.decision == Decision.RESTRICT
+
+    assert not g._effective_authority("agent_deploy").can(perm_no_budget)
+    # also blocked for the base authority's own (budgeted) permission object
+    assert not g._effective_authority("agent_deploy").can(
+        make_permission("deploy", "staging", max_budget=5))
 
 
 def test_restrict_step_budget(make_governor, envelope):

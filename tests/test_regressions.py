@@ -66,12 +66,23 @@ def test_bug3_bad_signature_does_not_burn_nonce(make_governor):
 def test_bug4_budget_survives_restrict(make_governor):
     g = make_governor()
     perm = make_permission("deploy", "staging")
-    for i in range(10):
-        r = g.evaluate(_p(f"b4-{i}", agent_id="agent_deploy", action="push",
-                          required_permission=perm, confidence=0.05))
-        assert r.decision == Decision.RESTRICT
-    # ten RESTRICTs, zero spend: the full budget of 5 is still on the books.
+    r = g.evaluate(_p("b4-0", agent_id="agent_deploy", action="push",
+                      required_permission=perm, confidence=0.05))
+    assert r.decision == Decision.RESTRICT
+    # the RESTRICT itself spent nothing: the full budget of 5 is still on
+    # the books.
     live = g.live_authority["agent_deploy"]
+    assert live.budget_remaining.get("deploy:staging", 5) == 5
+    assert live.has_budget(perm)
+    # a restriction must actually restrict: the very next attempt at the
+    # same permission is blocked outright (AUTHORITY_ABUSE), not RESTRICTed
+    # again as if nothing happened -- and still spends no budget, since the
+    # permission check now fails before the budget check is reached. (The
+    # default TTL_STEPS policy expires after a few more steps, so this
+    # checks immediate blocking rather than looping past the expiry.)
+    r2 = g.evaluate(_p("b4-1", agent_id="agent_deploy", action="push",
+                       required_permission=perm, confidence=0.9))
+    assert r2.decision == Decision.HUMAN and RiskSignal.AUTHORITY_ABUSE in r2.signals
     assert live.budget_remaining.get("deploy:staging", 5) == 5
     assert live.has_budget(perm)
 

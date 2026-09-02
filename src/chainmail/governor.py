@@ -419,7 +419,19 @@ class ChainmailGovernor:
         active = self._active_restrictions(agent_id)
         if not active:
             return base
-        return base.reduce_to(base.permissions - active)
+        # Removal must use the same name/scope *coverage* relation used to
+        # grant authority in the first place (Authority.can() / covers()),
+        # not exact Permission equality. A restriction is recorded against
+        # whatever Permission the restricted proposal declared
+        # (required_permission) -- e.g. a specific max_budget or a wildcard
+        # scope -- which need not be object-identical to the base
+        # permission it was actually authorised by. A plain set difference
+        # (base.permissions - active) silently keeps the base permission,
+        # and the restriction has no effect, whenever the two differ in any
+        # field including max_budget: exact equality is the wrong test for
+        # "does this restriction apply to this permission".
+        remaining = {p for p in base.permissions if not any(p.covers(r) for r in active)}
+        return base.reduce_to(remaining)
 
     def _compute_restrict_expiry(self) -> Optional[Tuple[str, float]]:
         """The (kind, value) a new restriction would get under the envelope's

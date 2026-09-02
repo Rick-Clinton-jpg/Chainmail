@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Fixed — active restrictions removed authority by exact equality, not coverage (independent audit, P1 #7)
+
+`_effective_authority()` computed `base.reduce_to(base.permissions - active)`
+-- a plain set difference, which requires exact `Permission` equality (name,
+scope, *and* `max_budget`) to remove anything. A restriction is recorded
+against whatever `Permission` the restricted proposal declared
+(`required_permission`), which need not be object-identical to the base
+authority's actual stored permission for that name/scope. Confirmed with a
+direct reproduction before fixing: restricting `agent_deploy` on
+`deploy:staging` (declared with `max_budget=None`) left
+`_effective_authority()` still granting the base authority's actual
+`deploy:staging` permission (`max_budget=5`) -- the restriction had no
+effect at all whenever the two objects differed in any field.
+
+Fix: removal now uses the same name/scope *coverage* relation
+(`Permission.covers`) used to grant authority in the first place, not exact
+equality -- a base permission is dropped if it covers any actively
+restricted requirement, regardless of budget metadata differences. Two
+pre-existing tests (`test_bug4_budget_survives_restrict`,
+`test_budget_not_consumed_on_non_continue`) were *accidentally* relying on
+the bug: they used `make_permission("deploy", "staging")` (unmetered)
+against `agent_deploy`'s actual metered permission and expected repeated
+`RESTRICT` on the same permission, which only "worked" because the
+restriction was silently not applying. Updated to assert the correct
+behaviour: after a restriction, the next attempt at that permission is
+blocked outright (`AUTHORITY_ABUSE`), not `RESTRICT`ed again as if nothing
+happened -- with budget still untouched either way. New dedicated test
+`test_restriction_removal_uses_coverage_not_exact_equality` isolates the
+mechanism directly against `_effective_authority()`.
+
 ### Fixed — delegation budget containment ignored `max_budget`, and trusted a caller-supplied `budget_remaining` (independent audit, P0 #4 and #5)
 
 `Permission.covers()` only compares `name`/`scope` -- by design, it exists to
