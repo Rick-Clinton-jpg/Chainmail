@@ -10,6 +10,15 @@ Auth: if ``auth_token`` is set, the first frame on every connection must be
 constant time). Without a token the server refuses to start unless
 ``allow_no_auth=True`` is passed explicitly.
 
+Authentication is not authorization: a valid token identifies the caller
+(see ``CallerIdentity``), but by itself grants nothing beyond ``ping`` and
+``evaluate``. ``register_delegation`` additionally requires the caller be
+bound to the ``from_agent`` it's delegating as (or be an admin credential);
+``revoke_delegation``, ``snapshot``, and ``suggest_envelope`` require an
+admin credential -- these are fleet-wide administrative operations, not
+something any authenticated caller should be able to invoke for an
+arbitrary agent just by supplying that agent's id in the request body.
+
 The socket file is created with mode 0600. This is a localhost trust boundary,
 not a public endpoint.
 """
@@ -22,7 +31,8 @@ import logging
 import os
 import socket
 import threading
-from typing import Optional
+from dataclasses import dataclass
+from typing import Dict, Optional, Union
 
 from ..builders import build_demo_envelope
 from ..config import GovernorConfig
@@ -36,18 +46,53 @@ from .protocol import (
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class CallerIdentity:
+    """What one authenticated credential is authorized to do.
+
+    ``label`` is a human-readable name for logging/audit only -- it grants
+    nothing by itself. ``agent_id``, when set, is the one agent this
+    credential may act as for ``register_delegation``'s ``from_agent``.
+    ``admin`` grants the fleet-wide operations (``revoke_delegation``,
+    ``snapshot``, ``suggest_envelope``) and bypasses the ``agent_id`` check
+    for delegation.
+    """
+    label: str
+    agent_id: Optional[str] = None
+    admin: bool = False
+
+
+def _normalize_tokens(
+    auth_tokens: Optional[Dict[str, Union[str, "CallerIdentity"]]],
+) -> Dict[str, "CallerIdentity"]:
+    normalized: Dict[str, CallerIdentity] = {}
+    for token, value in (auth_tokens or {}).items():
+        if isinstance(value, CallerIdentity):
+            normalized[token] = value
+        else:
+            # Backward-compatible shorthand: a plain string is a label only
+            # -- authenticated, but with no delegation or admin authority.
+            # Callers that need those must be granted them explicitly.
+            normalized[token] = CallerIdentity(label=str(value))
+    return normalized
+
+
 class UnixSocketGovernorServer:
     def __init__(self, governor: ChainmailGovernor, socket_path: str, *,
                  auth_token: Optional[str] = None,
-                 auth_tokens: Optional[dict] = None,
+                 auth_tokens: Optional[Dict[str, Union[str, CallerIdentity]]] = None,
                  allow_no_auth: bool = False,
                  backlog: int = 64) -> None:
-        # ``auth_tokens`` maps token -> caller label, so callers can be issued
-        # and revoked independently and the connecting identity is recorded.
-        # ``auth_token`` is the single-token shorthand (label "default").
-        tokens: dict = dict(auth_tokens or {})
+        # ``auth_tokens`` maps token -> CallerIdentity (a plain string value
+        # is shorthand for a label-only identity with no delegation/admin
+        # authority), so callers can be issued and revoked independently,
+        # scoped to exactly what they're authorized to do, and the
+        # connecting identity is recorded. ``auth_token`` is the
+        # single-token shorthand: full admin authority, matching its use as
+        # "the one trusted local operator" credential.
+        tokens = _normalize_tokens(auth_tokens)
         if auth_token:
-            tokens.setdefault(auth_token, "default")
+            tokens.setdefault(auth_token, CallerIdentity(label="default", admin=True))
         if not tokens and not allow_no_auth:
             raise ValueError(
                 "refusing to start without an auth token; pass allow_no_auth=True to override"
@@ -110,11 +155,13 @@ class UnixSocketGovernorServer:
             t.start()
             self._conn_threads.append(t)
 
-    def _authenticate(self, conn: socket.socket) -> Optional[str]:
-        """Returns the caller label on success, None on failure. When no tokens
-        are configured every connection is accepted as ``"anonymous"``."""
+    def _authenticate(self, conn: socket.socket) -> Optional[CallerIdentity]:
+        """Returns the caller's identity on success, None on failure. When no
+        tokens are configured every connection is accepted as a full-trust
+        anonymous admin -- that's the existing ``allow_no_auth`` contract
+        (loopback/testing only), unchanged here."""
         if not self._tokens:
-            return "anonymous"
+            return CallerIdentity(label="anonymous", admin=True)
         try:
             frame = read_frame(conn)
         except (ProtocolError, ConnectionError, OSError):
@@ -123,15 +170,15 @@ class UnixSocketGovernorServer:
             write_frame(conn, {"id": frame.get("id"), "ok": False, "error": "auth required"})
             return None
         supplied = str(frame.get("token", ""))
-        label = None
+        identity = None
         for token, caller in self._tokens.items():
             if hmac.compare_digest(supplied, token):
-                label = caller
+                identity = caller
                 break
-        write_frame(conn, {"id": frame.get("id"), "ok": label is not None,
-                           "error": None if label else "bad token",
-                           "result": {"caller": label} if label else None})
-        return label
+        write_frame(conn, {"id": frame.get("id"), "ok": identity is not None,
+                           "error": None if identity else "bad token",
+                           "result": {"caller": identity.label} if identity else None})
+        return identity
 
     def _serve_conn(self, conn: socket.socket) -> None:
         conn.settimeout(30)
@@ -139,7 +186,8 @@ class UnixSocketGovernorServer:
             caller = self._authenticate(conn)
             if caller is None:
                 return
-            logger.info("chainmail connection authenticated as %r", caller)
+            logger.info("chainmail connection authenticated as %r (agent_id=%r, admin=%s)",
+                       caller.label, caller.agent_id, caller.admin)
             while not self._stop.is_set():
                 try:
                     req = read_frame(conn)
@@ -148,14 +196,14 @@ class UnixSocketGovernorServer:
                 except ProtocolError as exc:
                     write_frame(conn, {"id": None, "ok": False, "error": str(exc)})
                     continue
-                resp = self._dispatch(req)
+                resp = self._dispatch(req, caller)
                 write_frame(conn, resp)
         except Exception:  # noqa: BLE001
             logger.exception("connection handler crashed")
         finally:
             conn.close()
 
-    def _dispatch(self, req: dict) -> dict:
+    def _dispatch(self, req: dict, caller: CallerIdentity) -> dict:
         rid = req.get("id")
         op = req.get("op")
         try:
@@ -168,17 +216,34 @@ class UnixSocketGovernorServer:
                 result = self.governor.evaluate(proposal)
                 return {"id": rid, "ok": True, "result": result_to_dict(result)}
             if op == "register_delegation":
+                from_agent = req.get("from_agent")
+                if not caller.admin and caller.agent_id != from_agent:
+                    return {"id": rid, "ok": False,
+                           "error": f"unauthorized: caller {caller.label!r} may not delegate "
+                                     f"as agent {from_agent!r}"}
                 offered = authority_from_dict(req.get("offered", {}))
                 ok, msg = self.governor.register_delegation(
                     req["from_agent"], req["to_agent"], req.get("reason", ""), offered,
                 )
                 return {"id": rid, "ok": True, "result": {"accepted": ok, "message": msg}}
             if op == "revoke_delegation":
+                if not caller.admin:
+                    return {"id": rid, "ok": False,
+                           "error": f"unauthorized: {caller.label!r} requires admin authority "
+                                     "for revoke_delegation"}
                 ok = self.governor.revoke_delegation(req["to_agent"])
                 return {"id": rid, "ok": True, "result": {"revoked": ok}}
             if op == "snapshot":
+                if not caller.admin:
+                    return {"id": rid, "ok": False,
+                           "error": f"unauthorized: {caller.label!r} requires admin authority "
+                                     "for snapshot"}
                 return {"id": rid, "ok": True, "result": self.governor.snapshot()}
             if op == "suggest_envelope":
+                if not caller.admin:
+                    return {"id": rid, "ok": False,
+                           "error": f"unauthorized: {caller.label!r} requires admin authority "
+                                     "for suggest_envelope"}
                 return {"id": rid, "ok": True, "result": self.governor.suggest_envelope()}
             return {"id": rid, "ok": False, "error": f"unknown op {op!r}"}
         except (ProtocolError, KeyError, TypeError, ValueError) as exc:

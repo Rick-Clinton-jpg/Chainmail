@@ -222,7 +222,12 @@ model2vec default embedding engine, the `chainmail.service` wrapper.
 - **Optional OTel tracing** (`chainmail.tracing`, from `Quorum`) — additive,
   fail-safe, off by default, console-only.
 - **Per-caller service tokens** (from `Quorum/gate/agent_identity.py`) —
-  `auth_tokens={token: label}`, caller label logged per connection.
+  `auth_tokens={token: CallerIdentity(label, agent_id=None, admin=False)}`
+  (a plain string is shorthand for label-only, no authority), caller identity
+  logged per connection. Authentication alone grants `ping`/`evaluate` only;
+  `register_delegation` requires the caller's own `agent_id` or admin;
+  `revoke_delegation`/`snapshot`/`suggest_envelope` require admin (see
+  Unreleased in CHANGELOG.md — authentication is not authorization).
 
 ---
 

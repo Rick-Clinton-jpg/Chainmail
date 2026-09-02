@@ -292,11 +292,20 @@ with GovernorClient("/run/chainmail.sock", auth_token=token) as gov:
 * Framing: 4-byte big-endian length + UTF-8 JSON, one object per frame, 4 MiB cap.
 * Auth: first frame must be `{"op":"auth","token":...}`, compared in constant
   time. The server refuses to start without a token unless `--allow-no-auth`.
-* **Per-caller tokens**: pass `auth_tokens={"tok-a": "worker-1", "tok-b": "audit-bot"}`
-  (or `--tokens '{"tok-a":"worker-1"}'` / `CHAINMAIL_TOKENS`) to issue and revoke
-  callers independently; the resolved caller label is logged per connection.
-  `auth_token=` is the single-token shorthand (label `"default"`). Pattern
-  adapted from [`Quorum/gate/agent_identity.py`](https://github.com/Rick-Clinton-jpg/Quorum).
+* **Per-caller tokens are authorization-scoped, not just labels**: pass
+  `auth_tokens={"tok-a": CallerIdentity(label="worker-1", agent_id="agent_research"),
+  "tok-b": CallerIdentity(label="audit-bot", admin=True)}` to issue and revoke
+  callers independently. Authentication alone grants only `ping`/`evaluate`;
+  `register_delegation` additionally requires the caller be bound to the
+  `from_agent` it's delegating as (or hold admin authority), and
+  `revoke_delegation`/`snapshot`/`suggest_envelope` require admin authority —
+  these are fleet-wide administrative operations, not something any
+  authenticated caller should reach just by naming an agent in the request. A
+  plain string value (`{"tok-a": "worker-1"}`, `--tokens '{"tok-a":"worker-1"}'`
+  / `CHAINMAIL_TOKENS`) is shorthand for a label-only identity with none of
+  that authority. `auth_token=` is the single-token shorthand and keeps full
+  admin authority (it represents the one trusted local operator credential).
+  Pattern adapted from [`Quorum/gate/agent_identity.py`](https://github.com/Rick-Clinton-jpg/Quorum).
 * The socket file is created mode `0600`. This is a localhost trust boundary, not
   a public endpoint — put TLS / mTLS in front if you cross a host.
 * One `ChainmailGovernor` is shared across all connections; it serialises

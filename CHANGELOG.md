@@ -80,6 +80,44 @@ included in the canonical signing payload. New tests
 at low confidence, mutate upward without resigning, confirm
 `SIGNATURE_INVALID`; same for an injected assumption.
 
+### Fixed — service authentication was not authorization (independent audit, P0 #6)
+
+`UnixSocketGovernorServer._authenticate()` resolved a token to a caller
+label, but `_serve_conn()` never passed that label into `_dispatch()` --
+confirmed by reading server.py directly. Any authenticated caller, holding
+any valid token, could call `register_delegation` with an arbitrary
+`from_agent`, `revoke_delegation` for any agent, `snapshot` (full fleet
+state), and `suggest_envelope`, regardless of which credential they held.
+
+Fix: authenticated tokens now resolve to a `CallerIdentity(label, agent_id,
+admin)` instead of a bare label string, and `_dispatch()` enforces
+operation-level authorization against it:
+- `register_delegation` requires the caller's `agent_id` to match the
+  request's `from_agent`, or admin authority.
+- `revoke_delegation`, `snapshot`, and `suggest_envelope` require admin
+  authority -- fleet-wide administrative operations, not something any
+  authenticated caller should reach by naming an agent in the request body.
+- `ping`/`evaluate` are unaffected -- `evaluate` already has its own
+  protection layer (known-agent check, signature verification when
+  configured), and requiring caller/proposal agent identity to match here
+  would break legitimate proxy/orchestrator deployments using one shared
+  credential; the auth gap being fixed is specifically the admin/delegation
+  surface that has no other layer of defense.
+- Backward compatible: a plain string value in `auth_tokens` (the prior
+  API) is still accepted, as shorthand for a label-only identity with *no*
+  delegation or admin authority -- existing deployments regain those
+  operations only by explicitly granting them per token, which is the
+  intended direction for this fix (fail closed by default). The single-token
+  `auth_token=` constructor shorthand keeps full admin authority unchanged,
+  since it represents the one trusted local-operator credential, not a
+  per-caller-scoped token.
+
+New tests (`tests/test_service.py`): a label-only token can `ping`/`evaluate`
+but gets `unauthorized` on all four admin/delegation ops; a token bound to
+one `agent_id` can delegate as that agent but not impersonate another, and
+still can't reach admin ops; an explicit admin `CallerIdentity` retains full
+access; the single-token shorthand keeps its existing full-trust behaviour.
+
 ### Fixed — quorum ran after execution, not before it (independent audit, P0 #1)
 
 `ChainmailGovernor.evaluate()` called `execution_boundary.execute()` (step 15)

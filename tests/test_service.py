@@ -10,7 +10,7 @@ import pytest
 from chainmail import (
     Authority, ChainmailGovernor, GovernorConfig, Proposal, TfidfEmbeddingEngine, make_permission,
 )
-from chainmail.service import GovernorClient, GovernorClientError, UnixSocketGovernorServer
+from chainmail.service import CallerIdentity, GovernorClient, GovernorClientError, UnixSocketGovernorServer
 
 OBJ = "Build a secure multi-agent governance prototype"
 
@@ -110,6 +110,88 @@ def test_per_caller_tokens(short_tmpdir, envelope):
             GovernorClient(sock, auth_token="tok-nope").connect()
     finally:
         server.stop()
+
+
+# -- authentication is not authorization ---------------------------------
+
+def test_plain_string_token_grants_no_delegation_or_admin(short_tmpdir, envelope):
+    """The backward-compatible plain-string form of auth_tokens is a label
+    only -- authenticated, but with no authority to delegate as any agent,
+    revoke, snapshot, or suggest_envelope. Before the fix, any authenticated
+    caller could invoke these regardless of which token they held."""
+    sock = os.path.join(short_tmpdir, "unauth.sock")
+    g = ChainmailGovernor(envelope, embedding=TfidfEmbeddingEngine(), auto_embedding=False)
+    server = UnixSocketGovernorServer(g, sock, auth_tokens={"tok-worker": "worker-1"})
+    server.start()
+    try:
+        with GovernorClient(sock, auth_token="tok-worker") as c:
+            assert c.ping() is True  # authenticated, evaluate/ping still work
+            offered = Authority(permissions={make_permission("research")})
+            with pytest.raises(GovernorClientError, match="unauthorized"):
+                c.register_delegation("agent_research", "agent_coder", "escalate", offered)
+            with pytest.raises(GovernorClientError, match="unauthorized"):
+                c.revoke_delegation("agent_coder")
+            with pytest.raises(GovernorClientError, match="unauthorized"):
+                c.snapshot()
+            with pytest.raises(GovernorClientError, match="unauthorized"):
+                c.suggest_envelope()
+    finally:
+        server.stop()
+    # nothing was granted despite the caller supplying an arbitrary from_agent
+    assert len(g.provenance) == 0
+
+
+def test_caller_bound_to_one_agent_can_only_delegate_as_that_agent(short_tmpdir, envelope):
+    sock = os.path.join(short_tmpdir, "bound.sock")
+    g = ChainmailGovernor(envelope, embedding=TfidfEmbeddingEngine(), auto_embedding=False)
+    server = UnixSocketGovernorServer(g, sock, auth_tokens={
+        "tok-research": CallerIdentity(label="agent_research-svc", agent_id="agent_research"),
+    })
+    server.start()
+    try:
+        with GovernorClient(sock, auth_token="tok-research") as c:
+            offered = Authority(permissions={make_permission("research")})
+            # delegating AS the bound agent is authorized
+            resp = c.register_delegation("agent_research", "agent_coder", "share", offered)
+            assert resp["accepted"] is True
+            # impersonating a different from_agent is not
+            with pytest.raises(GovernorClientError, match="unauthorized"):
+                c.register_delegation("agent_deploy", "agent_coder", "escalate", offered)
+            # admin-only ops remain unauthorized for a non-admin, agent-bound caller
+            with pytest.raises(GovernorClientError, match="unauthorized"):
+                c.snapshot()
+    finally:
+        server.stop()
+    assert len(g.provenance) == 1
+
+
+def test_admin_caller_retains_full_access(short_tmpdir, envelope):
+    sock = os.path.join(short_tmpdir, "admin.sock")
+    g = ChainmailGovernor(envelope, embedding=TfidfEmbeddingEngine(), auto_embedding=False)
+    server = UnixSocketGovernorServer(g, sock, auth_tokens={
+        "tok-admin": CallerIdentity(label="ops", admin=True),
+    })
+    server.start()
+    try:
+        with GovernorClient(sock, auth_token="tok-admin") as c:
+            offered = Authority(permissions={make_permission("research")})
+            resp = c.register_delegation("agent_research", "agent_coder", "share", offered)
+            assert resp["accepted"] is True
+            assert isinstance(c.snapshot(), dict)
+            assert isinstance(c.suggest_envelope(), dict)
+            assert c.revoke_delegation("agent_coder") is True
+    finally:
+        server.stop()
+
+
+def test_single_shared_token_shorthand_is_admin(running_server):
+    """The single-token constructor shorthand (auth_token=...) keeps its
+    existing full-trust behaviour -- it represents the one local operator
+    credential, not a per-caller-scoped token."""
+    sock, g = running_server
+    with GovernorClient(sock, auth_token="secret-token") as c:
+        assert isinstance(c.snapshot(), dict)
+        assert isinstance(c.suggest_envelope(), dict)
 
 
 def test_concurrent_clients(running_server):
