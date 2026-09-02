@@ -102,6 +102,20 @@ class ChainmailGovernor:
                 "audit=AuditSink(sqlite_store=SQLiteStore(...)), or build a "
                 "non-production GovernorConfig() for development."
             )
+        if self.config.production_mode and self.envelope.restrict_policy == RestrictPolicy.TTL_STEPS:
+            raise ValueError(
+                "config.production_mode=True but envelope.restrict_policy=TTL_STEPS: "
+                "a step-based restriction's expiry is compared against the evaluating "
+                "governor's own local step_count, which is neither durable nor shared "
+                "across processes. A second governor process sharing the same durable "
+                "store -- with a different (often higher) local step count -- can treat "
+                "a sibling's restriction as already expired the moment it reads it, "
+                "silently lifting a restriction that is supposed to still be active. "
+                "Use TTL_WALLCLOCK (an absolute timestamp, safe across processes and "
+                "restarts) or HUMAN_ONLY for a production, potentially multi-process "
+                "envelope; TTL_STEPS remains available for a single-process development "
+                "GovernorConfig()."
+            )
         self.quorum = quorum
         self.quorum_transport = quorum_transport or LocalSingleGovernorTransport()
 

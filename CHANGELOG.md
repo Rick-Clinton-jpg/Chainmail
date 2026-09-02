@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Fixed — production mode allowed TTL_STEPS restrictions, unsafe across processes (independent audit, P1 #8)
+
+A `TTL_STEPS`-policy restriction's expiry is (deliberately, per the durable
+restrictions changelog entry above) an absolute step number compared against
+the *evaluating governor's own local* `step_count` -- that counter is
+per-process, not durable, and not shared. In a multi-process deployment
+(exactly what `production_mode` + durable storage exists for), a second
+governor process with a different, often higher, local `step_count` can read
+a sibling's still-active restriction and treat it as already expired,
+silently lifting a restriction the operator believes is still in force.
+
+Fix: `ChainmailGovernor.__init__` now rejects `production_mode=True`
+combined with `envelope.restrict_policy == RestrictPolicy.TTL_STEPS` at
+construction time, matching this codebase's existing production-mode
+fail-closed pattern. `TTL_WALLCLOCK` (an absolute timestamp -- safe across
+processes and restarts, since wall-clock time is shared) and `HUMAN_ONLY`
+remain available for production; `TTL_STEPS` is still fine for a
+single-process development `GovernorConfig()`, where there's no sibling
+process to disagree with. Two existing production-mode tests
+(`test_production_config_requires_durable_replay_storage`,
+`test_production_mode_requires_durable_restriction_storage`) constructed
+their governor with the demo envelope's default `TTL_STEPS` policy and now
+use `TTL_WALLCLOCK` so they isolate the check they're actually testing. New
+test `test_production_config_rejects_ttl_steps_restrictions`.
+
 ### Fixed — active restrictions removed authority by exact equality, not coverage (independent audit, P1 #7)
 
 `_effective_authority()` computed `base.reduce_to(base.permissions - active)`

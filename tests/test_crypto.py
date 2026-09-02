@@ -190,24 +190,55 @@ def test_production_config_requires_signature():
 
 
 def test_production_config_requires_durable_replay_storage():
-    from chainmail import AuditSink, ChainmailGovernor, CompositeVerifier, KeyRegistry, SQLiteStore, build_demo_envelope
+    import dataclasses
+
+    from chainmail import (
+        AuditSink, ChainmailGovernor, CompositeVerifier, KeyRegistry, RestrictPolicy,
+        SQLiteStore, build_demo_envelope,
+    )
+
+    # production_mode also rejects TTL_STEPS (see the dedicated test below);
+    # use TTL_WALLCLOCK here so this test isolates the durable-storage check.
+    env = dataclasses.replace(build_demo_envelope(), restrict_policy=RestrictPolicy.TTL_WALLCLOCK)
 
     with pytest.raises(ValueError, match="production_mode"):
         ChainmailGovernor(
-            build_demo_envelope(),
+            env,
             config=GovernorConfig.production(),
             verifier=CompositeVerifier(KeyRegistry()),
             auto_embedding=False,
         )
     # with a durable store wired in, construction succeeds
     g = ChainmailGovernor(
-        build_demo_envelope(),
+        env,
         config=GovernorConfig.production(),
         verifier=CompositeVerifier(KeyRegistry()),
         audit=AuditSink(sqlite_store=SQLiteStore()),
         auto_embedding=False,
     )
     assert g.security_report()["durable_replay_protection"] is True
+
+
+def test_production_config_rejects_ttl_steps_restrictions():
+    """TTL_STEPS restriction expiry compares against the evaluating
+    governor's own local step_count -- not durable, not shared across
+    processes. A second production governor process could treat a sibling's
+    still-active restriction as expired purely because its own step_count
+    happens to be higher. production_mode refuses this envelope outright."""
+    from chainmail import (
+        AuditSink, ChainmailGovernor, CompositeVerifier, KeyRegistry, RestrictPolicy,
+        SQLiteStore, build_demo_envelope,
+    )
+
+    assert build_demo_envelope().restrict_policy == RestrictPolicy.TTL_STEPS
+    with pytest.raises(ValueError, match="TTL_STEPS"):
+        ChainmailGovernor(
+            build_demo_envelope(),
+            config=GovernorConfig.production(),
+            verifier=CompositeVerifier(KeyRegistry()),
+            audit=AuditSink(sqlite_store=SQLiteStore()),
+            auto_embedding=False,
+        )
 
 
 def test_canonical_bytes_are_stable():

@@ -362,15 +362,23 @@ def test_development_mode_without_sqlite_keeps_in_memory_behaviour(make_governor
 # -- production mode requires durable restriction storage -------------------
 
 def test_production_mode_requires_durable_restriction_storage():
+    import dataclasses
+
+    from chainmail import RestrictPolicy
+
+    # production_mode also rejects TTL_STEPS (see test_crypto.py); use
+    # TTL_WALLCLOCK so this test isolates the durable-storage requirement.
+    env = dataclasses.replace(build_demo_envelope(), restrict_policy=RestrictPolicy.TTL_WALLCLOCK)
+
     with pytest.raises(ValueError, match="production_mode"):
         ChainmailGovernor(
-            build_demo_envelope(),
+            env,
             config=GovernorConfig.production(),
             verifier=CompositeVerifier(KeyRegistry()),
             auto_embedding=False,
         )
     g = ChainmailGovernor(
-        build_demo_envelope(),
+        env,
         config=GovernorConfig.production(),
         verifier=CompositeVerifier(KeyRegistry()),
         audit=AuditSink(sqlite_store=SQLiteStore()),
