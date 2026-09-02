@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+Response to the independent technical assessment's Priority 0 finding
+("Secure Behaviour Should Be the Default"): the permissive defaults needed
+for local development and testing were silent about the protections they
+were skipping.
+
+### New
+
+- `GovernorConfig.production(**overrides)` — a secure-by-default config
+  factory. Currently differs from `GovernorConfig()` only in
+  `require_signature=True`; other fields still override.
+- `ChainmailGovernor.security_report()` — reports which protections are
+  actually active on a governor instance (signature enforcement, a real vs.
+  mock execution boundary, quorum configuration) and lists concrete
+  weaknesses for anything left permissive. Logged automatically at
+  construction: `INFO` when nothing is weak, `WARNING` naming each gap
+  otherwise.
+- `ChainmailGovernor.__init__` now fails closed at construction time if
+  `config.require_signature=True` is paired with a `NullApprovalVerifier`
+  (explicit or defaulted) — that combination would enforce signature
+  *presence* while accepting any signature *content*, which is a false
+  sense of security. A real verifier (e.g. `CompositeVerifier`) must be
+  supplied.
+- `MockArmourBoundary` now logs a construction warning, matching
+  `NullApprovalVerifier` — it authorises every `CONTINUE` decision
+  unconditionally and previously did so silently.
+
 ## v5.1.0
 
 Hardening pulled from the sibling projects (all PolyForm NC 1.0.0):

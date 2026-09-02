@@ -9,6 +9,7 @@ governor, and it is frozen for the life of that governor instance.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Dict
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,22 @@ class GovernorConfig:
 
     embedding_refit_interval: int = 256
     """Refit the TF-IDF fallback engine every N proposals. Ignored by model engines."""
+
+    @classmethod
+    def production(cls, **overrides: Any) -> "GovernorConfig":
+        """A secure-by-default config for real deployments.
+
+        Differs from ``GovernorConfig()`` only in ``require_signature``, which
+        this sets to ``True``. Everything else keeps the same defaults, which
+        the caller may still override. Pairing this with a
+        :class:`~chainmail.crypto.NullApprovalVerifier` (or no verifier at
+        all) is rejected at governor construction time -- see
+        ``ChainmailGovernor.__init__`` -- so a real
+        :class:`~chainmail.crypto.CompositeVerifier` must be supplied.
+        """
+        defaults: Dict[str, Any] = {"require_signature": True}
+        defaults.update(overrides)
+        return cls(**defaults)
 
     def __post_init__(self) -> None:
         fractions = {

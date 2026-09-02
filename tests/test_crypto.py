@@ -131,9 +131,30 @@ def test_rotate_key(make_governor):
 # -- config: require_signature --------------------------------------
 
 def test_require_signature(make_governor):
-    g = make_governor(config=GovernorConfig(require_signature=True))
+    g = make_governor(config=GovernorConfig(require_signature=True),
+                       verifier=CompositeVerifier(KeyRegistry()))
     r = g.evaluate(_prop("req-1"))
     assert r.decision == Decision.HUMAN and RiskSignal.SIGNATURE_MISSING in r.signals
+
+
+def test_require_signature_rejects_null_verifier():
+    """A NullApprovalVerifier accepts every signature check unconditionally, so
+    pairing it with require_signature=True would enforce presence but not
+    authenticity -- a false sense of security. The governor refuses to start
+    that way; a real verifier must be supplied."""
+    from chainmail import ChainmailGovernor, build_demo_envelope
+
+    with pytest.raises(ValueError, match="require_signature"):
+        ChainmailGovernor(
+            build_demo_envelope(),
+            config=GovernorConfig(require_signature=True),
+            auto_embedding=False,
+        )
+
+
+def test_production_config_requires_signature():
+    assert GovernorConfig.production().require_signature is True
+    assert GovernorConfig.production(dedupe_proposal_ids=False).dedupe_proposal_ids is False
 
 
 def test_canonical_bytes_are_stable():

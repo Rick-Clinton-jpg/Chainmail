@@ -335,6 +335,33 @@ def test_armour_exception_fail_closed(make_governor):
     assert r.decision == Decision.HUMAN and RiskSignal.VERIFIER_ERROR in r.signals
 
 
+# -- security diagnostics -----------------------------------------------
+
+def test_security_report_flags_defaults(make_governor):
+    g = make_governor()
+    report = g.security_report()
+    assert report["signature_enforced"] is False
+    assert report["armour_wired"] is False
+    assert report["quorum_configured"] is False
+    assert len(report["weaknesses"]) == 3
+
+
+def test_security_report_clears_weaknesses_when_hardened(make_governor):
+    from chainmail import CompositeVerifier, GovernorConfig, KeyRegistry, QuorumAggregator
+
+    g = make_governor(
+        config=GovernorConfig(require_signature=True),
+        verifier=CompositeVerifier(KeyRegistry()),
+        armour=DenyAllArmourBoundary(),
+        quorum=QuorumAggregator(),
+    )
+    report = g.security_report()
+    assert report["signature_enforced"] is True
+    assert report["armour_wired"] is True
+    assert report["quorum_configured"] is True
+    assert report["weaknesses"] == []
+
+
 # -- envelope integrity ------------------------------------------------
 
 def test_envelope_fingerprint_drift(governor, envelope):

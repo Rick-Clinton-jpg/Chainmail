@@ -40,7 +40,7 @@ from collections import deque
 from copy import deepcopy
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
-from .armour import ArmourBoundary
+from .armour import ArmourBoundary, MockArmourBoundary
 from .config import GovernorConfig
 from .core import (
     Authority, Decision, GovernanceResult, Permission, Proposal, ProvenanceLink,
@@ -80,6 +80,14 @@ class ChainmailGovernor:
         self.armour = armour
         self.audit = audit or AuditSink()
         self.verifier: ApprovalVerifier = verifier or NullApprovalVerifier()
+        if self.config.require_signature and isinstance(self.verifier, NullApprovalVerifier):
+            raise ValueError(
+                "config.require_signature=True but no real ApprovalVerifier was "
+                "supplied: NullApprovalVerifier accepts every proposal, which "
+                "would make signature enforcement meaningless. Pass an explicit "
+                "verifier= (e.g. CompositeVerifier(KeyRegistry(...))) or set "
+                "require_signature=False for a development configuration."
+            )
         self.quorum = quorum
         self.quorum_transport = quorum_transport or LocalSingleGovernorTransport()
 
@@ -119,6 +127,66 @@ class ChainmailGovernor:
         self._evals_since_fit = 0
         self._fitted_once = False
         self._refit_embedding(force=True)
+
+        self._log_security_report()
+
+    # ------------------------------------------------------------------
+    # security diagnostics
+    # ------------------------------------------------------------------
+    def security_report(self) -> Dict[str, Any]:
+        """Describe which protections are actually active on this governor.
+
+        Intended for startup logging and operational checks -- a user who
+        assumes signatures, an execution boundary, or a real quorum are
+        enforced should be able to confirm that from this report rather than
+        from reading source. See HANDOFF.md / the security assessment for
+        the full rationale (each of these is a real config knob, not a
+        cosmetic flag).
+        """
+        signature_enforced = self.config.require_signature and not isinstance(
+            self.verifier, NullApprovalVerifier
+        )
+        armour_wired = self.armour is not None and not isinstance(self.armour, MockArmourBoundary)
+        weaknesses: List[str] = []
+        if not signature_enforced:
+            weaknesses.append(
+                "proposal signatures are NOT enforced -- any caller can act as any "
+                "agent; use GovernorConfig.production() with a CompositeVerifier"
+            )
+        if not armour_wired:
+            weaknesses.append(
+                "no real execution boundary is wired -- MockArmourBoundary (or no "
+                "armour at all) authorises every CONTINUE decision unconditionally"
+            )
+        if self.quorum is None:
+            weaknesses.append(
+                "no quorum aggregator is configured -- this governor's CONTINUE "
+                "decisions are final with no peer-governor review"
+            )
+        return {
+            "governor_id": self.governor_id,
+            "signature_required": self.config.require_signature,
+            "signature_enforced": signature_enforced,
+            "verifier": type(self.verifier).__name__,
+            "armour": type(self.armour).__name__ if self.armour is not None else None,
+            "armour_wired": armour_wired,
+            "quorum_configured": self.quorum is not None,
+            "dedupe_proposal_ids": self.config.dedupe_proposal_ids,
+            "weaknesses": weaknesses,
+        }
+
+    def _log_security_report(self) -> None:
+        report = self.security_report()
+        if report["weaknesses"]:
+            logger.warning(
+                "chainmail governor %s starting with reduced protections: %s",
+                self.governor_id, "; ".join(report["weaknesses"]),
+            )
+        else:
+            logger.info(
+                "chainmail governor %s starting with signatures enforced, a real "
+                "execution boundary, and quorum configured", self.governor_id,
+            )
 
     # ------------------------------------------------------------------
     # internal helpers

@@ -29,6 +29,15 @@ class ArmourBoundary:
 
 
 class MockArmourBoundary(ArmourBoundary):
+    """Authorises every proposal unconditionally. Development only -- logs a
+    warning on construction, matching ``NullApprovalVerifier``."""
+
+    def __init__(self) -> None:
+        logger.warning(
+            "MockArmourBoundary in use: every CONTINUE decision is authorised "
+            "unconditionally -- no real execution boundary is enforced"
+        )
+
     def execute(self, proposal: Proposal, authority: Authority) -> ExecResult:
         return True, f"MockArmour: {proposal.action} executed", {"action": proposal.action}
 
