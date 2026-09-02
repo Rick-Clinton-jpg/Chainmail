@@ -87,7 +87,8 @@ class UnixSocketGovernorServer:
                  auth_token: Optional[str] = None,
                  auth_tokens: Optional[Dict[str, Union[str, CallerIdentity]]] = None,
                  allow_no_auth: bool = False,
-                 backlog: int = 64) -> None:
+                 backlog: int = 64,
+                 max_connections: int = 128) -> None:
         # ``auth_tokens`` maps token -> CallerIdentity (a plain string value
         # is shorthand for a label-only identity with no delegation/admin
         # authority), so callers can be issued and revoked independently,
@@ -110,6 +111,14 @@ class UnixSocketGovernorServer:
         self._accept_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._conn_threads: "list[threading.Thread]" = []
+        # One thread per connection, with no cap, let any client (buggy or
+        # malicious) that can reach the socket exhaust server threads/file
+        # descriptors just by opening connections and never closing them.
+        # This semaphore bounds live connections; accept() keeps polling
+        # (never blocks indefinitely) so _stop is still checked promptly
+        # while at capacity.
+        self._max_connections = max_connections
+        self._conn_slots = threading.Semaphore(max_connections)
 
     # -- lifecycle ---------------------------------------------------
     def start(self) -> None:
@@ -155,6 +164,16 @@ class UnixSocketGovernorServer:
                 continue
             except OSError:
                 break
+            self._conn_threads = [t for t in self._conn_threads if t.is_alive()]
+            if not self._conn_slots.acquire(blocking=False):
+                logger.warning(
+                    "chainmail service at max_connections=%d; refusing a new connection",
+                    self._max_connections,
+                )
+                try:
+                    conn.close()
+                finally:
+                    continue
             t = threading.Thread(target=self._serve_conn, args=(conn,),
                                  name="chainmail-conn", daemon=True)
             t.start()
@@ -207,6 +226,7 @@ class UnixSocketGovernorServer:
             logger.exception("connection handler crashed")
         finally:
             conn.close()
+            self._conn_slots.release()
 
     def _dispatch(self, req: dict, caller: CallerIdentity) -> dict:
         rid = req.get("id")

@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Fixed — the service accepted unlimited concurrent connections, one thread each (independent audit, P2)
+
+`UnixSocketGovernorServer._accept_loop()` spawned a new daemon thread for
+every accepted connection with no cap, and appended it to `_conn_threads`
+which was never pruned. Any client that can reach the socket -- a buggy
+integration retrying without backoff, or a malicious co-located process --
+could exhaust server threads and file descriptors just by opening
+connections and never closing them, and the never-pruned thread list leaked
+memory over a long-running server's lifetime independent of that.
+
+Fix, in `src/chainmail/service/server.py`: `UnixSocketGovernorServer` gained
+a `max_connections: int = 128` constructor argument, enforced by a
+`threading.Semaphore` acquired (non-blocking) before spawning each
+connection's thread and released when that thread exits; a connection
+beyond the cap is refused (closed immediately, logged) rather than
+accepted. `_accept_loop()` now also prunes finished threads from
+`_conn_threads` on every iteration instead of only ever appending to it.
+
+New test `test_max_connections_caps_concurrent_connections` in
+`tests/test_service.py`: with `max_connections=2`, a third concurrent
+client is refused (`GovernorClientError`), and closing one of the first two
+frees a slot for a new connection to succeed.
+
 ### Fixed — SQLiteStore silently accepted a newer, unrecognized schema version (independent audit, P2)
 
 `SQLiteStore._init_db()` compared the database's stored `schema_version`

@@ -4,6 +4,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 
 import pytest
 
@@ -194,6 +195,34 @@ def test_single_shared_token_shorthand_is_admin(running_server):
     with GovernorClient(sock, auth_token="secret-token") as c:
         assert isinstance(c.snapshot(), dict)
         assert isinstance(c.suggest_envelope(), dict)
+
+
+def test_max_connections_caps_concurrent_connections(short_tmpdir, envelope):
+    # Unbounded connections meant any client (buggy or malicious) that can
+    # reach the socket could exhaust server threads/file descriptors just by
+    # opening connections and never closing them. max_connections must
+    # actually be enforced, and a slot must free up once a connection closes.
+    sock = os.path.join(short_tmpdir, "capped.sock")
+    g = ChainmailGovernor(envelope, config=GovernorConfig(),
+                          embedding=TfidfEmbeddingEngine(), auto_embedding=False)
+    server = UnixSocketGovernorServer(g, sock, auth_token="secret-token", max_connections=2)
+    server.start()
+    try:
+        c1 = GovernorClient(sock, auth_token="secret-token").connect()
+        c2 = GovernorClient(sock, auth_token="secret-token").connect()
+        try:
+            with pytest.raises(GovernorClientError):
+                GovernorClient(sock, auth_token="secret-token", timeout=2.0).connect()
+        finally:
+            c1.close()
+            c2.close()
+
+        # A slot freed by closing c1/c2 must become available again.
+        time.sleep(0.2)  # let the accept loop notice the closed connections
+        with GovernorClient(sock, auth_token="secret-token") as c3:
+            assert c3.ping() is True
+    finally:
+        server.stop()
 
 
 def test_concurrent_clients(running_server):

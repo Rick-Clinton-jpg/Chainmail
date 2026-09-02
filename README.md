@@ -321,6 +321,9 @@ with GovernorClient("/run/chainmail.sock", auth_token=token) as gov:
   a public endpoint — put TLS / mTLS in front if you cross a host.
 * One `ChainmailGovernor` is shared across all connections; it serialises
   `evaluate` internally.
+* One thread per connection, capped by `UnixSocketGovernorServer(...,
+  max_connections=128)` (default). A connection beyond the cap is refused
+  (closed immediately) rather than spawning an unbounded number of threads.
 
 ---
 
