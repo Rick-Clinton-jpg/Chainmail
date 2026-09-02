@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chainmail"
+version = "5.1.0"
+description = "Policy-hard, context-fluid governance layer for long-running multi-agent systems."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE.md" }
+authors = [{ name = "Rick Clinton" }]
+keywords = ["ai-safety", "multi-agent", "governance", "authorization", "agents"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Rick-Clinton-jpg/Chainmail"
+Source = "https://github.com/Rick-Clinton-jpg/Chainmail"
+Changelog = "https://github.com/Rick-Clinton-jpg/Chainmail/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+# Asymmetric proposal signing + key management.
+crypto = ["cryptography>=42"]
+# Real static-embedding semantic engine (no torch).
+embeddings = ["model2vec>=0.3", "numpy>=1.24"]
+# Heavyweight transformer embedding engine.
+embeddings-transformer = ["sentence-transformers>=2.2", "numpy>=1.24"]
+# OpenTelemetry span export for evaluate().
+tracing = ["opentelemetry-sdk>=1.20"]
+# Everything needed to run the full test suite and demo.
+dev = [
+    "cryptography>=42",
+    "model2vec>=0.3",
+    "numpy>=1.24",
+    "opentelemetry-sdk>=1.20",
+    "pytest>=7",
+]
+
+[project.scripts]
+chainmail-governor = "chainmail.service.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

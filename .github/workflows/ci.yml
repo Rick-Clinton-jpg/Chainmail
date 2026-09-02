@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install (core + crypto + tracing, no ML)
+        run: |
+          python -m pip install --upgrade pip
+          # model2vec pulls a large wheel set and a model download; the suite
+          # runs green without it (falls back to TF-IDF), so CI skips it.
+          python -m pip install -e ".[crypto,tracing]" pytest
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Adversarial mutation harness (standard family must fully pass)
+        run: |
+          python - <<'PY'
+          import dataclasses
+          from chainmail import (
+              ChainmailGovernor, Proposal, make_permission, build_demo_envelope,
+              MutationRunner, standard_mutant_family,
+          )
+          env = dataclasses.replace(
+              build_demo_envelope(),
+              allowed_actions={"write_code", "deploy_service", "gather_requirements",
+                               "research", "push_staging"},
+          )
+          seed = Proposal("ci-seed", "agent_coder", "write_code",
+                          make_permission("code", "write"),
+                          "Implement the delegation guard for the governance prototype",
+                          0.85, payload={"file": "repo/src/guard.py"})
+          report = MutationRunner(
+              lambda: ChainmailGovernor(env, auto_embedding=False)
+          ).run(seed, standard_mutant_family(seed, env))
+          print(report.to_dict())
+          assert report.passed, "mutation harness found survivors or gaps"
+          PY

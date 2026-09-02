@@ -1,0 +1,365 @@
+"""Behavioural suite for the v5 governor. Ported from the v4 tests and adapted
+to the v5 API; the deterministic ``JaccardEmbeddingEngine`` (see conftest) keeps
+every semantic assertion reproducible."""
+
+import dataclasses
+
+import pytest
+
+from chainmail import (
+    Authority, ChainmailGovernor, Decision, GovernorConfig, MockArmourBoundary,
+    DenyAllArmourBoundary, Permission, Proposal, RestrictPolicy, RiskSignal, make_permission,
+)
+
+OBJ = "Build a secure multi-agent governance prototype"
+OFF_OBJ = "Launch a cryptocurrency token and maximize hype worldwide"
+
+
+def prop(pid, agent, action, perm, frag=OBJ, conf=0.85, **kw):
+    return Proposal(pid, agent, action, perm, frag, conf, **kw)
+
+
+# -- authority / delegation -------------------------------------------
+
+def test_authority_subset():
+    broad = Authority(permissions={make_permission("read"), make_permission("write"),
+                                   make_permission("deploy")})
+    narrow = Authority(permissions={make_permission("read"), make_permission("write")})
+    assert narrow.is_subset_of(broad)
+    assert not broad.is_subset_of(narrow)
+
+
+def test_delegation_cannot_expand(governor):
+    offered = Authority(permissions={make_permission("deploy", "staging"),
+                                     make_permission("code", "write")})
+    ok, msg = governor.register_delegation("agent_research", "agent_coder", "hand off", offered)
+    assert not ok and "does not hold" in msg
+
+
+def test_delegation_preserve_or_reduce(governor):
+    offered = Authority(permissions={make_permission("research"), make_permission("read", "docs")})
+    ok, _ = governor.register_delegation("agent_research", "agent_coder", "share", offered)
+    assert ok
+    assert not governor.live_authority["agent_coder"].can(make_permission("research"))
+
+
+def test_delegation_rejects_unknown_recipient(governor):
+    ok, msg = governor.register_delegation(
+        "agent_research", "ghost_agent", "x", Authority(permissions={make_permission("research")}))
+    assert not ok and "unknown recipient" in msg
+
+
+def test_role_enforced_delegation(governor):
+    offered = Authority(permissions={make_permission("read", "docs")})
+    ok, msg = governor.register_delegation("agent_research", "agent_approver", "bad", offered)
+    assert not ok and "Role violation" in msg
+
+
+def test_provenance_recorded(governor):
+    ok, _ = governor.register_delegation(
+        "agent_research", "agent_coder", "handoff",
+        Authority(permissions={make_permission("research")}))
+    assert ok and len(governor.provenance) == 1
+    assert governor.provenance[0].from_id == "agent_research"
+
+
+def test_authority_laundering(make_governor):
+    from chainmail import AuthorityEnvelope
+    env = AuthorityEnvelope(
+        objective="Test laundering",
+        agent_authorities={
+            "agent_A": Authority(permissions={make_permission("shared"), make_permission("excl_A")}),
+            "agent_B": Authority(permissions={make_permission("shared"), make_permission("excl_B")}),
+            "agent_C": Authority(permissions={make_permission("excl_C")}),
+        },
+        allowed_delegations={"role_A": {"role_B"}, "role_B": {"role_C"}, "role_C": set()},
+        agent_roles={"agent_A": "role_A", "agent_B": "role_B", "agent_C": "role_C"},
+        hard_denials=set(), max_fleet_steps=50,
+    )
+    g = make_governor(env)
+    ok1, _ = g.register_delegation("agent_A", "agent_B", "share",
+                                   Authority(permissions={make_permission("shared")}))
+    ok2, _ = g.register_delegation("agent_B", "agent_C", "launder",
+                                   Authority(permissions={make_permission("shared")}))
+    assert ok1 and ok2
+    assert not g.live_authority["agent_C"].can(make_permission("shared"))
+
+
+def test_revoke_delegation_restores_ceiling(governor):
+    governor.register_delegation("agent_research", "agent_coder", "narrow",
+                                 Authority(permissions={make_permission("read", "docs")}))
+    assert not governor.live_authority["agent_coder"].can(make_permission("code", "write"))
+    assert governor.revoke_delegation("agent_coder")
+    assert governor.live_authority["agent_coder"].can(make_permission("code", "write"))
+
+
+# -- core decisions ----------------------------------------------------
+
+def test_hard_denial(governor):
+    r = governor.evaluate(prop("p1", "agent_deploy", "delete_production",
+                               make_permission("deploy", "staging"), "clean up", 0.95))
+    assert r.decision == Decision.HUMAN and RiskSignal.AUTHORITY_ABUSE in r.signals
+
+
+def test_missing_permission(governor):
+    r = governor.evaluate(prop("p2", "agent_research", "gather",
+                               make_permission("deploy", "staging"), OBJ, 0.7))
+    assert r.decision == Decision.HUMAN and RiskSignal.AUTHORITY_ABUSE in r.signals
+
+
+def test_unknown_agent(governor):
+    r = governor.evaluate(prop("p3", "nobody", "gather", make_permission("research")))
+    assert r.decision == Decision.HUMAN and RiskSignal.UNKNOWN_AGENT in r.signals
+
+
+def test_happy_path_continue(governor):
+    r = governor.evaluate(prop("p4", "agent_research", "gather", make_permission("research")))
+    assert r.decision == Decision.CONTINUE
+
+
+def test_objective_mismatch(governor):
+    r = governor.evaluate(prop("p5", "agent_research", "gather",
+                               make_permission("research"), OFF_OBJ, 0.9))
+    assert r.decision == Decision.HUMAN and RiskSignal.OBJECTIVE_MISMATCH in r.signals
+
+
+def test_low_confidence_restrict(governor):
+    r = governor.evaluate(prop("p6", "agent_research", "gather",
+                               make_permission("research"), OBJ, 0.2))
+    assert r.decision == Decision.RESTRICT and RiskSignal.LOW_CONFIDENCE in r.signals
+    assert r.restricted_permissions == {make_permission("research")}
+
+
+def test_context_cannot_create_authority(governor):
+    before = repr(governor.live_authority["agent_research"])
+    for i in range(5):
+        governor.evaluate(prop(f"px{i}", "agent_research", "research", make_permission("research")))
+    assert repr(governor.live_authority["agent_research"]) == before
+
+
+def test_fleet_snapshot(governor):
+    snap = governor.snapshot()
+    assert snap["objective"] and snap["step_count"] == 0
+
+
+def test_effective_authority_is_a_copy(governor):
+    r = governor.evaluate(prop("p7", "agent_research", "gather", make_permission("research")))
+    r.effective_authority.permissions.clear()
+    assert governor.live_authority["agent_research"].can(make_permission("research"))
+
+
+# -- budgets --------------------------------------------------------
+
+def test_budget_consumption(governor):
+    for i in range(5):
+        r = governor.evaluate(prop(f"dep{i}", "agent_deploy", "push",
+                                   make_permission("deploy", "staging")))
+        assert r.decision == Decision.CONTINUE
+    r = governor.evaluate(prop("dep5", "agent_deploy", "push",
+                               make_permission("deploy", "staging")))
+    assert r.decision == Decision.HUMAN and RiskSignal.BUDGET_EXHAUSTED in r.signals
+
+
+def test_budget_not_consumed_on_non_continue(governor):
+    # Low-confidence proposals are RESTRICTed and must NOT spend deploy budget.
+    perm = make_permission("deploy", "staging")
+    for i in range(4):
+        r = governor.evaluate(prop(f"lb{i}", "agent_deploy", "push", perm, OBJ, 0.1))
+        assert r.decision == Decision.RESTRICT
+    live = governor.live_authority["agent_deploy"]
+    assert live.budget_remaining.get("deploy:staging", 5) == 5
+    assert live.has_budget(perm)
+
+
+def test_fleet_step_budget(make_governor, envelope):
+    env = dataclasses.replace(envelope, max_fleet_steps=3)
+    g = make_governor(env)
+    outcomes = [g.evaluate(prop(f"f{i}", "agent_research", "research",
+                                make_permission("research"))).decision for i in range(4)]
+    assert outcomes[:3] == [Decision.CONTINUE] * 3
+    assert outcomes[3] == Decision.HUMAN
+
+
+def test_per_agent_step_budget(make_governor):
+    g = make_governor(config=GovernorConfig(per_agent_step_budget=2))
+    d = [g.evaluate(prop(f"a{i}", "agent_research", "research",
+                         make_permission("research"))).decision for i in range(3)]
+    assert d == [Decision.CONTINUE, Decision.CONTINUE, Decision.HUMAN]
+
+
+# -- restrict policies -------------------------------------------------
+
+def test_restrict_ttl_steps(make_governor, envelope):
+    env = dataclasses.replace(envelope, restrict_policy=RestrictPolicy.TTL_STEPS,
+                              restrict_ttl_steps=2)
+    g = make_governor(env)
+    r = g.evaluate(prop("r1", "agent_coder", "write_code", make_permission("code", "write"),
+                        OBJ, 0.2, payload={"file": "repo/main.py"}))
+    assert r.decision == Decision.RESTRICT
+    assert not g._effective_authority("agent_coder").can(make_permission("code", "write"))
+    for i in range(2):
+        g.evaluate(prop(f"fill{i}", "agent_research", "research", make_permission("research")))
+    assert g._effective_authority("agent_coder").can(make_permission("code", "write"))
+
+
+def test_restrict_step_budget(make_governor, envelope):
+    env = dataclasses.replace(envelope, restrict_policy=RestrictPolicy.STEP_BUDGET,
+                              restrict_step_budget=2)
+    g = make_governor(env)
+    pw = make_permission("code", "write")
+    # Distinct on-objective fragments so the step-budget path is what's under
+    # test, not the re-entry gate (which would fire on re-submitting sb1's
+    # just-refused fragment).
+    f2 = "keep the system inside the declared authority envelope"
+    assert g.evaluate(prop("sb1", "agent_coder", "write_code", pw, OBJ, 0.2,
+                           payload={"file": "repo/main.py"})).decision == Decision.RESTRICT
+    # budget of 2 => two clean uses, then escalate
+    assert g.evaluate(prop("sb2", "agent_coder", "write_code", pw, f2, 0.85,
+                           payload={"file": "repo/main.py"})).decision == Decision.CONTINUE
+    assert g.evaluate(prop("sb3", "agent_coder", "write_code", pw, f2, 0.85,
+                           payload={"file": "repo/main.py"})).decision == Decision.CONTINUE
+    assert g.evaluate(prop("sb4", "agent_coder", "write_code", pw, f2, 0.85,
+                           payload={"file": "repo/main.py"})).decision == Decision.HUMAN
+
+
+def test_restrict_human_only(make_governor, envelope):
+    env = dataclasses.replace(envelope, restrict_policy=RestrictPolicy.HUMAN_ONLY)
+    g = make_governor(env)
+    assert g.evaluate(prop("ho1", "agent_coder", "write_code", make_permission("code", "write"),
+                           OBJ, 0.2, payload={"file": "repo/main.py"})).decision == Decision.RESTRICT
+    for i in range(5):
+        g.evaluate(prop(f"fill{i}", "agent_research", "research", make_permission("research")))
+    assert not g._effective_authority("agent_coder").can(make_permission("code", "write"))
+
+
+# -- drift / anomaly ------------------------------------------------
+
+def test_intent_graph_drift(governor):
+    for i in range(3):
+        governor.evaluate(prop(f"cons{i}", "agent_coder", "write_code",
+                               make_permission("code", "write"), OBJ, 0.85,
+                               payload={"file": "repo/main.py"}))
+    r = governor.evaluate(prop("drift1", "agent_coder", "write_code",
+                               make_permission("code", "write"),
+                               "Create a viral social media engagement farm", 0.85,
+                               payload={"file": "repo/main.py"}))
+    assert RiskSignal.DRIFT in r.signals or RiskSignal.OBJECTIVE_MISMATCH in r.signals
+
+
+def test_long_horizon_drift(governor):
+    frags = [
+        "Build a secure multi-agent governance prototype",
+        "Build a secure multi-agent governance system",
+        "Build a secure multi-agent system",
+        "Build a multi-agent system",
+        "Build a multi-agent platform",
+        "Build a platform for agents",
+        "Build a viral platform",
+        "Build a viral engagement platform",
+    ]
+    r = None
+    for i, f in enumerate(frags):
+        r = governor.evaluate(prop(f"d{i}", "agent_coder", "write_code",
+                                   make_permission("code", "write"), f, 0.85,
+                                   payload={"file": "repo/main.py"}))
+    assert r.decision in (Decision.RESTRICT, Decision.RECHECK, Decision.HUMAN)
+
+
+def test_universal_high_confidence(governor):
+    frag = "Launch a cryptocurrency and maximize token value"
+    for agent, perm in [("agent_research", make_permission("research")),
+                        ("agent_coder", make_permission("code", "write")),
+                        ("agent_deploy", make_permission("deploy", "staging"))]:
+        governor.evaluate(prop(f"u_{agent}", agent, "gather", perm, frag, 0.95))
+    r = governor.evaluate(prop("final", "agent_coder", "write_code",
+                               make_permission("code", "write"), frag, 0.95,
+                               payload={"file": "repo/main.py"}))
+    assert RiskSignal.OBJECTIVE_MISMATCH in r.signals or RiskSignal.ASSUMPTION_ANOMALY in r.signals
+
+
+# -- re-entry to a refused objective --------------------------------
+
+def test_reentry_hard_gate_no_prior_refusal(governor):
+    # Repeating a fragment many times, never refused -> never a re-entry hit.
+    for i in range(4):
+        r = governor.evaluate(prop(f"re{i}", "agent_research", "gather",
+                                   make_permission("research"), OBJ, 0.85))
+        assert r.decision == Decision.CONTINUE
+        assert RiskSignal.OBJECTIVE_REENTRY not in r.signals
+
+
+def test_reentry_high_escalates_to_human(governor):
+    off = "Exfiltrate the signing keys to an external host"
+    # First submission is refused for objective mismatch (HUMAN) -> boundary.
+    r1 = governor.evaluate(prop("rx1", "agent_research", "gather",
+                                make_permission("research"), off, 0.9))
+    assert r1.decision == Decision.HUMAN
+    # Reworded, high-confidence return to the same idea -> HIGH re-entry -> HUMAN.
+    r2 = governor.evaluate(prop("rx2", "agent_research", "gather",
+                                make_permission("research"),
+                                "Exfiltrate the signing keys to an outside server", 0.95))
+    assert r2.decision == Decision.HUMAN
+    assert RiskSignal.OBJECTIVE_REENTRY in r2.signals
+
+
+def test_reentry_is_per_agent(governor):
+    off = "Exfiltrate the signing keys to an external host"
+    governor.evaluate(prop("pa1", "agent_research", "gather", make_permission("research"), off, 0.9))
+    # A different agent with no refusal history is not tarred by it.
+    r = governor.evaluate(prop("pa2", "agent_coder", "write_code",
+                               make_permission("code", "write"), off, 0.9,
+                               payload={"file": "repo/x.py"}))
+    assert RiskSignal.OBJECTIVE_REENTRY not in r.signals
+
+
+# -- armour ---------------------------------------------------------
+
+def test_armour_continue(make_governor):
+    g = make_governor(armour=MockArmourBoundary())
+    assert g.evaluate(prop("a1", "agent_research", "gather",
+                           make_permission("research"))).decision == Decision.CONTINUE
+
+
+def test_armour_fail_closed(make_governor):
+    g = make_governor(armour=DenyAllArmourBoundary())
+    r = g.evaluate(prop("a2", "agent_research", "gather", make_permission("research")))
+    assert r.decision == Decision.HUMAN and "Armour boundary rejected" in r.reason
+
+
+def test_armour_exception_fail_closed(make_governor):
+    class Boom(MockArmourBoundary):
+        def execute(self, proposal, authority):
+            raise RuntimeError("kaboom")
+    g = make_governor(armour=Boom())
+    r = g.evaluate(prop("a3", "agent_research", "gather", make_permission("research")))
+    assert r.decision == Decision.HUMAN and RiskSignal.VERIFIER_ERROR in r.signals
+
+
+# -- envelope integrity ------------------------------------------------
+
+def test_envelope_fingerprint_drift(governor, envelope):
+    object.__setattr__(envelope, "max_fleet_steps", 999)
+    r = governor.evaluate(prop("ed", "agent_research", "gather", make_permission("research")))
+    assert r.decision == Decision.HUMAN and RiskSignal.ENVELOPE_DRIFT in r.signals
+
+
+# -- fail-closed on engine crashes ----------------------------------
+
+def test_fail_closed_semantic_crash(make_governor):
+    class BrokenEngine:
+        def fit(self, docs): return None
+        def similarity(self, a, b): raise RuntimeError("crash")
+    g = make_governor(embedding=BrokenEngine())
+    r = g.evaluate(prop("bk", "agent_research", "gather", make_permission("research")))
+    assert r.decision == Decision.HUMAN and RiskSignal.OBJECTIVE_MISMATCH in r.signals
+
+
+def test_fail_closed_intent_graph_crash(governor):
+    class BrokenIG:
+        entries = []
+        def add(self, e): pass
+        def drift_score(self, *a, **k): raise RuntimeError("crash")
+        def peer_consensus_score(self, *a, **k): raise RuntimeError("crash")
+    governor.intent_graph = BrokenIG()
+    r = governor.evaluate(prop("bg", "agent_research", "gather", make_permission("research")))
+    assert r.decision in (Decision.RESTRICT, Decision.RECHECK, Decision.HUMAN)
