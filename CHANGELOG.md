@@ -61,10 +61,17 @@ and `_seen_proposal_ids` lived only in process RAM: a restart silently
 dropped replay protection, and nothing prevented two governor processes
 sharing one SQLite database from both accepting the same identifier.
 
-- `SQLiteStore` schema bumped to v2: new `replay_nonces` and
-  `replay_proposal_ids` tables, each with a `UNIQUE (scope, identifier)`
-  constraint. An older v1 database is migrated in place (additive-only:
-  existing tables and rows are untouched) the next time it's opened.
+- `SQLiteStore` schema at v3: `replay_nonces` (`UNIQUE (deployment_namespace,
+  agent_id, nonce)`) and `replay_proposal_ids` (`UNIQUE (deployment_namespace,
+  proposal_id)`) — explicit columns, not a constructed `scope` string, so the
+  uniqueness boundary is inspectable directly in the schema. `key_id` and
+  `envelope_fingerprint` are stored as audit metadata columns only; neither
+  is part of either `UNIQUE` constraint (see "Documented scope" below for
+  why). An older database (v1, or the short-lived v2 `scope`-column shape)
+  is migrated in place the next time it's opened: `proposals`/`delegations`
+  rows are always preserved; a pre-v3 `replay_nonces`/`replay_proposal_ids`
+  table is dropped and rebuilt in the new shape (that data was only ever
+  claim history, not proposal history, and predates the corrected scope).
 - `SQLiteStore.claim_nonce()` / `claim_proposal_id()` — a claim is a single
   atomic `INSERT`; there is no separate check-then-insert. A `UNIQUE`
   conflict (`sqlite3.IntegrityError`) *is* the replay signal, so two
@@ -75,10 +82,21 @@ sharing one SQLite database from both accepting the same identifier.
   its `AuditSink`, nonce and proposal-ID claims become durable
   automatically — no extra opt-in. Without one, behaviour is unchanged
   (in-memory only), and `security_report()` now flags that as a weakness.
+- `GovernorConfig.production()` now also sets `production_mode=True`, which
+  `ChainmailGovernor.__init__` enforces at construction: production mode
+  requires *both* a real `ApprovalVerifier` (already enforced) *and* durable
+  replay storage (a `SQLiteStore` wired into `AuditSink`) — construction
+  raises `ValueError` otherwise rather than silently falling back to
+  in-memory-only protection. Development configs (plain `GovernorConfig()`)
+  are unaffected and may still use the in-memory fallback.
 - Claims happen only *after* a proposal's signature (if any) is verified,
   so an attacker who cannot forge a valid signature can never claim (and so
   can never poison) an identifier a legitimate, correctly-signed proposal
   will need later.
+- Consumption is unconditional: a claimed nonce/proposal-ID stays consumed
+  even if the proposal's final decision is `RESTRICT`/`RECHECK`/`HUMAN`
+  rather than `CONTINUE` — there is no path that returns a claimed
+  identifier. Retrying requires a new proposal with a new nonce.
 - Fail-closed: if the durable store cannot commit a claim (disk full,
   locked, corrupt, ...), the governor returns `HUMAN` /
   `REPLAY_STORE_UNAVAILABLE` — never `CONTINUE` — and best-effort records
@@ -87,12 +105,15 @@ sharing one SQLite database from both accepting the same identifier.
   cache hit is always backed by a prior durable claim, so it's safe to
   trust; a cache miss always falls through to the atomic DB claim — cache
   eviction never weakens the guarantee).
-- Documented scope: nonce uniqueness is **per agent** (bound to
-  `deployment_namespace` + envelope/policy fingerprint + `agent_id` — not
-  `key_id`, so a nonce stays blocked across that agent's key rotation).
-  Proposal-ID uniqueness is **fleet-wide** (namespace + envelope fingerprint
-  only), matching the pre-durability in-memory behaviour. Both reset on a
-  genuine envelope/policy change (the fingerprint changes). New
+- Documented scope: nonce uniqueness is **per agent** (`deployment_namespace`
+  + `agent_id` + `nonce` — not `key_id`, so a nonce stays blocked across that
+  agent's key rotation). Proposal-ID uniqueness is **fleet-wide**
+  (`deployment_namespace` + `proposal_id`), matching the pre-durability
+  in-memory behaviour. Neither includes the envelope/policy fingerprint:
+  replay protection identifies whether a *signed request* has already been
+  submitted, and a policy/envelope update must never make an earlier signed
+  proposal replayable again — an attacker holding one could otherwise retry
+  it simply by waiting for (or triggering) a policy change. New
   `ChainmailGovernor(..., deployment_namespace="default")` constructor
   parameter lets multiple deployments share one physical database file.
 - The non-durable in-memory nonce cache is now also scoped per agent (it
@@ -100,13 +121,16 @@ sharing one SQLite database from both accepting the same identifier.
   scope and could over-block two different agents that happened to pick the
   same nonce string).
 - New `RiskSignal.REPLAY_STORE_UNAVAILABLE`.
-- 12 new tests in `tests/test_replay_persistence.py`: survival across a
-  simulated restart (separate `SQLiteStore` instances over the same file),
-  two governors racing on one nonce, an invalid signature failing to poison
-  a nonce, a forced persistence failure never reaching `CONTINUE`, migration
-  of a hand-built v1 database, cache eviction not weakening protection, and
-  the documented scope (per-agent nonces, fleet-wide proposal IDs, survival
-  across key rotation, reset on envelope change).
+- 14 tests in `tests/test_replay_persistence.py` (+1 in `test_crypto.py` for
+  production-mode enforcement): survival across a simulated restart
+  (separate `SQLiteStore` instances over the same file), two governors
+  racing on one nonce, an invalid signature failing to poison a nonce, a
+  forced persistence failure never reaching `CONTINUE`, migration of both a
+  hand-built v1 database and a hand-built v2 (`scope`-column) database,
+  cache eviction not weakening protection, unconditional consumption on a
+  non-`CONTINUE` decision, and the documented scope end to end (per-agent
+  nonces, fleet-wide proposal IDs, survival across both key rotation *and* a
+  genuine envelope/policy change).
 
 ## v5.1.0
 

@@ -72,19 +72,31 @@ class GovernorConfig:
     embedding_refit_interval: int = 256
     """Refit the TF-IDF fallback engine every N proposals. Ignored by model engines."""
 
+    production_mode: bool = False
+    """Set by ``GovernorConfig.production()``. When True, ``ChainmailGovernor``
+    additionally requires a real :class:`~chainmail.crypto.ApprovalVerifier`
+    (see ``require_signature``) AND durable replay storage (a
+    :class:`~chainmail.persistence.SQLiteStore` wired into ``AuditSink``) at
+    construction time -- an in-memory-only replay-protection fallback is a
+    development convenience, not something a production deployment should
+    silently accept. Not meant to be set directly; use
+    ``GovernorConfig.production()``."""
+
     @classmethod
     def production(cls, **overrides: Any) -> "GovernorConfig":
         """A secure-by-default config for real deployments.
 
-        Differs from ``GovernorConfig()`` only in ``require_signature``, which
-        this sets to ``True``. Everything else keeps the same defaults, which
-        the caller may still override. Pairing this with a
-        :class:`~chainmail.crypto.NullApprovalVerifier` (or no verifier at
-        all) is rejected at governor construction time -- see
-        ``ChainmailGovernor.__init__`` -- so a real
-        :class:`~chainmail.crypto.CompositeVerifier` must be supplied.
+        Sets ``require_signature=True`` and ``production_mode=True``.
+        Everything else keeps the same defaults, which the caller may still
+        override. ``ChainmailGovernor.__init__`` rejects this config unless
+        both a real :class:`~chainmail.crypto.ApprovalVerifier` (e.g.
+        :class:`~chainmail.crypto.CompositeVerifier`) and a durable replay
+        store (``audit=AuditSink(sqlite_store=SQLiteStore(...))``) are
+        supplied -- a NullApprovalVerifier or in-memory-only replay
+        protection would silently defeat the point of asking for a
+        production configuration.
         """
-        defaults: Dict[str, Any] = {"require_signature": True}
+        defaults: Dict[str, Any] = {"require_signature": True, "production_mode": True}
         defaults.update(overrides)
         return cls(**defaults)
 

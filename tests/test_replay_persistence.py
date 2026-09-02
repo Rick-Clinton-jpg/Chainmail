@@ -3,11 +3,13 @@
 Covers: survival across a governor restart, atomicity across concurrent
 governor instances sharing one store, that an unauthenticated proposal can
 never poison an identifier, fail-closed behaviour on a persistence error,
-schema migration of a pre-existing database, that in-memory cache eviction
-never weakens the durable guarantee, and the documented scope (per-agent
-nonces, fleet-wide proposal IDs, both keyed to the envelope fingerprint) --
-including that a nonce stays blocked across a key rotation, since scope does
-not include key_id.
+schema migration of a pre-existing (and pre-hardening) database, that
+in-memory cache eviction never weakens the durable guarantee, unconditional
+consumption regardless of the final decision, and the documented scope
+(per-agent nonces, fleet-wide proposal IDs, both independent of the envelope
+fingerprint and of key_id -- so a claim survives a key rotation AND a
+policy/envelope change; only the (namespace, agent_id, nonce) /
+(namespace, proposal_id) columns are the uniqueness boundary).
 """
 
 import sqlite3
@@ -26,8 +28,8 @@ from conftest import JaccardEmbeddingEngine
 OBJ = "Build a secure multi-agent governance prototype"
 
 
-def _prop(pid, agent="agent_research", action="gather", nonce=None, **kw):
-    return Proposal(pid, agent, action, make_permission("research"), OBJ, 0.85,
+def _prop(pid, agent="agent_research", action="gather", nonce=None, confidence=0.85, **kw):
+    return Proposal(pid, agent, action, make_permission("research"), OBJ, confidence,
                     nonce=nonce, **kw)
 
 
@@ -202,6 +204,61 @@ def test_existing_v1_database_migrates_safely(tmp_path):
                              nonce="n1") is False
 
 
+def test_existing_v2_scope_based_database_migrates_safely(tmp_path):
+    """A database built by the first (v2, ``scope``-column) shape of the
+    replay tables must open cleanly and end up with the v3 (explicit-column)
+    shape -- the old table is dropped and rebuilt rather than crashing or
+    silently keeping the old, broader scope."""
+    db = str(tmp_path / "v2.db")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (2)")
+    conn.execute("""
+        CREATE TABLE proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, record_version INTEGER NOT NULL,
+            proposal_id TEXT NOT NULL, agent_id TEXT NOT NULL, action TEXT NOT NULL,
+            decision TEXT NOT NULL, signals TEXT, overlap REAL, drift REAL,
+            timestamp REAL NOT NULL, execution_id TEXT, phase TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE delegations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, record_version INTEGER NOT NULL,
+            from_agent TEXT NOT NULL, to_agent TEXT NOT NULL, reason TEXT,
+            authority TEXT, timestamp REAL NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE replay_nonces (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, nonce TEXT NOT NULL,
+            agent_id TEXT NOT NULL, key_id TEXT, envelope_fingerprint TEXT NOT NULL,
+            claimed_at REAL NOT NULL, UNIQUE (scope, nonce)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE replay_proposal_ids (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, proposal_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL, envelope_fingerprint TEXT NOT NULL,
+            claimed_at REAL NOT NULL, UNIQUE (scope, proposal_id)
+        )
+    """)
+    conn.execute("INSERT INTO replay_nonces (scope, nonce, agent_id, key_id, "
+                 "envelope_fingerprint, claimed_at) VALUES ('default:fp:a', 'old-scoped-nonce', "
+                 "'a', NULL, 'fp', 1000.0)")
+    conn.commit()
+    conn.close()
+
+    store = SQLiteStore(db)  # opens the existing v2 (scope-column) file
+    version = store._conn.execute("SELECT version FROM schema_version").fetchone()[0]
+    assert version == SQLiteStore.SCHEMA_VERSION
+    cols = {row[1] for row in store._conn.execute("PRAGMA table_info(replay_nonces)").fetchall()}
+    assert "scope" not in cols
+    assert {"deployment_namespace", "agent_id", "nonce"} <= cols
+    # the rebuilt table is empty (pre-hardening claims are not preserved) but usable
+    assert store.claim_nonce(namespace="default", agent_id="a", nonce="new-shape-nonce") is True
+    assert store.claim_nonce(namespace="default", agent_id="a", nonce="new-shape-nonce") is False
+
+
 # -- cache eviction never weakens the durable guarantee --------------------
 
 def test_cache_eviction_does_not_remove_durable_protection(tmp_path):
@@ -254,10 +311,9 @@ def test_proposal_id_scope_is_fleet_wide(tmp_path):
 
 
 def test_nonce_stays_blocked_across_key_rotation(tmp_path):
-    """Scope binds (namespace, envelope_fingerprint, agent_id) -- not key_id
-    -- so a nonce claimed under one key for an agent is still blocked after
-    that agent rotates to a new key. Nonces identify the request, not the
-    signing key."""
+    """Scope binds (namespace, agent_id, nonce) -- not key_id -- so a nonce
+    claimed under one key for an agent is still blocked after that agent
+    rotates to a new key. Nonces identify the request, not the signing key."""
     db = str(tmp_path / "chainmail.db")
     reg = KeyRegistry()
     secret1 = b"key-one-secret-value"
@@ -279,21 +335,62 @@ def test_nonce_stays_blocked_across_key_rotation(tmp_path):
     assert RiskSignal.REPLAY_DETECTED in r2.signals
 
 
-def test_replay_scope_resets_on_envelope_change(tmp_path):
-    """Scope includes the envelope's construction fingerprint, so a nonce
-    claimed under one policy/envelope version does not block reuse under a
-    genuinely different one."""
+def test_replay_detected_across_envelope_change(tmp_path):
+    """The uniqueness boundary is independent of the envelope/policy
+    fingerprint (see SQLiteStore module docs): replay protection identifies
+    whether a *signed request* has already been submitted, and a policy
+    update must not make an old signed proposal replayable again. An
+    attacker holding an earlier signed proposal must not be able to retry it
+    just by waiting for (or triggering) a policy change."""
     import dataclasses
 
     db = str(tmp_path / "chainmail.db")
+    reg = KeyRegistry()
+    secret = b"policy-change-secret-value"
+    reg.add_key("k1", "agent_research", ALGO_HMAC, secret)
     store = SQLiteStore(db)
-    env_a = build_demo_envelope()
-    g_a = ChainmailGovernor(env_a, embedding=JaccardEmbeddingEngine(), auto_embedding=False,
-                            audit=AuditSink(sqlite_store=store))
-    assert g_a.evaluate(_prop("p1", nonce="policy-nonce")).decision == Decision.CONTINUE
 
+    env_a = build_demo_envelope()
+    g_a = ChainmailGovernor(env_a, config=GovernorConfig(require_signature=True),
+                            embedding=JaccardEmbeddingEngine(), auto_embedding=False,
+                            audit=AuditSink(sqlite_store=store), verifier=CompositeVerifier(reg))
+    original = sign_proposal(_prop("p1", nonce="pre-policy-change-nonce"), "k1",
+                             algorithm=ALGO_HMAC, hmac_secret=secret,
+                             nonce="pre-policy-change-nonce")
+    assert g_a.evaluate(original).decision == Decision.CONTINUE
+
+    # policy/envelope changes; a fresh governor is constructed over it
     env_b = dataclasses.replace(build_demo_envelope(), max_fleet_steps=999)
-    g_b = ChainmailGovernor(env_b, embedding=JaccardEmbeddingEngine(), auto_embedding=False,
-                            audit=AuditSink(sqlite_store=store))
-    r = g_b.evaluate(_prop("p2", nonce="policy-nonce"))
-    assert r.decision == Decision.CONTINUE
+    assert env_b.fingerprint() != env_a.fingerprint()
+    g_b = ChainmailGovernor(env_b, config=GovernorConfig(require_signature=True),
+                            embedding=JaccardEmbeddingEngine(), auto_embedding=False,
+                            audit=AuditSink(sqlite_store=store), verifier=CompositeVerifier(reg))
+
+    # resubmitting the exact same signed proposal must still be a replay
+    r = g_b.evaluate(original)
+    assert r.decision == Decision.HUMAN
+    assert RiskSignal.REPLAY_DETECTED in r.signals
+
+
+# -- consumption semantics ---------------------------------------------------
+
+def test_nonce_consumed_even_when_final_decision_is_not_continue(tmp_path):
+    """An authenticated proposal consumes its nonce and proposal_id the
+    moment they are claimed -- unconditionally, even if the contextual-risk
+    checks further down evaluate() land on RESTRICT/RECHECK/HUMAN rather
+    than CONTINUE. Retrying requires a new proposal with a new nonce."""
+    db = str(tmp_path / "chainmail.db")
+    store = SQLiteStore(db)
+    g = _gov(store)
+
+    # confidence at/below low_confidence_max (default 0.35) -> LOW_CONFIDENCE -> RESTRICT
+    risky = _prop("risky", nonce="consumed-even-on-restrict", confidence=0.1)
+    r1 = g.evaluate(risky)
+    assert r1.decision == Decision.RESTRICT
+    assert RiskSignal.LOW_CONFIDENCE in r1.signals
+
+    # the nonce was consumed regardless -- a retry with the same nonce is a replay
+    retry = _prop("retry", nonce="consumed-even-on-restrict")
+    r2 = g.evaluate(retry)
+    assert r2.decision == Decision.HUMAN
+    assert RiskSignal.REPLAY_DETECTED in r2.signals

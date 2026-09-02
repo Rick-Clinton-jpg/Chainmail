@@ -91,6 +91,15 @@ class ChainmailGovernor:
                 "verifier= (e.g. CompositeVerifier(KeyRegistry(...))) or set "
                 "require_signature=False for a development configuration."
             )
+        if self.config.production_mode and self.audit.sqlite is None:
+            raise ValueError(
+                "config.production_mode=True (set by GovernorConfig.production()) "
+                "requires durable replay storage, but no SQLiteStore is wired into "
+                "audit: in-memory-only nonce/proposal-ID replay protection does not "
+                "survive a restart and offers no protection across multiple governor "
+                "processes. Pass audit=AuditSink(sqlite_store=SQLiteStore(...)), or "
+                "build a non-production GovernorConfig() for development."
+            )
         self.quorum = quorum
         self.quorum_transport = quorum_transport or LocalSingleGovernorTransport()
 
@@ -189,6 +198,7 @@ class ChainmailGovernor:
             "quorum_configured": self.quorum is not None,
             "dedupe_proposal_ids": self.config.dedupe_proposal_ids,
             "durable_replay_protection": durable_replay,
+            "production_mode": self.config.production_mode,
             "deployment_namespace": self.deployment_namespace,
             "weaknesses": weaknesses,
         }
@@ -243,7 +253,18 @@ class ChainmailGovernor:
         for the durable path's scope and atomicity guarantees -- this method
         never does a separate check-then-insert against the store; a claim
         is a single atomic call, and a UNIQUE conflict *is* the replay
-        signal.
+        signal. The uniqueness boundary is (namespace, agent_id, nonce) /
+        (namespace, proposal_id) -- deliberately independent of the
+        envelope/policy fingerprint, so a policy change can never make an
+        earlier signed proposal replayable again.
+
+        Consumption is unconditional: once claimed here (which only happens
+        after signature verification, above this call in ``evaluate``), the
+        identifiers stay consumed even if the contextual-risk checks further
+        down ``evaluate`` land on RESTRICT / RECHECK / HUMAN rather than
+        CONTINUE. There is no path that "returns" a claimed nonce -- retrying
+        requires a new proposal with a new nonce, regardless of how the
+        original one was decided.
         """
         if durable:
             envelope_fp = self.envelope._construction_fingerprint

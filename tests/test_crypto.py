@@ -154,7 +154,29 @@ def test_require_signature_rejects_null_verifier():
 
 def test_production_config_requires_signature():
     assert GovernorConfig.production().require_signature is True
+    assert GovernorConfig.production().production_mode is True
     assert GovernorConfig.production(dedupe_proposal_ids=False).dedupe_proposal_ids is False
+
+
+def test_production_config_requires_durable_replay_storage():
+    from chainmail import AuditSink, ChainmailGovernor, CompositeVerifier, KeyRegistry, SQLiteStore, build_demo_envelope
+
+    with pytest.raises(ValueError, match="production_mode"):
+        ChainmailGovernor(
+            build_demo_envelope(),
+            config=GovernorConfig.production(),
+            verifier=CompositeVerifier(KeyRegistry()),
+            auto_embedding=False,
+        )
+    # with a durable store wired in, construction succeeds
+    g = ChainmailGovernor(
+        build_demo_envelope(),
+        config=GovernorConfig.production(),
+        verifier=CompositeVerifier(KeyRegistry()),
+        audit=AuditSink(sqlite_store=SQLiteStore()),
+        auto_embedding=False,
+    )
+    assert g.security_report()["durable_replay_protection"] is True
 
 
 def test_canonical_bytes_are_stable():

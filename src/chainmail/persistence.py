@@ -188,9 +188,18 @@ class HashChainLog:
 # ============================================================================
 
 class SQLiteStore:
-    # v1: proposals, delegations. v2: + replay_nonces, replay_proposal_ids
-    # (durable replay protection -- see claim_nonce / claim_proposal_id).
-    SCHEMA_VERSION = 2
+    # v1: proposals, delegations. v2: + replay_nonces, replay_proposal_ids,
+    # scoped by a constructed (namespace, envelope_fingerprint[, agent_id])
+    # "scope" string. v3: replay tables rebuilt with explicit columns and the
+    # uniqueness boundary narrowed to (namespace, agent_id, nonce) /
+    # (namespace, proposal_id) -- envelope_fingerprint is metadata only, no
+    # longer part of uniqueness (see claim_nonce / claim_proposal_id: a
+    # policy/envelope change must never make an old signed proposal replayable
+    # again). A v2 database's replay tables are dropped and recreated on open
+    # (see _migrate_replay_tables) -- v2 shipped only within this session, so
+    # there is no real replay history to preserve across that specific
+    # transition; proposals/delegations are untouched by any version bump.
+    SCHEMA_VERSION = 3
 
     def __init__(self, db_path: str = ":memory:") -> None:
         self.db_path = db_path
@@ -212,9 +221,12 @@ class SQLiteStore:
             if row is None:
                 c.execute("INSERT INTO schema_version (version) VALUES (?)", (self.SCHEMA_VERSION,))
             elif row[0] < self.SCHEMA_VERSION:
-                # Table creation below is idempotent (CREATE TABLE IF NOT EXISTS) and
-                # additive-only, so an older database just gains the new tables here.
+                # proposals/delegations are additive-only across every version, so an
+                # older database just gains new tables/columns here. The replay
+                # tables specifically may need their old (pre-v3) shape replaced --
+                # see _migrate_replay_tables.
                 logger.info("migrating SQLiteStore schema %s -> %s", row[0], self.SCHEMA_VERSION)
+                self._migrate_replay_tables(c)
                 c.execute("UPDATE schema_version SET version = ?", (self.SCHEMA_VERSION,))
             c.execute("""
                 CREATE TABLE IF NOT EXISTS proposals (
@@ -243,34 +255,40 @@ class SQLiteStore:
                     timestamp REAL NOT NULL
                 )
             """)
-            # Durable replay protection. ``scope`` encodes the binding described in
-            # claim_nonce()/claim_proposal_id(): deployment namespace + envelope
-            # (policy) fingerprint, plus agent_id for nonces. The UNIQUE constraint
-            # is the whole point -- claims are a single atomic INSERT, never a
-            # separate SELECT-then-INSERT, so two governor processes racing on the
-            # same identifier cannot both succeed (the loser gets an
+            # Durable replay protection. The UNIQUE constraint is the whole
+            # point -- claims are a single atomic INSERT, never a separate
+            # SELECT-then-INSERT, so two governor processes racing on the same
+            # identifier cannot both succeed (the loser gets an
             # IntegrityError, which the caller reads as "replay").
+            #
+            # Deliberately NOT part of the uniqueness boundary:
+            # envelope_fingerprint. Replay protection answers "has this
+            # signed request already been submitted?" -- a policy/envelope
+            # update must not reset that answer, or an attacker holding an
+            # earlier signed proposal could replay it simply by waiting for
+            # (or triggering) a policy change. envelope_fingerprint and
+            # key_id are stored as audit metadata only.
             c.execute("""
                 CREATE TABLE IF NOT EXISTS replay_nonces (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    scope TEXT NOT NULL,
-                    nonce TEXT NOT NULL,
+                    deployment_namespace TEXT NOT NULL,
                     agent_id TEXT NOT NULL,
+                    nonce TEXT NOT NULL,
                     key_id TEXT,
-                    envelope_fingerprint TEXT NOT NULL,
+                    envelope_fingerprint TEXT,
                     claimed_at REAL NOT NULL,
-                    UNIQUE (scope, nonce)
+                    UNIQUE (deployment_namespace, agent_id, nonce)
                 )
             """)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS replay_proposal_ids (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    scope TEXT NOT NULL,
+                    deployment_namespace TEXT NOT NULL,
                     proposal_id TEXT NOT NULL,
                     agent_id TEXT NOT NULL,
-                    envelope_fingerprint TEXT NOT NULL,
+                    envelope_fingerprint TEXT,
                     claimed_at REAL NOT NULL,
-                    UNIQUE (scope, proposal_id)
+                    UNIQUE (deployment_namespace, proposal_id)
                 )
             """)
             c.execute("CREATE INDEX IF NOT EXISTS ix_proposals_agent ON proposals(agent_id)")
@@ -279,53 +297,88 @@ class SQLiteStore:
             c.execute("CREATE INDEX IF NOT EXISTS ix_deleg_from ON delegations(from_agent)")
             c.commit()
 
+    def _migrate_replay_tables(self, c: sqlite3.Connection) -> None:
+        """Drop a pre-v3 (``scope``-column) replay table so it gets rebuilt in
+        the new shape by the ``CREATE TABLE`` statements that follow.
+
+        v2's replay tables shipped only within the same development cycle as
+        this v3 rework, so there is no real replay history to carry forward
+        across that specific transition -- correctness (narrowing the
+        uniqueness boundary) matters more here than preserving a few hours of
+        pre-hardening claims. A no-op for a fresh database or one already at
+        v3+ (nothing to detect: absent or already-correct tables have no
+        ``scope`` column).
+        """
+        for table in ("replay_nonces", "replay_proposal_ids"):
+            cols = {row[1] for row in c.execute(f"PRAGMA table_info({table})").fetchall()}
+            if "scope" in cols:
+                logger.warning(
+                    "dropping pre-hardening %s table (scope-based uniqueness); "
+                    "it will be recreated with the narrower uniqueness boundary "
+                    "-- any replay claims recorded under the old schema are lost",
+                    table,
+                )
+                c.execute(f"DROP TABLE {table}")
+
     # -- durable replay protection -------------------------------------
     #
-    # Scope (see the table comments above for the schema):
-    #   * Nonces are unique per (deployment namespace, envelope/policy
-    #     fingerprint, agent_id). Nonce uniqueness is PER AGENT: a nonce is
-    #     bound to whichever key signed the proposal that carries it, and
-    #     keys are themselves agent-bound (KeyRegistry.resolve), so a nonce
-    #     collision between two different agents is not the replay this
-    #     defends against -- it would already be caught by signature/key
-    #     binding. Scoping per agent also means agent A's nonce space can
-    #     never be exhausted or polluted by agent B's traffic.
-    #   * Proposal IDs are unique per (deployment namespace, envelope/policy
-    #     fingerprint) -- fleet-wide, across all agents. This matches the
-    #     pre-durability in-memory behaviour (a single process-wide
-    #     ``_seen_proposal_ids`` set) and treats proposal_id as a
-    #     general-purpose idempotency key for the whole fleet, not a
-    #     per-agent one.
-    #   * Both are scoped to the envelope's construction fingerprint, so a
-    #     legitimate policy/envelope update starts a fresh replay namespace
-    #     rather than being blocked by (or silently sharing) identifiers
-    #     claimed under a previous policy version.
+    # Scope:
+    #   * Nonces are unique per (deployment_namespace, agent_id, nonce).
+    #     Nonce uniqueness is PER AGENT: a nonce is bound to whichever key
+    #     signed the proposal that carries it, and keys are themselves
+    #     agent-bound (KeyRegistry.resolve), so a nonce collision between two
+    #     different agents is not the replay this defends against -- it
+    #     would already be caught by signature/key binding. Scoping per
+    #     agent also means agent A's nonce space can never be exhausted or
+    #     polluted by agent B's traffic.
+    #   * Proposal IDs are unique per (deployment_namespace, proposal_id) --
+    #     fleet-wide, across all agents. This matches the pre-durability
+    #     in-memory behaviour (a single process-wide ``_seen_proposal_ids``
+    #     set) and treats proposal_id as a general-purpose idempotency key
+    #     for the whole fleet, not a per-agent one.
+    #   * ``envelope_fingerprint`` is NOT part of either uniqueness boundary
+    #     -- see the table comments in ``_init_db``. Replay protection
+    #     identifies whether a *signed request* has already been submitted;
+    #     updating policy must not make an old signed proposal fresh again.
+    #     It is stored alongside the claim as audit metadata, along with
+    #     ``key_id`` for nonces.
     #   * ``deployment_namespace`` (default ``"default"``) lets multiple
     #     independent deployments share one physical database file without
     #     their replay records colliding.
     #
-    # Every claim is a single atomic INSERT; a UNIQUE violation *is* the
-    # replay signal, never a prior SELECT. Callers must not batch these
-    # writes -- each call commits immediately, so a claim that returns True
-    # is durable before the caller acts on it.
+    # Every claim is a single atomic INSERT against real, indexed columns --
+    # never a constructed "scope" string, and never a prior SELECT. A UNIQUE
+    # violation *is* the replay signal. Callers must not batch these writes
+    # -- each call commits immediately, so a claim that returns True is
+    # durable before the caller acts on it.
+    #
+    # Consumption semantics: a claim is unconditional once made -- it is not
+    # rolled back if a later policy check on the same proposal returns
+    # RESTRICT / RECHECK / HUMAN instead of CONTINUE. An authenticated
+    # proposal consumes its nonce and proposal_id the moment they are
+    # claimed; retrying requires a new proposal with a new nonce, regardless
+    # of how the original proposal was ultimately decided.
 
-    def claim_nonce(self, *, namespace: str, envelope_fingerprint: str, agent_id: str,
-                    nonce: str, key_id: Optional[str] = None) -> bool:
-        """Atomically claim ``nonce`` for ``agent_id`` in this scope.
+    def claim_nonce(self, *, namespace: str, agent_id: str, nonce: str,
+                    key_id: Optional[str] = None,
+                    envelope_fingerprint: Optional[str] = None) -> bool:
+        """Atomically claim ``nonce`` for ``agent_id`` within ``namespace``.
 
-        Returns True if this call newly claimed it, False if it was already
-        claimed (a replay). Any other ``sqlite3.Error`` (disk full, DB
-        locked/corrupt, ...) propagates -- the caller must treat that as a
-        persistence failure and fail closed, not as "not a replay".
+        Uniqueness is ``(namespace, agent_id, nonce)`` only -- see the module
+        docs above for why ``envelope_fingerprint`` is metadata, not part of
+        the uniqueness boundary. Returns True if this call newly claimed it,
+        False if it was already claimed (a replay). Any other
+        ``sqlite3.Error`` (disk full, DB locked/corrupt, ...) propagates --
+        the caller must treat that as a persistence failure and fail closed,
+        not as "not a replay".
         """
-        scope = f"{namespace}:{envelope_fingerprint}:{agent_id}"
         with self._lock:
             try:
                 self._conn.execute(
                     "INSERT INTO replay_nonces "
-                    "(scope, nonce, agent_id, key_id, envelope_fingerprint, claimed_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (scope, nonce, agent_id, key_id, envelope_fingerprint, time.time()),
+                    "(deployment_namespace, agent_id, nonce, key_id, envelope_fingerprint, "
+                    "claimed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (namespace, agent_id, nonce, key_id, envelope_fingerprint, time.time()),
                 )
                 self._conn.commit()
                 return True
@@ -333,20 +386,20 @@ class SQLiteStore:
                 self._conn.rollback()
                 return False
 
-    def claim_proposal_id(self, *, namespace: str, envelope_fingerprint: str,
-                          proposal_id: str, agent_id: str) -> bool:
-        """Atomically claim ``proposal_id`` fleet-wide in this scope.
+    def claim_proposal_id(self, *, namespace: str, proposal_id: str, agent_id: str,
+                          envelope_fingerprint: Optional[str] = None) -> bool:
+        """Atomically claim ``proposal_id`` fleet-wide within ``namespace``.
 
-        Same return/exception contract as ``claim_nonce``.
+        Uniqueness is ``(namespace, proposal_id)`` only. Same return/exception
+        contract as ``claim_nonce``.
         """
-        scope = f"{namespace}:{envelope_fingerprint}"
         with self._lock:
             try:
                 self._conn.execute(
                     "INSERT INTO replay_proposal_ids "
-                    "(scope, proposal_id, agent_id, envelope_fingerprint, claimed_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (scope, proposal_id, agent_id, envelope_fingerprint, time.time()),
+                    "(deployment_namespace, proposal_id, agent_id, envelope_fingerprint, "
+                    "claimed_at) VALUES (?, ?, ?, ?, ?)",
+                    (namespace, proposal_id, agent_id, envelope_fingerprint, time.time()),
                 )
                 self._conn.commit()
                 return True
