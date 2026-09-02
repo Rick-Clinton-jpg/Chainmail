@@ -1,12 +1,13 @@
 """Hash-chain log, SQLite store, and the composed audit sink."""
 
 import json
+import sqlite3
 
 import pytest
 
 from chainmail import (
     AuditSink, Decision, HashChainLog, Proposal, ReceiptIntegrityError, RiskSignal,
-    SQLiteStore, make_permission,
+    SQLiteStore, SchemaVersionError, make_permission,
 )
 from chainmail.persistence import sanitize
 
@@ -166,3 +167,19 @@ def test_sqlite_synchronous_normal_can_be_requested_explicitly():
 def test_sqlite_synchronous_rejects_invalid_value():
     with pytest.raises(ValueError):
         SQLiteStore(":memory:", synchronous="fast-and-loose")
+
+
+def test_sqlite_store_refuses_a_newer_schema_version(tmp_path):
+    # A database last written by a newer Chainmail (higher schema_version)
+    # opened by this, older code must be refused outright -- proceeding
+    # would run CREATE TABLE IF NOT EXISTS / migration logic against tables
+    # or columns this code has no knowledge of, silently misreading or
+    # corrupting an unknown shape instead.
+    db = str(tmp_path / "future.db")
+    SQLiteStore(db)  # creates it at the current SCHEMA_VERSION
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE schema_version SET version = ?", (SQLiteStore.SCHEMA_VERSION + 1,))
+    conn.commit()
+    conn.close()
+    with pytest.raises(SchemaVersionError):
+        SQLiteStore(db)

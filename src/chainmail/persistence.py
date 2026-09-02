@@ -94,6 +94,12 @@ class ReceiptIntegrityError(ValueError):
     """Raised when an append would extend a damaged receipt chain."""
 
 
+class SchemaVersionError(ValueError):
+    """Raised when a SQLiteStore database's schema_version is newer than this
+    code's SQLiteStore.SCHEMA_VERSION -- opening it would risk misreading or
+    corrupting a shape this code has no knowledge of."""
+
+
 class HashChainLog:
     def __init__(self, filepath: Optional[str] = None, *, load: bool = True) -> None:
         self.filepath = filepath
@@ -288,6 +294,22 @@ class SQLiteStore:
             migrating = False
             if row is None:
                 c.execute("INSERT INTO schema_version (version) VALUES (?)", (self.SCHEMA_VERSION,))
+            elif row[0] > self.SCHEMA_VERSION:
+                # A newer schema version than this code understands -- e.g. the
+                # database was last written by a newer Chainmail release, then
+                # opened by an older one (a downgrade, or two versions pointed
+                # at the same file). Proceeding would run this version's
+                # CREATE TABLE IF NOT EXISTS / migration logic against tables
+                # or columns it has no knowledge of, silently reading or
+                # writing an incompatible shape rather than refusing outright.
+                raise SchemaVersionError(
+                    f"SQLite database {self.db_path!r} has schema_version="
+                    f"{row[0]}, newer than this Chainmail's SCHEMA_VERSION="
+                    f"{self.SCHEMA_VERSION}; refusing to open it (opening with "
+                    f"an older version risks silently misreading or corrupting "
+                    f"data written in a newer, unknown shape). Upgrade "
+                    f"Chainmail, or point at a different database."
+                )
             elif row[0] < self.SCHEMA_VERSION:
                 # proposals/delegations are additive-only across every version, so an
                 # older database just gains new tables/columns here. The replay

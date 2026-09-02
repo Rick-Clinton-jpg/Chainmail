@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Fixed — SQLiteStore silently accepted a newer, unrecognized schema version (independent audit, P2)
+
+`SQLiteStore._init_db()` compared the database's stored `schema_version`
+against `SCHEMA_VERSION` only to decide whether to *migrate forward*
+(`row[0] < SCHEMA_VERSION`). A database with a *higher* stored version --
+e.g. last written by a newer Chainmail release, then opened by an older one
+after a downgrade, or two versions pointed at the same file -- fell through
+unchecked into this code's `CREATE TABLE IF NOT EXISTS` / migration logic,
+which has no knowledge of whatever shape a newer version introduced. That
+risks silently misreading or corrupting data in an unrecognized shape
+instead of refusing to start.
+
+Fix, in `src/chainmail/persistence.py`: `_init_db()` now raises a new
+`SchemaVersionError` (exported from `chainmail`) when the stored
+`schema_version` exceeds `SCHEMA_VERSION`, naming both versions and telling
+the operator to upgrade Chainmail or point at a different database, rather
+than proceeding.
+
+New test `test_sqlite_store_refuses_a_newer_schema_version` in
+`tests/test_persistence.py`: creates a store at the current version, bumps
+`schema_version` past it directly in the database, and asserts reopening
+raises `SchemaVersionError`.
+
 ### Fixed — SQLiteStore defaulted to synchronous=NORMAL, a durability gap for a replay/restriction ledger (independent audit, P2)
 
 `SQLiteStore` always set `PRAGMA synchronous=NORMAL`. With `journal_mode=WAL`
