@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Fixed — the v2→v3 replay migration dropped claim history instead of preserving it (independent audit, P1 #11)
+
+The v2→v3 migration (narrowing nonce/proposal-ID uniqueness to no longer
+include `envelope_fingerprint`, landed earlier in this Unreleased section)
+handled a pre-v3 replay table by dropping it outright and letting it be
+recreated empty. That's exactly backwards for a replay ledger: silently
+losing claim history across a migration means a previously-consumed signed
+proposal or nonce becomes replayable again the moment someone upgrades.
+
+Fix: a pre-v3 replay table is now renamed out of the way
+(`_rename_pre_v3_replay_tables`), the v3-shaped table created fresh, and
+every row copied forward into the new columns
+(`_migrate_replay_data_from_v2`) before the old table is dropped. v2's
+`scope` string embedded `namespace` alongside `envelope_fingerprint` and
+`agent_id`/`proposal_id`, which were already separate columns even in v2 --
+so `namespace` is recovered exactly by stripping that known suffix, not
+guessed. Because v3's uniqueness boundary is narrower (no longer includes
+`envelope_fingerprint`), multiple v2 rows for the same nonce can collapse
+onto one v3 row; migration uses `INSERT OR IGNORE` to tolerate that rather
+than crash on the resulting conflict -- correctly, since they all represent
+the same already-consumed identifier.
+
+`test_existing_v2_scope_based_database_migrates_safely` now asserts the
+old claim is still rejected as a replay after migrating, not just that the
+new schema is usable. New test
+`test_v2_rows_collapsing_under_v3_scope_do_not_crash_migration` covers the
+collapse case directly.
+
 ### Fixed — delegation mutated live state before its audit write succeeded (independent audit, P1 #10)
 
 `register_delegation()` set `self.live_authority[to_agent]` and appended to

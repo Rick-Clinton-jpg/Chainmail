@@ -207,8 +207,10 @@ def test_existing_v1_database_migrates_safely(tmp_path):
 def test_existing_v2_scope_based_database_migrates_safely(tmp_path):
     """A database built by the first (v2, ``scope``-column) shape of the
     replay tables must open cleanly and end up with the v3 (explicit-column)
-    shape -- the old table is dropped and rebuilt rather than crashing or
-    silently keeping the old, broader scope."""
+    shape -- and every existing claim must survive the migration. A nonce
+    consumed under the old schema must still read as consumed afterward:
+    silently losing claim history across a migration would let a
+    previously-used signed proposal or nonce become replayable again."""
     db = str(tmp_path / "v2.db")
     conn = sqlite3.connect(db)
     conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
@@ -254,9 +256,52 @@ def test_existing_v2_scope_based_database_migrates_safely(tmp_path):
     cols = {row[1] for row in store._conn.execute("PRAGMA table_info(replay_nonces)").fetchall()}
     assert "scope" not in cols
     assert {"deployment_namespace", "agent_id", "nonce"} <= cols
-    # the rebuilt table is empty (pre-hardening claims are not preserved) but usable
+    # the old claim survived the migration -- re-attempting it must still
+    # read as a replay, not a fresh nonce.
+    assert store.claim_nonce(namespace="default", agent_id="a", nonce="old-scoped-nonce") is False
+    # the new-shaped table is otherwise perfectly usable for new claims
     assert store.claim_nonce(namespace="default", agent_id="a", nonce="new-shape-nonce") is True
     assert store.claim_nonce(namespace="default", agent_id="a", nonce="new-shape-nonce") is False
+    # the pre-v3 staging table left no trace
+    assert not store._table_exists(store._conn, "replay_nonces_pre_v3")
+
+
+def test_v2_rows_collapsing_under_v3_scope_do_not_crash_migration(tmp_path):
+    """v3 narrowed nonce uniqueness to (namespace, agent_id, nonce), dropping
+    envelope_fingerprint. Two v2 rows for the same nonce/agent claimed under
+    different envelope fingerprints therefore collapse onto one v3 row;
+    migration must tolerate that (INSERT OR IGNORE) rather than crash on the
+    resulting UNIQUE conflict, and the nonce must still read as consumed
+    afterward."""
+    db = str(tmp_path / "collapse.db")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (2)")
+    conn.execute("""
+        CREATE TABLE replay_nonces (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, nonce TEXT NOT NULL,
+            agent_id TEXT NOT NULL, key_id TEXT, envelope_fingerprint TEXT NOT NULL,
+            claimed_at REAL NOT NULL, UNIQUE (scope, nonce)
+        )
+    """)
+    # same (namespace, agent, nonce), two different envelope fingerprints --
+    # legitimately distinct v2 rows, since fingerprint was part of scope
+    conn.execute("INSERT INTO replay_nonces (scope, nonce, agent_id, key_id, "
+                 "envelope_fingerprint, claimed_at) VALUES ('default:fp-one:a', "
+                 "'shared-nonce', 'a', NULL, 'fp-one', 1000.0)")
+    conn.execute("INSERT INTO replay_nonces (scope, nonce, agent_id, key_id, "
+                 "envelope_fingerprint, claimed_at) VALUES ('default:fp-two:a', "
+                 "'shared-nonce', 'a', NULL, 'fp-two', 2000.0)")
+    conn.commit()
+    conn.close()
+
+    store = SQLiteStore(db)  # must not raise despite the now-colliding rows
+    assert store.claim_nonce(namespace="default", agent_id="a", nonce="shared-nonce") is False
+    rows = store._conn.execute(
+        "SELECT COUNT(*) FROM replay_nonces WHERE deployment_namespace='default' "
+        "AND agent_id='a' AND nonce='shared-nonce'"
+    ).fetchone()
+    assert rows[0] == 1
 
 
 # -- cache eviction never weakens the durable guarantee --------------------

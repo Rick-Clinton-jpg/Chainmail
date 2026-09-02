@@ -195,10 +195,13 @@ class SQLiteStore:
     # (namespace, proposal_id) -- envelope_fingerprint is metadata only, no
     # longer part of uniqueness (see claim_nonce / claim_proposal_id: a
     # policy/envelope change must never make an old signed proposal replayable
-    # again). A v2 database's replay tables are dropped and recreated on open
-    # (see _migrate_replay_tables) -- v2 shipped only within this session, so
-    # there is no real replay history to preserve across that specific
-    # transition; proposals/delegations are untouched by any version bump.
+    # again). A v2 database's replay tables are renamed out of the way, the
+    # v3-shaped tables created fresh, and every row migrated forward into
+    # the new columns (see _rename_pre_v3_replay_tables /
+    # _migrate_replay_data_from_v2) -- claim history is preserved, never
+    # dropped, since a claim silently disappearing across a migration would
+    # let a previously-consumed signed proposal or nonce become replayable
+    # again. proposals/delegations are untouched by any version bump.
     # v4: + restrictions, restriction_events (durable restriction state --
     # see impose_restriction / clear_restriction / active_restrictions).
     # Purely additive over v1-v3; no existing table changes shape.
@@ -221,16 +224,21 @@ class SQLiteStore:
             c.execute("PRAGMA foreign_keys=ON")
             c.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
             row = c.execute("SELECT version FROM schema_version").fetchone()
+            migrating = False
             if row is None:
                 c.execute("INSERT INTO schema_version (version) VALUES (?)", (self.SCHEMA_VERSION,))
             elif row[0] < self.SCHEMA_VERSION:
                 # proposals/delegations are additive-only across every version, so an
                 # older database just gains new tables/columns here. The replay
                 # tables specifically may need their old (pre-v3) shape replaced --
-                # see _migrate_replay_tables.
+                # renamed here, out of the way of the CREATE TABLE statements below,
+                # then migrated forward by _migrate_replay_data_from_v2 once the
+                # v3-shaped tables exist -- never dropped: replay claims are exactly
+                # the record that must survive a migration.
                 logger.info("migrating SQLiteStore schema %s -> %s", row[0], self.SCHEMA_VERSION)
-                self._migrate_replay_tables(c)
+                self._rename_pre_v3_replay_tables(c)
                 c.execute("UPDATE schema_version SET version = ?", (self.SCHEMA_VERSION,))
+                migrating = True
             c.execute("""
                 CREATE TABLE IF NOT EXISTS proposals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -354,30 +362,101 @@ class SQLiteStore:
                      "ON restrictions(deployment_namespace, agent_id, status)")
             c.execute("CREATE INDEX IF NOT EXISTS ix_restriction_events_rid "
                      "ON restriction_events(restriction_id)")
+            if migrating:
+                self._migrate_replay_data_from_v2(c)
             c.commit()
 
-    def _migrate_replay_tables(self, c: sqlite3.Connection) -> None:
-        """Drop a pre-v3 (``scope``-column) replay table so it gets rebuilt in
-        the new shape by the ``CREATE TABLE`` statements that follow.
+    def _rename_pre_v3_replay_tables(self, c: sqlite3.Connection) -> None:
+        """Rename a pre-v3 (``scope``-column) replay table out of the way so
+        the v3-shaped table can be created fresh by the ``CREATE TABLE``
+        statements that follow; ``_migrate_replay_data_from_v2`` then copies
+        its rows forward into the new table and drops it.
 
-        v2's replay tables shipped only within the same development cycle as
-        this v3 rework, so there is no real replay history to carry forward
-        across that specific transition -- correctness (narrowing the
-        uniqueness boundary) matters more here than preserving a few hours of
-        pre-hardening claims. A no-op for a fresh database or one already at
-        v3+ (nothing to detect: absent or already-correct tables have no
+        Renaming (not dropping) matters: replay claims are exactly the
+        record that must never quietly disappear across a migration -- a
+        previously-consumed signed proposal or nonce becoming reusable after
+        an upgrade would defeat the whole point of durable replay
+        protection. A no-op for a fresh database or one already at v3+
+        (nothing to detect: absent or already-correct tables have no
         ``scope`` column).
         """
         for table in ("replay_nonces", "replay_proposal_ids"):
             cols = {row[1] for row in c.execute(f"PRAGMA table_info({table})").fetchall()}
             if "scope" in cols:
-                logger.warning(
-                    "dropping pre-hardening %s table (scope-based uniqueness); "
-                    "it will be recreated with the narrower uniqueness boundary "
-                    "-- any replay claims recorded under the old schema are lost",
-                    table,
+                c.execute(f"ALTER TABLE {table} RENAME TO {table}_pre_v3")
+
+    def _migrate_replay_data_from_v2(self, c: sqlite3.Connection) -> None:
+        """Copy claim rows forward from a table renamed by
+        ``_rename_pre_v3_replay_tables`` into the newly-created v3-shaped
+        table, then drop the renamed table. No-op if there is nothing to
+        migrate (a fresh database, or one already at v3+).
+
+        v2's ``scope`` was ``f"{namespace}:{envelope_fingerprint}:{agent_id}"``
+        for nonces and ``f"{namespace}:{envelope_fingerprint}"`` for proposal
+        IDs -- both ``envelope_fingerprint`` and ``agent_id``/``proposal_id``
+        were already separate columns even in v2, so ``namespace`` is
+        recovered exactly by stripping that known suffix from ``scope``, not
+        guessed.
+
+        v3 narrowed uniqueness to no longer include ``envelope_fingerprint``
+        (see the table comment above), so multiple v2 rows for the same
+        nonce/proposal_id claimed under different envelope fingerprints can
+        now collapse onto a single v3 row. ``INSERT OR IGNORE`` keeps
+        whichever is inserted first and silently discards the rest -- that's
+        correct: they all represent the same already-consumed identifier,
+        and the durable point is that it stays consumed, not which specific
+        historical claim record wins.
+        """
+        if self._table_exists(c, "replay_nonces_pre_v3"):
+            rows = c.execute(
+                "SELECT scope, nonce, agent_id, key_id, envelope_fingerprint, claimed_at "
+                "FROM replay_nonces_pre_v3"
+            ).fetchall()
+            migrated = 0
+            for scope, nonce, agent_id, key_id, envelope_fingerprint, claimed_at in rows:
+                suffix = f":{envelope_fingerprint}:{agent_id}"
+                namespace = scope[: -len(suffix)] if scope.endswith(suffix) else scope
+                c.execute(
+                    "INSERT OR IGNORE INTO replay_nonces (deployment_namespace, agent_id, "
+                    "nonce, key_id, envelope_fingerprint, claimed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (namespace, agent_id, nonce, key_id, envelope_fingerprint, claimed_at),
                 )
-                c.execute(f"DROP TABLE {table}")
+                migrated += c.execute("SELECT changes()").fetchone()[0]
+            logger.warning(
+                "migrated %d/%d nonce claims forward from the pre-v3 schema (%d collapsed "
+                "under the v3 uniqueness scope, which no longer includes envelope_fingerprint)",
+                migrated, len(rows), len(rows) - migrated,
+            )
+            c.execute("DROP TABLE replay_nonces_pre_v3")
+
+        if self._table_exists(c, "replay_proposal_ids_pre_v3"):
+            rows = c.execute(
+                "SELECT scope, proposal_id, agent_id, envelope_fingerprint, claimed_at "
+                "FROM replay_proposal_ids_pre_v3"
+            ).fetchall()
+            migrated = 0
+            for scope, proposal_id, agent_id, envelope_fingerprint, claimed_at in rows:
+                suffix = f":{envelope_fingerprint}"
+                namespace = scope[: -len(suffix)] if scope.endswith(suffix) else scope
+                c.execute(
+                    "INSERT OR IGNORE INTO replay_proposal_ids (deployment_namespace, "
+                    "proposal_id, agent_id, envelope_fingerprint, claimed_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (namespace, proposal_id, agent_id, envelope_fingerprint, claimed_at),
+                )
+                migrated += c.execute("SELECT changes()").fetchone()[0]
+            logger.warning(
+                "migrated %d/%d proposal-id claims forward from the pre-v3 schema (%d "
+                "collapsed under the v3 uniqueness scope)",
+                migrated, len(rows), len(rows) - migrated,
+            )
+            c.execute("DROP TABLE replay_proposal_ids_pre_v3")
+
+    @staticmethod
+    def _table_exists(c: sqlite3.Connection, name: str) -> bool:
+        return c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone() is not None
 
     # -- durable replay protection -------------------------------------
     #
