@@ -22,7 +22,7 @@ Evaluation order (every failing gate returns HUMAN):
  12. step-budget restriction not exhausted
  13. contextual risk -> signal set -> decision
  14. audit "started"
- 15. Armour boundary (only if CONTINUE)
+ 15. execution boundary (only if CONTINUE)
  16. quorum (only if CONTINUE)
  17. consume permission budget  (only if the final decision is CONTINUE)
  18. apply restriction          (only if the final decision is RESTRICT)
@@ -40,7 +40,7 @@ from collections import deque
 from copy import deepcopy
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
-from .armour import ArmourBoundary, MockArmourBoundary
+from .execution_boundary import ExecutionBoundary, PermissiveExecutionBoundary
 from .config import GovernorConfig
 from .core import (
     Authority, Decision, GovernanceResult, Permission, Proposal, ProvenanceLink,
@@ -66,7 +66,7 @@ class ChainmailGovernor:
         *,
         config: Optional[GovernorConfig] = None,
         embedding: Optional[EmbeddingEngine] = None,
-        armour: Optional[ArmourBoundary] = None,
+        execution_boundary: Optional[ExecutionBoundary] = None,
         audit: Optional[AuditSink] = None,
         verifier: Optional[ApprovalVerifier] = None,
         quorum: Optional[QuorumAggregator] = None,
@@ -77,7 +77,7 @@ class ChainmailGovernor:
         self.envelope = envelope
         self.config = config or GovernorConfig()
         self.governor_id = governor_id
-        self.armour = armour
+        self.execution_boundary = execution_boundary
         self.audit = audit or AuditSink()
         self.verifier: ApprovalVerifier = verifier or NullApprovalVerifier()
         if self.config.require_signature and isinstance(self.verifier, NullApprovalVerifier):
@@ -146,17 +146,20 @@ class ChainmailGovernor:
         signature_enforced = self.config.require_signature and not isinstance(
             self.verifier, NullApprovalVerifier
         )
-        armour_wired = self.armour is not None and not isinstance(self.armour, MockArmourBoundary)
+        boundary_wired = (
+            self.execution_boundary is not None
+            and not isinstance(self.execution_boundary, PermissiveExecutionBoundary)
+        )
         weaknesses: List[str] = []
         if not signature_enforced:
             weaknesses.append(
                 "proposal signatures are NOT enforced -- any caller can act as any "
                 "agent; use GovernorConfig.production() with a CompositeVerifier"
             )
-        if not armour_wired:
+        if not boundary_wired:
             weaknesses.append(
-                "no real execution boundary is wired -- MockArmourBoundary (or no "
-                "armour at all) authorises every CONTINUE decision unconditionally"
+                "no real execution boundary is wired -- PermissiveExecutionBoundary "
+                "(or none at all) authorises every CONTINUE decision unconditionally"
             )
         if self.quorum is None:
             weaknesses.append(
@@ -168,8 +171,10 @@ class ChainmailGovernor:
             "signature_required": self.config.require_signature,
             "signature_enforced": signature_enforced,
             "verifier": type(self.verifier).__name__,
-            "armour": type(self.armour).__name__ if self.armour is not None else None,
-            "armour_wired": armour_wired,
+            "execution_boundary": (
+                type(self.execution_boundary).__name__ if self.execution_boundary is not None else None
+            ),
+            "execution_boundary_wired": boundary_wired,
             "quorum_configured": self.quorum is not None,
             "dedupe_proposal_ids": self.config.dedupe_proposal_ids,
             "weaknesses": weaknesses,
@@ -550,18 +555,18 @@ class ChainmailGovernor:
                               f"Audit start failed; action not executed: {type(exc).__name__}",
                               [RiskSignal.SANITIZATION_FAILURE], execution_id=execution_id)
 
-        # (15) Armour
-        armour_output: Any = None
-        if decision == Decision.CONTINUE and self.armour is not None:
+        # (15) execution boundary
+        execution_output: Any = None
+        if decision == Decision.CONTINUE and self.execution_boundary is not None:
             try:
-                ok, msg, armour_output = self.armour.execute(proposal, current_auth.copy())
+                ok, msg, execution_output = self.execution_boundary.execute(proposal, current_auth.copy())
                 if not ok:
                     decision = Decision.HUMAN
-                    reason_parts.append(f"Armour boundary rejected: {msg}")
+                    reason_parts.append(f"Execution boundary rejected: {msg}")
             except Exception as exc:  # noqa: BLE001
-                logger.exception("armour boundary raised")
+                logger.exception("execution boundary raised")
                 decision = Decision.HUMAN
-                reason_parts.append(f"Armour boundary error: {type(exc).__name__}")
+                reason_parts.append(f"Execution boundary error: {type(exc).__name__}")
                 signals.append(RiskSignal.VERIFIER_ERROR)
 
         # (16) quorum
@@ -605,7 +610,7 @@ class ChainmailGovernor:
                     proposal_id=proposal.proposal_id, agent_id=proposal.agent_id,
                     action=proposal.action, decision=decision.value,
                     signals=[s.value for s in signals], overlap=overlap, drift=drift,
-                    phase="completed", execution_id=execution_id, armour_output=armour_output,
+                    phase="completed", execution_id=execution_id, execution_output=execution_output,
                     objective_fragment=proposal.objective_fragment,
                     trace_id=tracing.current_trace_id(),
                 )
@@ -623,7 +628,7 @@ class ChainmailGovernor:
             provenance=list(self.provenance),
             quorum_votes=quorum_votes,
             execution_id=execution_id,
-            armour_output=armour_output,
+            execution_output=execution_output,
         )
 
     def _verify_signature(self, proposal: Proposal):

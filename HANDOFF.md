@@ -26,25 +26,27 @@ understand it, work on it, or publish it. Read it fully before touching code.
 Agents may plan and propose freely. Chainmail — not the agent — decides whether a
 proposed action is inside the human-declared **authority envelope**. It contains
 no LLM. It is the *trajectory* governor; the *single-action* boundary is a
-separate project called Armour (see §9).
+generic, independent seam (`chainmail.execution_boundary`) that any sibling
+project can plug into -- e.g. Armour (see §9) -- with no dependency in either
+direction.
 
 ```
-Agent / harness     Intent & planning     Fluid work inside the envelope
+Agent / harness               Intent & planning     Fluid work inside the envelope
       |
-chainmail.governor  Trajectory            objective continuity, authority flow,
-                                          delegation, drift, cross-agent anomaly,
-                                          re-entry, schema + path safety,
-                                          envelope integrity, replay, quorum
+chainmail.governor            Trajectory            objective continuity, authority flow,
+                                                     delegation, drift, cross-agent anomaly,
+                                                     re-entry, schema + path safety,
+                                                     envelope integrity, replay, quorum
       |
-chainmail.armour    Action                single-action execution boundary (seam)
+chainmail.execution_boundary  Action                single-action execution boundary (seam)
       |
-OS / APIs           Effect                trusted handlers
+OS / APIs                     Effect                trusted handlers
 ```
 
 **It is NOT:**
 - a sandbox — it decides, it does not contain or execute. The real action
-  boundary is Armour, wired via `GuardedExecutorAdapter`. The built-in
-  `MockArmourBoundary` authorises everything.
+  boundary is whatever you wire in via `GuardedExecutorAdapter`. The built-in
+  `PermissiveExecutionBoundary` authorises everything and is development-only.
 - a network security boundary — the service auth is a shared / per-caller token
   over a `0600` Unix socket. Fine co-located on one trusted host; put mTLS in
   front to cross a host.
@@ -90,7 +92,7 @@ src/chainmail/
   redaction.py            scrub_pii — typed shapes only (keeps hashes/UUIDs)
   quorum.py               QuorumAggregator (fail-closed: any HUMAN dominates),
                           VoteTransport, LocalSingleGovernorTransport
-  armour.py               ArmourBoundary, Mock/DenyAll, GuardedExecutorAdapter
+  execution_boundary.py   ExecutionBoundary, Permissive/DenyAll, GuardedExecutorAdapter
   evaluation.py           offline adversarial mutation harness — MutationRunner,
                           standard_mutant_family, MutationReport
   tracing.py              optional OpenTelemetry span per evaluate() (off unless
@@ -154,7 +156,7 @@ every failing gate returns `HUMAN`:
     disagreement/anomaly -> `RECHECK`; MEDIUM re-entry/drift/low-confidence ->
     `RESTRICT`; else `CONTINUE`.
 15. audit "started" (write failure -> `HUMAN` / `SANITIZATION_FAILURE`)
-16. Armour boundary, only if `CONTINUE` (reject or exception -> `HUMAN`)
+16. execution boundary, only if `CONTINUE` (reject or exception -> `HUMAN`)
 17. quorum, only if `CONTINUE` (any `HUMAN` vote dominates)
 18. consume permission budget **only** if final decision is `CONTINUE`
 19. apply restriction if `RESTRICT`; record intent-graph entry

@@ -16,7 +16,7 @@ thin service wrapper (`chainmail.service`). Agents propose actions; the governor
 returns one of `CONTINUE` / `RESTRICT` / `RECHECK` / `HUMAN` after checking the
 proposal against a human-declared **authority envelope**, cryptographic
 authentication, replay protection, an action allow-list and payload schema
-(including filesystem-path safety), contextual risk signals, an Armour execution
+(including filesystem-path safety), contextual risk signals, an execution
 boundary, and -- for high-stakes fleets -- multi-governor quorum.
 
 v5 is the hardening release: every falsification criterion from v4 has a
@@ -28,9 +28,11 @@ adversarial mutation harness challenges the boundary on every CI run.
 
 - **Not a sandbox.** It is a *policy* boundary. It decides whether an action is
   allowed; it does not contain, isolate, or execute anything. The actual action
-  boundary is [Armour](https://github.com/Rick-Clinton-jpg/Armour); wire a real
-  `GuardedExecutor` in via `GuardedExecutorAdapter` — the built-in
-  `MockArmourBoundary` authorises everything.
+  boundary is whatever execution handler you wire in via `GuardedExecutorAdapter`
+  (any project with a compatible `(proposal, authority) -> (ok, message, output)`
+  callable, e.g. a sibling project like [Armour](https://github.com/Rick-Clinton-jpg/Armour) —
+  Chainmail has no dependency on it) — the built-in `PermissiveExecutionBoundary`
+  authorises everything and is development-only.
 - **Not a security boundary for untrusted agents across a network.** The service
   auth is a shared secret / per-caller token over a `0600` Unix socket — fine for
   co-located processes on one trusted host, not across a network. Put mTLS in
@@ -43,8 +45,8 @@ adversarial mutation harness challenges the boundary on every CI run.
   schema, replay, envelope integrity) are the wall.
 - **Governs declared intent, not behaviour.** `objective_fragment` and
   `required_permission` are self-reported by the agent. Chainmail checks the
-  declared intent against policy; whether the action *does* what it says is
-  Armour's job.
+  declared intent against policy; whether the action *does* what it says is the
+  execution boundary's job.
 - **Single-process operational state.** `live_authority`, the replay set, and
   restrictions live in RAM. A governor restart resets replay protection and
   active restrictions (the audit log is durable; nothing rebuilds live state from
@@ -153,7 +155,7 @@ chainmail.governor  Trajectory            Objective continuity, authority flow,
                                           schema + path safety, envelope
                                           integrity, replay, quorum
       |
-chainmail.armour    Action                Single-action execution boundary
+chainmail.execution_boundary  Action        Single-action execution boundary
       |
 OS / APIs           Effect                Trusted handlers
 ```
@@ -169,7 +171,7 @@ OS / APIs           Effect                Trusted handlers
 | `persistence` | `HashChainLog`, `SQLiteStore`, `AuditSink`, PII scrubbing |
 | `redaction` | `scrub_pii` — typed PII redaction for audit surfaces |
 | `quorum` | `QuorumAggregator` (fail-closed), `VoteTransport` |
-| `armour` | `ArmourBoundary`, `GuardedExecutorAdapter` |
+| `execution_boundary` | `ExecutionBoundary`, `PermissiveExecutionBoundary`, `DenyAllExecutionBoundary`, `GuardedExecutorAdapter` |
 | `evaluation` | offline adversarial mutation harness (`MutationRunner`, `standard_mutant_family`) |
 | `tracing` | optional, additive OpenTelemetry spans on `evaluate()` |
 | `governor` | `ChainmailGovernor` — the policy-hard core |
@@ -353,8 +355,8 @@ because they are the point of an audit trail. (Adapted from
 - Quorum's default `VoteTransport` is single-governor (`LocalSingleGovernorTransport`);
   real peer voting needs a `VoteTransport` implementation over your transport of
   choice. `StaticPeerTransport` is provided for tests.
-- `GuardedExecutorAdapter` is the integration seam for Armour's real
-  `GuardedExecutor`; wire it to your executor callable.
+- `GuardedExecutorAdapter` is a generic integration seam for any external
+  execution-boundary handler; wire it to your executor callable.
 - The demo envelope's agent authorities are deliberately disjoint, so demo
   delegations reduce to the empty set — that is the "non-expanding" invariant
   doing its job, not a bug.

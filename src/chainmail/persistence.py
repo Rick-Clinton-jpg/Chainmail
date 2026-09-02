@@ -318,7 +318,7 @@ class AuditSink:
 
     def record_proposal(self, *, proposal_id: str, agent_id: str, action: str, decision: str,
                         signals: List[str], overlap: float, drift: float, phase: str,
-                        execution_id: Optional[str], armour_output: Any = None,
+                        execution_id: Optional[str], execution_output: Any = None,
                         objective_fragment: Optional[str] = None,
                         trace_id: Optional[str] = None) -> None:
         if self.hash_chain is not None:
@@ -327,7 +327,7 @@ class AuditSink:
                 "decision": decision, "signals": signals,
                 "objective_fragment": scrub_pii(objective_fragment) if objective_fragment else None,
                 "overlap": round(overlap, 4), "drift": round(drift, 4),
-                "armour_output": armour_output, "trace_id": trace_id,
+                "execution_output": execution_output, "trace_id": trace_id,
             }, phase=phase, execution_id=execution_id)
         if self.sqlite is not None:
             self.sqlite.log_proposal(

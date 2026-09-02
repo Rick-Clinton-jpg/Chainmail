@@ -10,7 +10,7 @@ bounded hostile variants, then reports:
 * **invariant coverage** -- which named safety invariants were actually
   exercised by the family that ran.
 
-Nothing here executes a proposal or an Armour handler; every mutation is fed
+Nothing here executes a proposal or an execution-boundary handler; every mutation is fed
 straight to ``governor.evaluate()`` and only the verdict is inspected.
 
 Adapted in spirit from ``Armour/armour/evaluation.py`` (Rick-Clinton-jpg,

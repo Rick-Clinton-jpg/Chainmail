@@ -389,7 +389,7 @@ class GovernanceResult:
     provenance: List[ProvenanceLink] = field(default_factory=list)
     quorum_votes: Optional[Dict[str, str]] = None
     execution_id: Optional[str] = None
-    armour_output: Any = None
+    execution_output: Any = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -407,5 +407,5 @@ class GovernanceResult:
             ],
             "quorum_votes": self.quorum_votes,
             "execution_id": self.execution_id,
-            "armour_output": self.armour_output,
+            "execution_output": self.execution_output,
         }

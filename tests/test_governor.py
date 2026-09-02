@@ -7,8 +7,8 @@ import dataclasses
 import pytest
 
 from chainmail import (
-    Authority, ChainmailGovernor, Decision, GovernorConfig, MockArmourBoundary,
-    DenyAllArmourBoundary, Permission, Proposal, RestrictPolicy, RiskSignal, make_permission,
+    Authority, ChainmailGovernor, Decision, GovernorConfig, PermissiveExecutionBoundary,
+    DenyAllExecutionBoundary, Permission, Proposal, RestrictPolicy, RiskSignal, make_permission,
 )
 
 OBJ = "Build a secure multi-agent governance prototype"
@@ -312,25 +312,25 @@ def test_reentry_is_per_agent(governor):
     assert RiskSignal.OBJECTIVE_REENTRY not in r.signals
 
 
-# -- armour ---------------------------------------------------------
+# -- execution boundary ----------------------------------------------
 
-def test_armour_continue(make_governor):
-    g = make_governor(armour=MockArmourBoundary())
+def test_execution_boundary_continue(make_governor):
+    g = make_governor(execution_boundary=PermissiveExecutionBoundary())
     assert g.evaluate(prop("a1", "agent_research", "gather",
                            make_permission("research"))).decision == Decision.CONTINUE
 
 
-def test_armour_fail_closed(make_governor):
-    g = make_governor(armour=DenyAllArmourBoundary())
+def test_execution_boundary_fail_closed(make_governor):
+    g = make_governor(execution_boundary=DenyAllExecutionBoundary())
     r = g.evaluate(prop("a2", "agent_research", "gather", make_permission("research")))
-    assert r.decision == Decision.HUMAN and "Armour boundary rejected" in r.reason
+    assert r.decision == Decision.HUMAN and "Execution boundary rejected" in r.reason
 
 
-def test_armour_exception_fail_closed(make_governor):
-    class Boom(MockArmourBoundary):
+def test_execution_boundary_exception_fail_closed(make_governor):
+    class Boom(PermissiveExecutionBoundary):
         def execute(self, proposal, authority):
             raise RuntimeError("kaboom")
-    g = make_governor(armour=Boom())
+    g = make_governor(execution_boundary=Boom())
     r = g.evaluate(prop("a3", "agent_research", "gather", make_permission("research")))
     assert r.decision == Decision.HUMAN and RiskSignal.VERIFIER_ERROR in r.signals
 
@@ -341,7 +341,7 @@ def test_security_report_flags_defaults(make_governor):
     g = make_governor()
     report = g.security_report()
     assert report["signature_enforced"] is False
-    assert report["armour_wired"] is False
+    assert report["execution_boundary_wired"] is False
     assert report["quorum_configured"] is False
     assert len(report["weaknesses"]) == 3
 
@@ -352,12 +352,12 @@ def test_security_report_clears_weaknesses_when_hardened(make_governor):
     g = make_governor(
         config=GovernorConfig(require_signature=True),
         verifier=CompositeVerifier(KeyRegistry()),
-        armour=DenyAllArmourBoundary(),
+        execution_boundary=DenyAllExecutionBoundary(),
         quorum=QuorumAggregator(),
     )
     report = g.security_report()
     assert report["signature_enforced"] is True
-    assert report["armour_wired"] is True
+    assert report["execution_boundary_wired"] is True
     assert report["quorum_configured"] is True
     assert report["weaknesses"] == []
 

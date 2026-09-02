@@ -14,7 +14,7 @@ were skipping.
   `require_signature=True`; other fields still override.
 - `ChainmailGovernor.security_report()` — reports which protections are
   actually active on a governor instance (signature enforcement, a real vs.
-  mock execution boundary, quorum configuration) and lists concrete
+  permissive execution boundary, quorum configuration) and lists concrete
   weaknesses for anything left permissive. Logged automatically at
   construction: `INFO` when nothing is weak, `WARNING` naming each gap
   otherwise.
@@ -24,9 +24,33 @@ were skipping.
   *presence* while accepting any signature *content*, which is a false
   sense of security. A real verifier (e.g. `CompositeVerifier`) must be
   supplied.
-- `MockArmourBoundary` now logs a construction warning, matching
-  `NullApprovalVerifier` — it authorises every `CONTINUE` decision
-  unconditionally and previously did so silently.
+- `PermissiveExecutionBoundary` (renamed from `MockArmourBoundary` — see
+  below) now logs a construction warning, matching `NullApprovalVerifier` —
+  it authorises every `CONTINUE` decision unconditionally and previously did
+  so silently.
+
+### Changed — decoupled from Armour naming
+
+Chainmail and Armour are independent sibling projects (see HANDOFF.md §8/§9);
+Chainmail must not carry Armour-specific identifiers in its own public API.
+`chainmail.armour` never depended on the Armour *project* (it was always a
+generic seam), but its naming implied a coupling that didn't exist. Renamed,
+with no change in behaviour:
+
+- Module `chainmail.armour` -> `chainmail.execution_boundary`.
+- `ArmourBoundary` -> `ExecutionBoundary`.
+- `MockArmourBoundary` -> `PermissiveExecutionBoundary`.
+- `DenyAllArmourBoundary` -> `DenyAllExecutionBoundary`.
+- `ChainmailGovernor(..., armour=...)` constructor kwarg -> `execution_boundary=...`;
+  `governor.armour` attribute -> `governor.execution_boundary`.
+- `GovernanceResult.armour_output` -> `GovernanceResult.execution_output`;
+  same field rename in `AuditSink.record_proposal()` and the hash-chain audit
+  record.
+- `security_report()` keys `armour` / `armour_wired` -> `execution_boundary` /
+  `execution_boundary_wired`.
+- `GuardedExecutorAdapter` is unchanged (its name was already generic) but its
+  docstring no longer names Armour as the thing it wraps — it wraps any
+  compatible `(proposal, authority) -> (ok, message, output)` callable.
 
 ## v5.1.0
 

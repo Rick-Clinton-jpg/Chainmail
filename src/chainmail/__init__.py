@@ -9,8 +9,9 @@ from __future__ import annotations
 
 __version__ = "5.1.0"
 
-from .armour import (
-    ArmourBoundary, DenyAllArmourBoundary, GuardedExecutorAdapter, MockArmourBoundary,
+from .execution_boundary import (
+    DenyAllExecutionBoundary, ExecutionBoundary, GuardedExecutorAdapter,
+    PermissiveExecutionBoundary,
 )
 from .builders import build_demo_envelope, make_permission
 from .config import GovernorConfig
@@ -73,6 +74,7 @@ __all__ = [
     # quorum
     "QuorumAggregator", "GovernorVote", "VoteTransport", "LocalSingleGovernorTransport",
     "StaticPeerTransport",
-    # armour
-    "ArmourBoundary", "MockArmourBoundary", "DenyAllArmourBoundary", "GuardedExecutorAdapter",
+    # execution boundary
+    "ExecutionBoundary", "PermissiveExecutionBoundary", "DenyAllExecutionBoundary",
+    "GuardedExecutorAdapter",
 ]
