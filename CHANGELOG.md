@@ -2,6 +2,55 @@
 
 ## Unreleased
 
+### Fixed — the mutation harness could execute real actions and misreport invariant coverage (independent audit, P1 #12)
+
+`MutationRunner.run()` evaluated every mutant against whatever governor the
+caller's factory built, with whatever `execution_boundary` that factory
+wired in -- a factory built for production use, with a real boundary,
+would let a mutant that survives every earlier check actually execute. And
+`killed` was computed as `result.decision in mut.accepted`: any
+non-`CONTINUE` decision counted as a kill, regardless of *why* the governor
+objected. A mutant caught for the wrong reason (a governor-wide gate like
+`SIGNATURE_MISSING`, or -- concretely -- a `hard_denial` mutant landing on
+`UNKNOWN_ACTION` instead of `AUTHORITY_ABUSE` when the envelope's
+`allowed_actions` allowlist excludes every hard-denied action) read as
+"killed," inflating the reported invariant coverage without the invariant
+ever actually being exercised. Cloned mutants also carried no signature,
+so under `require_signature=True` every mutant would be killed by
+`SIGNATURE_MISSING` alone, masking whether the targeted invariant held.
+
+Fix, in `src/chainmail/evaluation.py`:
+- `MutationRunner.run()` now forcibly replaces `gov.execution_boundary`
+  with a new internal `_DenyAndRecordBoundary` on every governor it builds,
+  regardless of what the factory wired in. It always denies and records
+  whether it was reached (`MutationOutcome.execution_attempted`), so this
+  harness can never cause a real side effect no matter what governor it is
+  handed.
+- `Mutation` gained `expected_signals: Optional[Set[RiskSignal]]`, populated
+  for every mutation in `standard_mutant_family()`. `killed` is now
+  `decision in accepted AND (expected_signals is None OR signals intersect
+  expected_signals)` -- a mutant caught for the wrong reason is reported as
+  a survivor.
+- `standard_mutant_family()` no longer includes a `hard_denial` mutation
+  when no hard-denied action is reachable under the envelope's
+  `allowed_actions` (previously it could silently target an action that
+  would be rejected as `UNKNOWN_ACTION` instead, testing the wrong
+  invariant).
+- `MutationRunner` gained an optional `resign: Optional[Callable[[Proposal],
+  Proposal]]` constructor argument, applied to every built/primed mutant
+  and to `prime`'s replay/duplicate-proposal setup calls (`Mutation.prime`
+  now takes `(governor, proposal, resign)`), so a family can be run
+  correctly against a governor with `require_signature=True`.
+
+New tests in `tests/test_evaluation.py`:
+`test_hard_denial_mutation_skipped_when_unreachable_via_allowlist`,
+`test_harness_never_lets_execution_reach_a_real_boundary` (asserts an
+exploding real boundary is never invoked),
+`test_signal_specificity_catches_a_family_that_targets_the_wrong_signal`,
+and `test_resign_is_threaded_through_mutants_and_primers` (runs the
+standard family against a `require_signature=True` governor and asserts no
+mutant is killed by `SIGNATURE_MISSING`).
+
 ### Fixed — the v2→v3 replay migration dropped claim history instead of preserving it (independent audit, P1 #11)
 
 The v2→v3 migration (narrowing nonce/proposal-ID uniqueness to no longer
