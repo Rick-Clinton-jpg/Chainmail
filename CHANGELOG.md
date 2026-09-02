@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Fixed — delegation mutated live state before its audit write succeeded (independent audit, P1 #10)
+
+`register_delegation()` set `self.live_authority[to_agent]` and appended to
+`self.provenance` *before* attempting the audit write. A failed write
+returned `(False, "delegation audit write failed; delegation not
+recorded")` -- but the delegation was, at that point, already live: the
+message was false.
+
+Fix: reordered so the audit write is attempted first, using the already-computed
+`new_auth` (a pure computation with no side effects, so there is nothing to
+roll back). `live_authority` and `provenance` are only mutated after a
+successful (or inactive) audit write; on failure, the delegation is never
+published at all, matching the returned message. New test
+`test_delegation_audit_failure_leaves_no_live_state_change`: a
+`FailingAuditSink` forces the write to raise; confirms `live_authority`
+and `provenance` are byte-for-byte unchanged from before the call.
+
 ### Changed — security_report() always names process-local authority/budget state as a weakness (independent audit, P1 #9)
 
 `live_authority` (delegated authority), permission budgets, fleet/per-agent

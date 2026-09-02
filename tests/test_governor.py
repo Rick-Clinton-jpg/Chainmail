@@ -118,6 +118,34 @@ def test_provenance_recorded(governor):
     assert governor.provenance[0].from_id == "agent_research"
 
 
+def test_delegation_audit_failure_leaves_no_live_state_change(make_governor):
+    """A failed audit write must mean the delegation truly never happened --
+    not just that it wasn't recorded while still taking effect. Previously
+    live_authority/provenance were mutated BEFORE the audit write was
+    attempted; a failure returned "delegation not recorded" while the
+    delegation was, in fact, already live."""
+    from chainmail import AuditSink
+
+    class FailingAuditSink(AuditSink):
+        @property
+        def active(self):
+            return True
+
+        def record_delegation(self, **kwargs):
+            raise RuntimeError("audit backend unavailable")
+
+    g = make_governor(audit=FailingAuditSink())
+    before = g.live_authority["agent_coder"].copy()
+    ok, msg = g.register_delegation(
+        "agent_research", "agent_coder", "handoff",
+        Authority(permissions={make_permission("research")}))
+    assert ok is False
+    assert "not recorded" in msg
+    assert len(g.provenance) == 0
+    assert repr(g.live_authority["agent_coder"]) == repr(before)
+    assert not g.live_authority["agent_coder"].can(make_permission("research"))
+
+
 def test_authority_laundering(make_governor):
     from chainmail import AuthorityEnvelope
     env = AuthorityEnvelope(

@@ -570,12 +570,15 @@ class ChainmailGovernor:
                 return False, "Delegator attempted to grant authority it does not hold"
 
             new_auth = offered.clamp_to_ceiling(max_to)
-            self.live_authority[to_agent] = new_auth
 
-            link = ProvenanceLink(from_id=from_agent, to_id=to_agent, reason=reason,
-                                  delegated_authority=new_auth.copy())
-            self.provenance.append(link)
-
+            # Audit before publication: record the decision durably (when
+            # audit is active) before this delegation becomes live state.
+            # Previously live_authority/provenance were mutated first and
+            # the audit write attempted after -- a failed write returned
+            # "delegation not recorded" while the delegation was, in fact,
+            # already live and in effect. Computing new_auth above has no
+            # side effects, so there is nothing to roll back: on failure we
+            # simply never publish it.
             try:
                 if self.audit.active:
                     self.audit.record_delegation(
@@ -585,6 +588,12 @@ class ChainmailGovernor:
             except Exception:  # noqa: BLE001
                 logger.exception("delegation audit write failed")
                 return False, "delegation audit write failed; delegation not recorded"
+
+            self.live_authority[to_agent] = new_auth
+            self.provenance.append(ProvenanceLink(
+                from_id=from_agent, to_id=to_agent, reason=reason,
+                delegated_authority=new_auth.copy(),
+            ))
 
             if len(new_auth.permissions) < len(offered.permissions):
                 return True, "Delegation accepted after reduction to recipient envelope"
