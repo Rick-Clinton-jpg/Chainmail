@@ -1,5 +1,8 @@
 # Chainmail v5.1
 
+[![CI](https://github.com/Rick-Clinton-jpg/Chainmail/actions/workflows/ci.yml/badge.svg)](https://github.com/Rick-Clinton-jpg/Chainmail/actions/workflows/ci.yml)
+&nbsp;License: [PolyForm Noncommercial 1.0.0](LICENSE.md)
+
 **Policy-hard, context-fluid governance layer for long-running multi-agent systems.**
 
 > The links don't bend. The chain does.
