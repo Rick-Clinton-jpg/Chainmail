@@ -279,3 +279,23 @@ def test_cli_dev_mode_warns_and_production_starts_signature_enforcing(short_tmpd
               "--allow-no-auth"], _block=_dont_block)
     assert rc == 0
     assert "WITHOUT --production" not in capsys.readouterr().err
+
+
+def test_cli_sqlite_synchronous_flag_defaults_to_full_and_accepts_normal(short_tmpdir):
+    # PRAGMA synchronous is per-connection, not persisted to the database
+    # file, so this checks what the CLI actually wires into SQLiteStore
+    # rather than re-reading it back from a fresh connection.
+    sock = os.path.join(short_tmpdir, "sync.sock")
+    db = os.path.join(short_tmpdir, "audit.db")
+    rc = main(["--socket", sock, "--sqlite", db, "--allow-no-auth"], _block=_dont_block)
+    assert rc == 0  # default (no --sqlite-synchronous) must not error
+
+    sock2 = os.path.join(short_tmpdir, "sync2.sock")
+    db2 = os.path.join(short_tmpdir, "audit2.db")
+    rc = main(["--socket", sock2, "--sqlite", db2, "--sqlite-synchronous", "NORMAL",
+              "--allow-no-auth"], _block=_dont_block)
+    assert rc == 0
+
+    with pytest.raises(SystemExit):
+        main(["--socket", os.path.join(short_tmpdir, "sync3.sock"), "--sqlite", db,
+              "--sqlite-synchronous", "bogus", "--allow-no-auth"], _block=_dont_block)

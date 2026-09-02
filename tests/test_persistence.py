@@ -149,3 +149,20 @@ def governor_with_sqlite(make_governor):
     store = SQLiteStore(":memory:")
     g = make_governor(audit=AuditSink(sqlite_store=store))
     return g, store
+
+
+def test_sqlite_synchronous_defaults_to_full():
+    store = SQLiteStore(":memory:")
+    assert store.synchronous == "FULL"
+    assert store._conn.execute("PRAGMA synchronous").fetchone()[0] == 2  # FULL=2
+
+
+def test_sqlite_synchronous_normal_can_be_requested_explicitly():
+    store = SQLiteStore(":memory:", synchronous="normal")
+    assert store.synchronous == "NORMAL"
+    assert store._conn.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL=1
+
+
+def test_sqlite_synchronous_rejects_invalid_value():
+    with pytest.raises(ValueError):
+        SQLiteStore(":memory:", synchronous="fast-and-loose")

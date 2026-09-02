@@ -295,6 +295,9 @@ def main(argv: Optional[list] = None, *, _block: Optional[Callable[[], None]] = 
     parser.add_argument("--allow-no-auth", action="store_true",
                         help="start without authentication (loopback / testing only)")
     parser.add_argument("--sqlite", help="path to the SQLite audit DB (default: in-memory)")
+    parser.add_argument("--sqlite-synchronous", default="FULL", choices=["FULL", "NORMAL", "OFF"],
+                        help="SQLite synchronous PRAGMA (default: FULL, the durable choice; "
+                             "NORMAL trades a small crash-durability window for throughput)")
     parser.add_argument("--hash-chain", help="path to the hash-chain JSONL audit log")
     parser.add_argument("--production", action="store_true",
                         help="use GovernorConfig.production() -- requires --sqlite and at "
@@ -341,7 +344,8 @@ def main(argv: Optional[list] = None, *, _block: Optional[Callable[[], None]] = 
 
     audit = AuditSink(
         hash_chain=HashChainLog(args.hash_chain) if args.hash_chain else None,
-        sqlite_store=SQLiteStore(args.sqlite) if args.sqlite else None,
+        sqlite_store=(SQLiteStore(args.sqlite, synchronous=args.sqlite_synchronous)
+                     if args.sqlite else None),
     )
     envelope = build_demo_envelope()
     if args.production and envelope.restrict_policy == RestrictPolicy.TTL_STEPS:

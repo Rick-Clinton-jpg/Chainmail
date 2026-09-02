@@ -256,8 +256,20 @@ class SQLiteStore:
     # Purely additive over v1-v3; no existing table changes shape.
     SCHEMA_VERSION = 4
 
-    def __init__(self, db_path: str = ":memory:") -> None:
+    def __init__(self, db_path: str = ":memory:", *, synchronous: str = "FULL") -> None:
+        if synchronous.upper() not in ("FULL", "NORMAL", "OFF"):
+            raise ValueError(f"synchronous must be FULL, NORMAL, or OFF, got {synchronous!r}")
         self.db_path = db_path
+        # WAL + synchronous=NORMAL is the common performance-oriented combo,
+        # but it can still lose the most recently committed transaction(s)
+        # on an OS crash or power loss between the WAL write and its
+        # checkpoint (not corruption -- a clean rollback to the last
+        # checkpoint). For a store whose entire purpose is durable replay
+        # and restriction state ("a previously-consumed proposal cannot
+        # become replayable again"), that gap contradicts the guarantee.
+        # FULL fsyncs on every commit and is the safe default; pass
+        # synchronous="NORMAL" explicitly to trade that for throughput.
+        self.synchronous = synchronous.upper()
         # A single shared connection guarded by a lock. threadlocal connections
         # against ``:memory:`` would each get a *separate* database, which is the
         # v4 footgun; one connection avoids it and keeps writes serialised.
@@ -269,7 +281,7 @@ class SQLiteStore:
         with self._lock:
             c = self._conn
             c.execute("PRAGMA journal_mode=WAL")
-            c.execute("PRAGMA synchronous=NORMAL")
+            c.execute(f"PRAGMA synchronous={self.synchronous}")
             c.execute("PRAGMA foreign_keys=ON")
             c.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
             row = c.execute("SELECT version FROM schema_version").fetchone()

@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Fixed — SQLiteStore defaulted to synchronous=NORMAL, a durability gap for a replay/restriction ledger (independent audit, P2)
+
+`SQLiteStore` always set `PRAGMA synchronous=NORMAL`. With `journal_mode=WAL`
+(also always set), NORMAL is a common, safe-against-corruption combination,
+but it can still lose the most recently committed transaction(s) on an OS
+crash or power loss between the WAL write and its checkpoint. For a store
+whose whole purpose is durable replay-claim and restriction state --
+`GovernorConfig.production()` requires it specifically so "a previously-
+consumed signed proposal or nonce cannot become replayable again" -- that
+gap is a real, if narrow, contradiction of the guarantee: a claim recorded
+just before a crash could be gone on restart, silently re-opening a replay
+window `production_mode` is supposed to close.
+
+Fix, in `src/chainmail/persistence.py`: `SQLiteStore.__init__` gained a
+`synchronous: str = "FULL"` keyword (validated to `FULL`/`NORMAL`/`OFF`),
+applied via `PRAGMA synchronous=<value>`. **FULL is now the default** --
+fsyncs on every commit, matching the durability the rest of the store
+promises. Pass `synchronous="NORMAL"` explicitly to trade that for
+throughput. The service CLI (`src/chainmail/service/server.py`) gained a
+matching `--sqlite-synchronous {FULL,NORMAL,OFF}` flag (default `FULL`),
+wired into its `SQLiteStore(...)` construction.
+
+New tests in `tests/test_persistence.py`: synchronous defaults to `FULL`
+(checked via `PRAGMA synchronous`, not just the stored attribute),
+`synchronous="normal"` is honored (case-insensitively), and an invalid
+value raises `ValueError` at construction. New tests in
+`tests/test_service.py` cover the CLI flag: default and explicit `NORMAL`
+both construct successfully, and an invalid value is rejected via
+`argparse` (`SystemExit`), not a silent fallback.
+
 ### Fixed — HashChainLog.append() was not safe for multiple processes sharing one file (independent audit, P2)
 
 `HashChainLog.append()` computed each new entry's `prev_hash` from its own
