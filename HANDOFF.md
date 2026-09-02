@@ -54,12 +54,13 @@ OS / APIs                     Effect                trusted handlers
   embedding cosine similarity vs tuned thresholds. They are tripwires. The
   deterministic checks (permissions, allow-list, hard denials, budgets,
   delegation math, signatures, schema, replay, envelope integrity) are the wall.
-- fully durable across restart — nonce/proposal-ID replay protection is now
-  durable and atomic when a `SQLiteStore` is wired into `AuditSink` (see
-  `SQLiteStore.claim_nonce`/`claim_proposal_id`, Unreleased in CHANGELOG.md);
-  `live_authority` and `restrictions` still live only in RAM. The audit log
-  is durable; nothing rebuilds `live_authority`/`restrictions` from it yet
-  (that's the rest of v6).
+- fully durable across restart — nonce/proposal-ID replay protection and
+  restriction state are now durable and atomic when a `SQLiteStore` is
+  wired into `AuditSink` (see `SQLiteStore.claim_nonce`/`claim_proposal_id`/
+  `impose_restriction`/`clear_restriction`, Unreleased in CHANGELOG.md);
+  `live_authority` and STEP_BUDGET restriction budgets (`_restrict_budgets`)
+  still live only in RAM. The audit log is durable; nothing rebuilds
+  `live_authority`/budgets from it yet (that's the rest of v6).
 
 ---
 
@@ -278,10 +279,11 @@ Actions run is green.
 ## 7. Known limitations / v6 roadmap
 
 Must: network quorum transport with real peer governors; mTLS/SPIFFE identity for
-the service; durable `live_authority` and `restrictions`/budgets (nonce and
-proposal-ID replay protection is already durable -- see Unreleased in
-CHANGELOG.md; the rest still needs a store + local fallback, rebuilt from the
-audit log on restart — pattern from `Quorum/gate/firestore_*.py`).
+the service; durable `live_authority` and STEP_BUDGET restriction budgets /
+permission budgets (nonce/proposal-ID replay protection and restriction state
+are already durable -- see Unreleased in CHANGELOG.md; the rest still needs a
+store + local fallback, rebuilt from the audit log on restart — pattern from
+`Quorum/gate/firestore_*.py`).
 Should: encrypted key material at rest / KMS backend; formal TLA+ model of the
 delegation invariants; wall-clock fleet budgets + rate limits; an atomic
 idempotency store so a client retry can't re-run a CONTINUE (pattern from

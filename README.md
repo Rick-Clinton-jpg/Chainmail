@@ -47,12 +47,14 @@ adversarial mutation harness challenges the boundary on every CI run.
   `required_permission` are self-reported by the agent. Chainmail checks the
   declared intent against policy; whether the action *does* what it says is the
   execution boundary's job.
-- **Partially durable operational state.** Nonce and proposal-ID replay
-  protection is durable and atomic *when a `SQLiteStore` is wired into
-  `AuditSink`* (see `SQLiteStore.claim_nonce`/`claim_proposal_id`); without
-  one, or for `live_authority` and `restrictions`, state still lives only in
-  RAM and a governor restart resets it. Multi-process quorum, KMS-backed
-  keys, and durable restrictions/budgets are tracked for v6.
+- **Partially durable operational state.** Nonce/proposal-ID replay
+  protection and restriction state are durable and atomic *when a
+  `SQLiteStore` is wired into `AuditSink`* (see `SQLiteStore.claim_nonce`/
+  `claim_proposal_id`/`impose_restriction`/`clear_restriction`); without
+  one, or for `live_authority` and STEP_BUDGET restriction/permission
+  budgets, state still lives only in RAM and a governor restart resets it.
+  Multi-process quorum, KMS-backed keys, and durable budgets are tracked for
+  v6.
 - **No formal proof.** The no-authority-laundering property is tested by example
   and challenged by the mutation harness, not proven.
 
@@ -170,7 +172,7 @@ OS / APIs           Effect                Trusted handlers
 | `embeddings` | `EmbeddingEngine` protocol; model2vec / sentence-transformers / TF-IDF; `auto_embedding_engine()` |
 | `intent` | `IntentGraph` — bounded drift, peer-consensus, and hard-gated re-entry scoring |
 | `crypto` | `KeyRegistry`, `CompositeVerifier` (Ed25519 + HMAC), canonical signing payload, `sign_proposal` |
-| `persistence` | `HashChainLog`, `SQLiteStore` (audit + durable replay claims), `AuditSink`, PII scrubbing |
+| `persistence` | `HashChainLog`, `SQLiteStore` (audit + durable replay claims + durable restrictions), `AuditSink`, PII scrubbing |
 | `redaction` | `scrub_pii` — typed PII redaction for audit surfaces |
 | `quorum` | `QuorumAggregator` (fail-closed), `VoteTransport` |
 | `execution_boundary` | `ExecutionBoundary`, `PermissiveExecutionBoundary`, `DenyAllExecutionBoundary`, `GuardedExecutorAdapter` |
@@ -382,7 +384,7 @@ copyright holder.
 |---|---|
 | Must | Network quorum transport (Raft / PBFT) with real peer governors |
 | Must | mTLS / SPIFFE identity for the service instead of shared/per-caller tokens |
-| Must | Durable live state (`live_authority`, replay set, restrictions) with a store + local fallback, rebuilt from the audit log on restart — pattern from `Quorum/gate/firestore_*.py` |
+| Must | Durable `live_authority` and STEP_BUDGET/permission budgets with a store + local fallback, rebuilt from the audit log on restart — pattern from `Quorum/gate/firestore_*.py` (replay set and restrictions are already durable) |
 | Should | Encrypted key material at rest in `KeyRegistry`; HSM/KMS backend |
 | Should | Formal TLA+ model of the delegation invariants |
 | Should | Wall-clock fleet budgets and sliding-window rate limits |

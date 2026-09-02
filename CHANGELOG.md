@@ -132,6 +132,76 @@ sharing one SQLite database from both accepting the same identifier.
   nonces, fleet-wide proposal IDs, survival across both key rotation *and* a
   genuine envelope/policy change).
 
+### New — durable restriction state
+
+Continues Priority 1 ("Durable Governance State"), scoped to restrictions
+only -- STEP_BUDGET restrictions and general permission/fleet budgets remain
+in-memory and are tracked separately. Previously `self.restricted` lived only
+in process RAM: a restart silently lifted every active restriction, and
+nothing let two governor processes sharing a database observe restrictions
+imposed by one another.
+
+- `SQLiteStore` schema at v4: `restrictions` (current-state, one row per
+  `restriction_id`, `status` one of `ACTIVE`/`CLEARED`/`EXPIRED`, updated in
+  place and never deleted) and `restriction_events` (append-only log of
+  every `IMPOSED`/`CLEARED`/`EXPIRED` transition, for investigation after a
+  restriction is cleared). `SQLiteStore.impose_restriction()` /
+  `active_restrictions()` / `mark_expired()` / `clear_restriction()` /
+  `restriction_history()`.
+- Scope is `(deployment_namespace, agent_id)` -- deliberately independent of
+  `envelope_fingerprint` and any signing key: a restriction is a consequence
+  of an agent's behaviour, and a policy update, envelope change, or key
+  rotation must not silently lift it. `envelope_fingerprint` is still
+  recorded as metadata (the policy version active when imposed / cleared).
+- When a `ChainmailGovernor` is constructed with a `SQLiteStore` wired into
+  `AuditSink`, restrictions become durable automatically -- same trigger as
+  durable replay protection, since both use the same store. Without one,
+  behaviour is unchanged (in-memory only, per-process), and
+  `security_report()` flags that as a weakness (`durable_restriction_protection`).
+- No `__init__`-time load and no in-memory cache for the durable path:
+  `evaluate()` asks the store fresh every time via `active_restrictions()`,
+  so a restriction imposed or cleared by *any* governor process sharing the
+  store is observed on the very next call by every other one -- not just
+  after a restart.
+- Persist-before-return: imposing a restriction commits to the store (in the
+  same transaction as its `IMPOSED` event) *before* `evaluate()` returns.
+  If that commit fails, the decision is downgraded to `HUMAN` /
+  `RESTRICTION_STORE_UNAVAILABLE` and the in-memory mirror is never touched
+  -- a restriction is never reported as imposed when it exists only in
+  memory. A failure reading restrictions (not just writing) also fails
+  closed the same way, rather than silently proceeding as unrestricted.
+- `ChainmailGovernor.clear_restriction(agent_id, restriction_id, *,
+  authorised_by, reason="")` -- the only way to lift a durable restriction
+  early. Bound to the exact `(agent_id, restriction_id)` pair, so releasing
+  one restriction can never affect another, and a stale/replayed release
+  naming an old (already-cleared) `restriction_id` cannot clear a different,
+  newer restriction imposed since. Idempotent (`"already_cleared"` on a
+  repeat). `authorised_by` and `reason` are recorded on the restriction row
+  and in `restriction_events`, along with the clearing governor's current
+  envelope fingerprint as `cleared_policy_version`.
+- `GovernorConfig.production()` / `production_mode` now also cover
+  restrictions: since both replay protection and restriction storage are
+  backed by the same `SQLiteStore`, the existing construction-time check
+  (durable storage required) already enforces this -- the error message now
+  says so explicitly.
+- Existing expiry semantics only, not extended: `TTL_WALLCLOCK` stores an
+  absolute timestamp (durable and restart-safe by construction).
+  `TTL_STEPS` stores an absolute step number and is still compared against
+  the *evaluating governor's own* `step_count`, exactly as before -- no
+  cross-process step synchronisation is invented here. `STEP_BUDGET`
+  (`_restrict_budgets`, a decrementing counter) is explicitly out of scope
+  for this commit and remains in-memory-only, deferred to a future budget
+  durability commit.
+- New `RiskSignal.RESTRICTION_STORE_UNAVAILABLE`.
+- 13 new tests in `tests/test_restriction_persistence.py`: restart survival,
+  survival across both an envelope change and a key rotation, a second
+  governor observing a restriction imposed by the first, a forced write
+  failure and a forced read failure each failing closed, clearing surviving
+  restart, idempotent clearing, a stale release unable to touch a newer
+  restriction, clearing rejected for the wrong agent, history surviving
+  clearing, v3->v4 schema migration, development-mode behaviour unchanged,
+  and production mode requiring durable restriction storage.
+
 ## v5.1.0
 
 Hardening pulled from the sibling projects (all PolyForm NC 1.0.0):

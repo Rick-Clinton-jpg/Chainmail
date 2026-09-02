@@ -199,7 +199,10 @@ class SQLiteStore:
     # (see _migrate_replay_tables) -- v2 shipped only within this session, so
     # there is no real replay history to preserve across that specific
     # transition; proposals/delegations are untouched by any version bump.
-    SCHEMA_VERSION = 3
+    # v4: + restrictions, restriction_events (durable restriction state --
+    # see impose_restriction / clear_restriction / active_restrictions).
+    # Purely additive over v1-v3; no existing table changes shape.
+    SCHEMA_VERSION = 4
 
     def __init__(self, db_path: str = ":memory:") -> None:
         self.db_path = db_path
@@ -291,10 +294,66 @@ class SQLiteStore:
                     UNIQUE (deployment_namespace, proposal_id)
                 )
             """)
+            # Durable restriction state. ``restrictions`` is the current-state
+            # table (one row per restriction_id, updated in place on
+            # clear/expire -- never deleted); ``restriction_events`` is the
+            # accompanying append-only log of every IMPOSED / CLEARED /
+            # EXPIRED transition, for investigation after the fact.
+            #
+            # Scoped by (deployment_namespace, agent_id) -- see
+            # active_restrictions(). Deliberately NOT scoped by
+            # envelope_fingerprint or a signing key_id, for the same reason
+            # replay protection isn't: a restriction is a consequence of an
+            # agent's behaviour, and a policy update, envelope change, or key
+            # rotation must not silently lift it. envelope_fingerprint is
+            # still recorded as metadata (the policy version active when the
+            # restriction was imposed / cleared).
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS restrictions (
+                    restriction_id TEXT PRIMARY KEY,
+                    deployment_namespace TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    permission_name TEXT NOT NULL,
+                    permission_scope TEXT NOT NULL,
+                    permission_max_budget INTEGER,
+                    status TEXT NOT NULL,
+                    reason_code TEXT NOT NULL,
+                    source_proposal_id TEXT NOT NULL,
+                    envelope_fingerprint TEXT,
+                    expiry_kind TEXT NOT NULL,
+                    expiry_value REAL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    cleared_by TEXT,
+                    cleared_reason TEXT,
+                    cleared_policy_version TEXT
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS restriction_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    restriction_id TEXT NOT NULL,
+                    deployment_namespace TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    permission_name TEXT NOT NULL,
+                    permission_scope TEXT NOT NULL,
+                    reason_code TEXT,
+                    source_proposal_id TEXT,
+                    envelope_fingerprint TEXT,
+                    actor TEXT,
+                    detail TEXT,
+                    timestamp REAL NOT NULL
+                )
+            """)
             c.execute("CREATE INDEX IF NOT EXISTS ix_proposals_agent ON proposals(agent_id)")
             c.execute("CREATE INDEX IF NOT EXISTS ix_proposals_ts ON proposals(timestamp)")
             c.execute("CREATE INDEX IF NOT EXISTS ix_proposals_pid ON proposals(proposal_id)")
             c.execute("CREATE INDEX IF NOT EXISTS ix_deleg_from ON delegations(from_agent)")
+            c.execute("CREATE INDEX IF NOT EXISTS ix_restrictions_active "
+                     "ON restrictions(deployment_namespace, agent_id, status)")
+            c.execute("CREATE INDEX IF NOT EXISTS ix_restriction_events_rid "
+                     "ON restriction_events(restriction_id)")
             c.commit()
 
     def _migrate_replay_tables(self, c: sqlite3.Connection) -> None:
@@ -406,6 +465,178 @@ class SQLiteStore:
             except sqlite3.IntegrityError:
                 self._conn.rollback()
                 return False
+
+    # -- durable restriction state --------------------------------------
+    #
+    # ``restrictions`` holds current state (never deleted, only transitioned:
+    # ACTIVE -> CLEARED or ACTIVE -> EXPIRED); ``restriction_events`` is an
+    # append-only log of every transition, for investigation after a
+    # restriction is cleared. Both are written in the same commit as the
+    # state change they record.
+    #
+    # Scope: (deployment_namespace, agent_id) -- NOT envelope_fingerprint or
+    # a key_id. A restriction is a consequence of behaviour; a policy
+    # update, envelope change, or key rotation must not silently lift it.
+    # envelope_fingerprint is recorded as metadata (the policy version in
+    # effect when imposed / cleared), never part of how a restriction is
+    # looked up.
+
+    def impose_restriction(self, *, namespace: str, agent_id: str, permission_name: str,
+                           permission_scope: str, permission_max_budget: Optional[int],
+                           reason_code: str, source_proposal_id: str,
+                           envelope_fingerprint: Optional[str], expiry_kind: str,
+                           expiry_value: Optional[float]) -> str:
+        """Durably impose a new ACTIVE restriction. Returns the new
+        ``restriction_id``. Raises ``sqlite3.Error`` on failure -- the caller
+        must fail closed (HUMAN, never CONTINUE/RESTRICT reported as applied)
+        rather than treat the restriction as imposed.
+        """
+        restriction_id = secrets.token_hex(16)
+        now = time.time()
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "INSERT INTO restrictions (restriction_id, deployment_namespace, agent_id, "
+                    "permission_name, permission_scope, permission_max_budget, status, "
+                    "reason_code, source_proposal_id, envelope_fingerprint, expiry_kind, "
+                    "expiry_value, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?)",
+                    (restriction_id, namespace, agent_id, permission_name, permission_scope,
+                     permission_max_budget, reason_code, source_proposal_id, envelope_fingerprint,
+                     expiry_kind, expiry_value, now, now),
+                )
+                self._conn.execute(
+                    "INSERT INTO restriction_events (restriction_id, deployment_namespace, "
+                    "agent_id, event_type, permission_name, permission_scope, reason_code, "
+                    "source_proposal_id, envelope_fingerprint, actor, detail, timestamp) "
+                    "VALUES (?, ?, ?, 'IMPOSED', ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (restriction_id, namespace, agent_id, permission_name, permission_scope,
+                     reason_code, source_proposal_id, envelope_fingerprint, None, None, now),
+                )
+                self._conn.commit()
+                return restriction_id
+            except sqlite3.Error:
+                self._conn.rollback()
+                raise
+
+    def active_restrictions(self, *, namespace: str, agent_id: str) -> List[Dict[str, Any]]:
+        """All ACTIVE restriction rows for ``(namespace, agent_id)``.
+
+        The caller (``ChainmailGovernor``) applies liveness (steps/wall/human)
+        itself and calls ``mark_expired`` for anything found expired -- this
+        method does not interpret expiry, it only returns what's currently
+        marked ACTIVE.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT restriction_id, permission_name, permission_scope, "
+                "permission_max_budget, expiry_kind, expiry_value FROM restrictions "
+                "WHERE deployment_namespace = ? AND agent_id = ? AND status = 'ACTIVE'",
+                (namespace, agent_id),
+            )
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def mark_expired(self, *, namespace: str, agent_id: str, restriction_id: str) -> bool:
+        """Atomically transition one restriction ACTIVE -> EXPIRED.
+
+        Returns True if this call performed the transition, False if it was
+        already non-ACTIVE (idempotent no-op) -- never raises on a
+        already-cleared/expired restriction, only on a genuine store error.
+        """
+        now = time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE restrictions SET status = 'EXPIRED', updated_at = ? "
+                "WHERE restriction_id = ? AND deployment_namespace = ? AND agent_id = ? "
+                "AND status = 'ACTIVE'",
+                (now, restriction_id, namespace, agent_id),
+            )
+            if cur.rowcount:
+                row = self._conn.execute(
+                    "SELECT permission_name, permission_scope FROM restrictions "
+                    "WHERE restriction_id = ?", (restriction_id,),
+                ).fetchone()
+                self._conn.execute(
+                    "INSERT INTO restriction_events (restriction_id, deployment_namespace, "
+                    "agent_id, event_type, permission_name, permission_scope, timestamp) "
+                    "VALUES (?, ?, ?, 'EXPIRED', ?, ?, ?)",
+                    (restriction_id, namespace, agent_id, row[0], row[1], now),
+                )
+            self._conn.commit()
+            return bool(cur.rowcount)
+
+    def clear_restriction(self, *, namespace: str, agent_id: str, restriction_id: str,
+                          authorised_by: str, reason: str,
+                          policy_version: Optional[str]) -> str:
+        """Explicitly clear one restriction, bound to a specific
+        ``(agent_id, restriction_id)`` pair -- clearing restriction A can
+        never affect restriction B, however similar, and a stale release
+        naming an old restriction_id cannot clear a newer one imposed since.
+
+        Returns one of:
+          * ``"cleared"``          -- this call performed the transition
+          * ``"already_cleared"``  -- idempotent no-op, it was already CLEARED
+          * ``"not_found"``        -- no such restriction_id in this namespace
+                                      (or it is EXPIRED, not ACTIVE/CLEARED --
+                                      an expired restriction cannot be cleared)
+          * ``"wrong_agent"``      -- the restriction_id exists but belongs to
+                                      a different agent_id
+        """
+        now = time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE restrictions SET status = 'CLEARED', updated_at = ?, cleared_by = ?, "
+                "cleared_reason = ?, cleared_policy_version = ? WHERE restriction_id = ? AND "
+                "deployment_namespace = ? AND agent_id = ? AND status = 'ACTIVE'",
+                (now, authorised_by, reason, policy_version, restriction_id, namespace, agent_id),
+            )
+            if cur.rowcount:
+                row = self._conn.execute(
+                    "SELECT permission_name, permission_scope FROM restrictions "
+                    "WHERE restriction_id = ?", (restriction_id,),
+                ).fetchone()
+                self._conn.execute(
+                    "INSERT INTO restriction_events (restriction_id, deployment_namespace, "
+                    "agent_id, event_type, permission_name, permission_scope, actor, detail, "
+                    "timestamp) VALUES (?, ?, ?, 'CLEARED', ?, ?, ?, ?, ?)",
+                    (restriction_id, namespace, agent_id, row[0], row[1], authorised_by, reason, now),
+                )
+                self._conn.commit()
+                return "cleared"
+            # not newly cleared: figure out why, without assuming anything changed
+            row = self._conn.execute(
+                "SELECT status, agent_id FROM restrictions WHERE restriction_id = ? "
+                "AND deployment_namespace = ?", (restriction_id, namespace),
+            ).fetchone()
+            self._conn.commit()
+            if row is None:
+                return "not_found"
+            status, existing_agent = row
+            if existing_agent != agent_id:
+                return "wrong_agent"
+            if status == "CLEARED":
+                return "already_cleared"
+            return "not_found"  # EXPIRED (or any other non-ACTIVE state) -- can't clear it
+
+    def restriction_history(self, *, namespace: str, agent_id: str,
+                            restriction_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Every recorded event (IMPOSED/CLEARED/EXPIRED) for an agent, or for
+        one specific restriction_id -- the append-only audit trail."""
+        with self._lock:
+            if restriction_id is not None:
+                cur = self._conn.execute(
+                    "SELECT * FROM restriction_events WHERE deployment_namespace = ? "
+                    "AND agent_id = ? AND restriction_id = ? ORDER BY id",
+                    (namespace, agent_id, restriction_id),
+                )
+            else:
+                cur = self._conn.execute(
+                    "SELECT * FROM restriction_events WHERE deployment_namespace = ? "
+                    "AND agent_id = ? ORDER BY id", (namespace, agent_id),
+                )
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
 
     def log_proposal(self, *, proposal_id: str, agent_id: str, action: str, decision: str,
                      signals: List[str], overlap: float, drift: float, phase: str,

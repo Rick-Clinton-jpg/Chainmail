@@ -94,11 +94,12 @@ class ChainmailGovernor:
         if self.config.production_mode and self.audit.sqlite is None:
             raise ValueError(
                 "config.production_mode=True (set by GovernorConfig.production()) "
-                "requires durable replay storage, but no SQLiteStore is wired into "
-                "audit: in-memory-only nonce/proposal-ID replay protection does not "
-                "survive a restart and offers no protection across multiple governor "
-                "processes. Pass audit=AuditSink(sqlite_store=SQLiteStore(...)), or "
-                "build a non-production GovernorConfig() for development."
+                "requires durable storage, but no SQLiteStore is wired into audit: "
+                "in-memory-only nonce/proposal-ID replay protection and restriction "
+                "state do not survive a restart and offer no protection across "
+                "multiple governor processes. Pass "
+                "audit=AuditSink(sqlite_store=SQLiteStore(...)), or build a "
+                "non-production GovernorConfig() for development."
             )
         self.quorum = quorum
         self.quorum_transport = quorum_transport or LocalSingleGovernorTransport()
@@ -186,6 +187,14 @@ class ChainmailGovernor:
                 "across multiple governor processes; wire a SQLiteStore into "
                 "AuditSink for durable, atomic replay protection"
             )
+        durable_restrictions = self.audit.sqlite is not None
+        if not durable_restrictions:
+            weaknesses.append(
+                "restriction state is in-memory only -- a restart silently drops "
+                "active restrictions, and multiple governor processes cannot "
+                "observe restrictions imposed by one another; wire a SQLiteStore "
+                "into AuditSink for durable restriction storage"
+            )
         return {
             "governor_id": self.governor_id,
             "signature_required": self.config.require_signature,
@@ -198,6 +207,7 @@ class ChainmailGovernor:
             "quorum_configured": self.quorum is not None,
             "dedupe_proposal_ids": self.config.dedupe_proposal_ids,
             "durable_replay_protection": durable_replay,
+            "durable_restriction_protection": durable_restrictions,
             "production_mode": self.config.production_mode,
             "deployment_namespace": self.deployment_namespace,
             "weaknesses": weaknesses,
@@ -348,22 +358,59 @@ class ChainmailGovernor:
     def _get_live_auth(self, agent_id: str) -> Authority:
         return self.live_authority.get(agent_id, Authority())
 
+    def _is_restriction_live(self, kind: str, expiry: float) -> bool:
+        if kind == "human":
+            return True
+        if kind == "wall":
+            return expiry > time.time()
+        return expiry > self.step_count  # "steps"
+
     def _active_restrictions(self, agent_id: str) -> Set[Permission]:
+        """The set of currently-restricted permissions for ``agent_id``.
+
+        Durable mode (a SQLiteStore wired into AuditSink) reads the store
+        fresh on every call -- never a cached/loaded-at-__init__ snapshot --
+        so this reflects restrictions imposed or cleared by *any* governor
+        process sharing the store, not just this one. ``sqlite3.Error``
+        propagates to the caller (see ``evaluate``), which fails closed
+        rather than silently falling back to "no restrictions".
+        """
+        if self.audit.sqlite is not None:
+            return self._active_restrictions_durable(agent_id)
         now = time.time()
         active: Set[Permission] = set()
         kept: List[Tuple[Permission, str, float]] = []
         for perm, kind, expiry in self.restricted.get(agent_id, []):
-            if kind == "human":
-                live = True
-            elif kind == "wall":
-                live = expiry > now
-            else:  # "steps"
-                live = expiry > self.step_count
-            if live:
+            if self._is_restriction_live(kind, expiry):
                 active.add(perm)
                 kept.append((perm, kind, expiry))
         if agent_id in self.restricted:
             self.restricted[agent_id] = kept
+        return active
+
+    def _active_restrictions_durable(self, agent_id: str) -> Set[Permission]:
+        rows = self.audit.sqlite.active_restrictions(
+            namespace=self.deployment_namespace, agent_id=agent_id)
+        active: Set[Permission] = set()
+        for row in rows:
+            live = self._is_restriction_live(row["expiry_kind"], row["expiry_value"])
+            if live:
+                active.add(Permission(row["permission_name"], row["permission_scope"],
+                                      row["permission_max_budget"]))
+            else:
+                try:
+                    self.audit.sqlite.mark_expired(
+                        namespace=self.deployment_namespace, agent_id=agent_id,
+                        restriction_id=row["restriction_id"],
+                    )
+                except sqlite3.Error:
+                    # Best-effort bookkeeping: the row is already correctly
+                    # excluded from `active` above regardless of whether this
+                    # write succeeds, so a failure here doesn't need to fail
+                    # the whole evaluation -- only imposing/reading a
+                    # restriction does.
+                    logger.exception("failed to mark restriction %s expired (non-fatal)",
+                                     row["restriction_id"])
         return active
 
     def _effective_authority(self, agent_id: str) -> Authority:
@@ -373,21 +420,47 @@ class ChainmailGovernor:
             return base
         return base.reduce_to(base.permissions - active)
 
-    def _apply_restrict(self, agent_id: str, permission: Permission) -> None:
+    def _compute_restrict_expiry(self) -> Optional[Tuple[str, float]]:
+        """The (kind, value) a new restriction would get under the envelope's
+        current ``restrict_policy``, or None for STEP_BUDGET -- that policy
+        has no expiry row; it consumes ``_restrict_budgets`` instead, which
+        is out of scope for durable persistence in this commit (tracked with
+        the rest of budget durability)."""
         policy = self.envelope.restrict_policy
         if policy == RestrictPolicy.TTL_STEPS:
             ttl = self.envelope.restrict_ttl_steps or 3
-            self.restricted.setdefault(agent_id, []).append(
-                (permission, "steps", float(self.step_count + ttl)))
-        elif policy == RestrictPolicy.TTL_WALLCLOCK:
+            return ("steps", float(self.step_count + ttl))
+        if policy == RestrictPolicy.TTL_WALLCLOCK:
             ttl = self.envelope.restrict_ttl_seconds or 60.0
-            self.restricted.setdefault(agent_id, []).append(
-                (permission, "wall", time.time() + ttl))
-        elif policy == RestrictPolicy.STEP_BUDGET:
+            return ("wall", time.time() + ttl)
+        if policy == RestrictPolicy.HUMAN_ONLY:
+            return ("human", _INF)
+        return None
+
+    def _apply_restrict(self, agent_id: str, permission: Permission,
+                        expiry: Optional[Tuple[str, float]]) -> None:
+        """In-memory bookkeeping. ``expiry`` is whatever
+        ``_compute_restrict_expiry()`` returned -- None means STEP_BUDGET.
+
+        When durable restriction storage is configured, an expiring
+        restriction (expiry is not None) is NOT mirrored here: the durable
+        store is the sole source of truth for it (see
+        ``_active_restrictions``), and keeping a shadow copy that nothing
+        ever prunes would just grow unboundedly and go stale. STEP_BUDGET
+        remains in-memory-only regardless of durability (see
+        ``_compute_restrict_expiry``).
+        """
+        if expiry is None:
             budget = self.envelope.restrict_step_budget or 10
             self._restrict_budgets.setdefault(agent_id, {})[permission.key()] = budget
-        elif policy == RestrictPolicy.HUMAN_ONLY:
-            self.restricted.setdefault(agent_id, []).append((permission, "human", _INF))
+            return
+        if self.audit.sqlite is not None:
+            return
+        kind, value = expiry
+        self.restricted.setdefault(agent_id, []).append((permission, kind, value))
+
+    def _restriction_reason_code(self, signals: List[RiskSignal]) -> str:
+        return ",".join(s.value for s in signals) if signals else "RESTRICT"
 
     def _check_restrict_budget(self, agent_id: str, permission: Permission) -> bool:
         """STEP_BUDGET policy: consume one unit; return True when it hits zero
@@ -594,7 +667,13 @@ class ChainmailGovernor:
 
         # (10) permission
         live_auth = self._get_live_auth(proposal.agent_id)
-        current_auth = self._effective_authority(proposal.agent_id)
+        try:
+            current_auth = self._effective_authority(proposal.agent_id)
+        except sqlite3.Error as exc:
+            logger.exception("durable restriction store is unavailable")
+            return self._deny(Decision.HUMAN,
+                              f"Durable restriction store is unavailable: {type(exc).__name__}",
+                              [RiskSignal.RESTRICTION_STORE_UNAVAILABLE], execution_id=execution_id)
         if not current_auth.can(proposal.required_permission):
             return self._deny(Decision.HUMAN,
                               f"Agent {proposal.agent_id} lacks permission {proposal.required_permission}",
@@ -725,11 +804,38 @@ class ChainmailGovernor:
         if decision == Decision.CONTINUE:
             live_auth.consume_budget(proposal.required_permission)
 
-        # (18) apply restriction
+        # (18) apply restriction. Durable persistence, when configured, is
+        # attempted BEFORE any in-memory mutation and before the decision is
+        # returned: on failure the decision is downgraded to HUMAN here (fail
+        # closed) and _apply_restrict is never called, so this governor never
+        # reports a restriction as imposed when it exists only in memory.
         restricted_perms: Optional[Set[Permission]] = None
         if decision == Decision.RESTRICT:
-            self._apply_restrict(proposal.agent_id, proposal.required_permission)
-            restricted_perms = {proposal.required_permission}
+            expiry = self._compute_restrict_expiry()
+            persisted = True
+            if expiry is not None and self.audit.sqlite is not None:
+                kind, value = expiry
+                try:
+                    self.audit.sqlite.impose_restriction(
+                        namespace=self.deployment_namespace, agent_id=proposal.agent_id,
+                        permission_name=proposal.required_permission.name,
+                        permission_scope=proposal.required_permission.scope,
+                        permission_max_budget=proposal.required_permission.max_budget,
+                        reason_code=self._restriction_reason_code(signals),
+                        source_proposal_id=proposal.proposal_id,
+                        envelope_fingerprint=self.envelope._construction_fingerprint,
+                        expiry_kind=kind, expiry_value=value,
+                    )
+                except sqlite3.Error as exc:
+                    logger.exception("durable restriction store is unavailable")
+                    decision = Decision.HUMAN
+                    reason_parts.append(
+                        f"Durable restriction store is unavailable: {type(exc).__name__}")
+                    signals.append(RiskSignal.RESTRICTION_STORE_UNAVAILABLE)
+                    persisted = False
+            if persisted:
+                self._apply_restrict(proposal.agent_id, proposal.required_permission, expiry)
+                restricted_perms = {proposal.required_permission}
 
         # intent-graph record. A RESTRICT/HUMAN turn is a refusal boundary: a
         # later reworded return to it is what reentry_risk() keys off.
@@ -774,6 +880,45 @@ class ChainmailGovernor:
             logger.exception("approval verifier raised")
             from .crypto import VerificationResult
             return VerificationResult(False, "verifier raised an exception")
+
+    # ------------------------------------------------------------------
+    # restriction release
+    # ------------------------------------------------------------------
+    def clear_restriction(self, agent_id: str, restriction_id: str, *,
+                          authorised_by: str, reason: str = "") -> str:
+        """Explicitly clear one durably-imposed restriction.
+
+        Requires durable restriction storage (a SQLiteStore wired into
+        AuditSink) -- there is no in-memory equivalent; a non-durable
+        governor's TTL/HUMAN_ONLY restrictions clear themselves on expiry or
+        aren't meant to be released by anything but that expiry.
+
+        The release is bound to the exact ``(agent_id, restriction_id)``
+        pair -- see ``SQLiteStore.clear_restriction`` for why a stale release
+        can never clear a different, newer restriction. ``authorised_by``
+        (who/what approved this) and ``reason`` are recorded on the
+        restriction and in the append-only event history. Idempotent:
+        clearing an already-cleared restriction returns ``"already_cleared"``
+        rather than raising.
+
+        Returns one of ``"cleared"`` / ``"already_cleared"`` / ``"not_found"``
+        / ``"wrong_agent"`` (see ``SQLiteStore.clear_restriction``).
+        """
+        if self.audit.sqlite is None:
+            raise RuntimeError(
+                "clear_restriction requires durable restriction storage: no SQLiteStore "
+                "is wired into audit. Non-durable restrictions are not individually "
+                "releasable -- they clear themselves on TTL expiry."
+            )
+        if not authorised_by:
+            raise ValueError("authorised_by is required: who or what authorised this release "
+                             "must be recorded")
+        with self._lock:
+            return self.audit.sqlite.clear_restriction(
+                namespace=self.deployment_namespace, agent_id=agent_id,
+                restriction_id=restriction_id, authorised_by=authorised_by, reason=reason,
+                policy_version=self.envelope._construction_fingerprint,
+            )
 
     # ------------------------------------------------------------------
     # introspection
