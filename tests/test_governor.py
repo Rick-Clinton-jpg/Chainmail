@@ -36,6 +36,61 @@ def test_delegation_cannot_expand(governor):
     assert not ok and "does not hold" in msg
 
 
+def test_delegation_cannot_launder_bounded_into_unlimited(make_governor):
+    """A delegator whose own permission is budget-bounded must not be able
+    to delegate an "equivalent" name/scope permission with a higher or
+    unlimited ceiling -- Permission.covers() only checks name/scope, so
+    is_subset_of() must add its own budget-aware check rather than trust
+    covers() for containment."""
+    from chainmail import AuthorityEnvelope
+
+    env = AuthorityEnvelope(
+        objective="Test budget laundering",
+        agent_authorities={
+            "agent_A": Authority(permissions={make_permission("deploy", "prod", max_budget=1)}),
+            "agent_B": Authority(permissions={make_permission("deploy", "prod", max_budget=None)}),
+        },
+        allowed_delegations={}, agent_roles={},
+        hard_denials=set(), max_fleet_steps=50,
+    )
+    g = make_governor(env)
+    offered = Authority(permissions={make_permission("deploy", "prod", max_budget=None)})
+    ok, msg = g.register_delegation("agent_A", "agent_B", "escalate", offered)
+    assert not ok
+    assert "does not hold" in msg
+
+
+def test_delegation_ignores_injected_remaining_budget(make_governor):
+    """An offered Authority's budget_remaining is caller-supplied data, not
+    evidence -- register_delegation must compute the recipient's granted
+    remaining itself rather than trust an inflated stored value."""
+    from chainmail import AuthorityEnvelope
+
+    env = AuthorityEnvelope(
+        objective="Test injected remaining",
+        agent_authorities={
+            "agent_A": Authority(
+                permissions={make_permission("deploy", "prod", max_budget=1)},
+                budget_remaining={"deploy:prod": 1},
+            ),
+            "agent_B": Authority(permissions={make_permission("deploy", "prod", max_budget=5)}),
+        },
+        allowed_delegations={}, agent_roles={},
+        hard_denials=set(), max_fleet_steps=50,
+    )
+    g = make_governor(env)
+    offered = Authority(
+        permissions={make_permission("deploy", "prod", max_budget=1)},
+        budget_remaining={"deploy:prod": 999},
+    )
+    ok, _ = g.register_delegation("agent_A", "agent_B", "share", offered)
+    assert ok
+    granted = g.live_authority["agent_B"]._match(make_permission("deploy", "prod"))
+    assert granted is not None and granted.max_budget == 1
+    remaining = g.live_authority["agent_B"].budget_remaining.get("deploy:prod")
+    assert remaining is not None and remaining <= 1
+
+
 def test_delegation_preserve_or_reduce(governor):
     offered = Authority(permissions={make_permission("research"), make_permission("read", "docs")})
     ok, _ = governor.register_delegation("agent_research", "agent_coder", "share", offered)

@@ -527,7 +527,7 @@ class ChainmailGovernor:
             if not offered.is_subset_of(from_auth):
                 return False, "Delegator attempted to grant authority it does not hold"
 
-            new_auth = offered.reduce_to(max_to.permissions)
+            new_auth = offered.clamp_to_ceiling(max_to)
             self.live_authority[to_agent] = new_auth
 
             link = ProvenanceLink(from_id=from_agent, to_id=to_agent, reason=reason,

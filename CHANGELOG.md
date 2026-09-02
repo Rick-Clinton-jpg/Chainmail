@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+### Fixed — delegation budget containment ignored `max_budget`, and trusted a caller-supplied `budget_remaining` (independent audit, P0 #4 and #5)
+
+`Permission.covers()` only compares `name`/`scope` -- by design, it exists to
+find "the applicable permission entry", not to answer "is this contained
+within that entry's budget". But `Authority.is_subset_of()` (delegation's
+does-the-delegator-actually-hold-this check) and the recipient-envelope
+reduction step in `register_delegation()` both used `covers()` as their only
+containment test. Confirmed before fixing: an agent holding
+`deploy:prod max_budget=1` could delegate `deploy:prod max_budget=None`
+(unlimited) of the same name/scope, and `is_subset_of()` accepted it outright
+-- turning a budget-bounded permission into unlimited authority purely by
+relabelling its ceiling during delegation (P0 #4). Separately, an offered
+`Authority`'s `budget_remaining` dict is caller-supplied data (e.g. via the
+service layer), and the recipient-ceiling reduction step copied it through
+uninspected -- an offer of `max_budget=1, budget_remaining=999` was accepted
+and the `999` preserved (P0 #5).
+
+Fix:
+- `Authority.is_subset_of()` now also requires the claimed `max_budget` (and,
+  when metered, the claimed remaining -- clamped to never exceed the
+  claiming side's own ceiling first) to not exceed the source authority's
+  own ceiling and remaining. An unmetered (`max_budget=None`) claim is never
+  a subset of a metered source.
+- New `Authority.clamp_to_ceiling()` replaces the unclamped `reduce_to()`
+  call used for the recipient-envelope reduction step in
+  `register_delegation()`. Unlike `reduce_to` (still used unchanged for
+  restrictions, where it reduces an authority to a subset of its *own*
+  permission objects), `clamp_to_ceiling` constructs new, independently
+  budget-capped `Permission` objects against a *different* authority's
+  ceiling, and computes the granted remaining itself rather than copying any
+  stored value beyond that cap.
+
+New tests (`tests/test_governor.py`):
+- `test_delegation_cannot_launder_bounded_into_unlimited`: a delegator
+  limited to `max_budget=1` attempts to delegate `max_budget=None` of the
+  same permission; delegation is now rejected ("does not hold").
+- `test_delegation_ignores_injected_remaining_budget`: an offer with
+  `max_budget=1, budget_remaining=999` results in the recipient receiving
+  `max_budget=1` and a remaining count that never exceeds it.
+
 ### Fixed — a caller-held proposal object could be mutated after verification and before execution (independent audit, P0 #3)
 
 `Proposal` is a mutable dataclass (`sign_proposal()` itself mutates

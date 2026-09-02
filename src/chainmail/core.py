@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
@@ -119,7 +119,41 @@ class Authority:
         return remaining > 0
 
     def is_subset_of(self, other: "Authority") -> bool:
-        return all(any(op.covers(p) for op in other.permissions) for p in self.permissions)
+        """True only if every permission this Authority claims is genuinely
+        held by ``other``: matching name/scope (``Permission.covers``) AND a
+        budget ceiling and remaining count that never exceed ``other``'s own.
+
+        ``covers()`` alone ignores ``max_budget`` -- it exists to answer "is
+        this the applicable permission entry", not "is this offer contained".
+        Without the budget check here, an authority limited to
+        ``max_budget=1`` could "offer" (and have accepted as a subset) an
+        unlimited (``max_budget=None``) permission of the same name/scope,
+        turning a bounded permission into unlimited authority purely by
+        relabelling it during delegation.
+        """
+        for p in self.permissions:
+            match = other._match(p)
+            if match is None:
+                return False
+            if p.max_budget is None:
+                if match.max_budget is not None:
+                    return False  # claiming unlimited from a bounded source
+                continue
+            if match.max_budget is not None and p.max_budget > match.max_budget:
+                return False  # claimed ceiling exceeds the source's ceiling
+            # Never trust this side's stored `budget_remaining` beyond its own
+            # ceiling (a permission claiming max_budget=1 but a stored
+            # remaining of 999 must not be treated as offering 999).
+            claimed_remaining = min(
+                self.budget_remaining.get(p.key(), p.max_budget), p.max_budget
+            )
+            source_remaining = (
+                other.budget_remaining.get(match.key(), match.max_budget)
+                if match.max_budget is not None else None
+            )
+            if source_remaining is not None and claimed_remaining > source_remaining:
+                return False
+        return True
 
     # -- mutations -------------------------------------------------------
     def consume_budget(self, required: Permission, amount: int = 1) -> bool:
@@ -156,6 +190,41 @@ class Authority:
             elif p.max_budget is not None:
                 new_budgets[key] = p.max_budget
         return Authority(permissions=set(kept), budget_remaining=new_budgets)
+
+    def clamp_to_ceiling(self, ceiling: "Authority") -> "Authority":
+        """Return a new Authority for delegation into ``ceiling``'s envelope:
+        keep only permissions ``ceiling`` also authorises (by name/scope),
+        and clamp each kept permission's ``max_budget`` and remaining count
+        to never exceed ``ceiling``'s own -- regardless of what this side
+        claims to offer.
+
+        Unlike ``reduce_to`` (used for the *same* authority reducing to a
+        subset of its own permission objects, e.g. active restrictions),
+        this constructs new, independently-capped ``Permission`` objects: the
+        recipient's envelope ceiling is a different Authority with its own
+        budgets, so simply keeping the offered permission object unclamped
+        (as ``reduce_to`` does) would let an unbounded or over-budget offer
+        pass straight through "reduction to the recipient's envelope" with
+        its ceiling untouched. All new remaining counters are computed here,
+        never copied from this side's ``budget_remaining`` beyond the
+        clamped ceiling -- an inflated stored remaining cannot survive.
+        """
+        kept: Set[Permission] = set()
+        new_budgets: Dict[str, int] = {}
+        for p in self.permissions:
+            ceil_perm = ceiling._match(p)
+            if ceil_perm is None:
+                continue
+            candidates = [b for b in (p.max_budget, ceil_perm.max_budget) if b is not None]
+            effective_max = min(candidates) if candidates else None
+            clamped = p if effective_max == p.max_budget else replace(p, max_budget=effective_max)
+            kept.add(clamped)
+            if effective_max is not None:
+                offered_remaining = min(
+                    self.budget_remaining.get(p.key(), effective_max), effective_max
+                )
+                new_budgets[clamped.key()] = max(0, offered_remaining)
+        return Authority(permissions=kept, budget_remaining=new_budgets)
 
     def copy(self) -> "Authority":
         return Authority(permissions=set(self.permissions), budget_remaining=dict(self.budget_remaining))
