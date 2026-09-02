@@ -28,6 +28,37 @@ def test_hmac_signed_proposal_continues(make_governor):
     assert g.evaluate(p).decision == Decision.CONTINUE
 
 
+def test_confidence_is_signed_not_forgeable(make_governor):
+    """confidence alone decides CONTINUE vs RESTRICT (low_confidence_max) and
+    feeds ASSUMPTION_ANOMALY / re-entry risk, so it must be bound by the
+    signature. Sign at a low confidence, then tamper it upward without
+    resigning: the signature must no longer verify."""
+    reg = KeyRegistry()
+    secret = b"shared-secret-value"
+    reg.add_key("k-hmac", "agent_research", ALGO_HMAC, secret)
+    g = make_governor(verifier=CompositeVerifier(reg))
+    low_confidence = Proposal("s1", "agent_research", "gather", make_permission("research"), OBJ, 0.1)
+    p = sign_proposal(low_confidence, "k-hmac", algorithm=ALGO_HMAC, hmac_secret=secret)
+    p.confidence = 0.9
+    r = g.evaluate(p)
+    assert r.decision == Decision.HUMAN
+    assert RiskSignal.SIGNATURE_INVALID in r.signals
+
+
+def test_assumptions_are_signed_not_forgeable(make_governor):
+    from chainmail import StructuredAssumption
+
+    reg = KeyRegistry()
+    secret = b"shared-secret-value"
+    reg.add_key("k-hmac", "agent_research", ALGO_HMAC, secret)
+    g = make_governor(verifier=CompositeVerifier(reg))
+    p = sign_proposal(_prop(), "k-hmac", algorithm=ALGO_HMAC, hmac_secret=secret)
+    p.assumptions = [StructuredAssumption("injected claim", "agent_research")]
+    r = g.evaluate(p)
+    assert r.decision == Decision.HUMAN
+    assert RiskSignal.SIGNATURE_INVALID in r.signals
+
+
 def test_hmac_tampered_signature_escalates(make_governor):
     reg = KeyRegistry()
     reg.add_key("k-hmac", "agent_research", ALGO_HMAC, b"shared-secret-value")

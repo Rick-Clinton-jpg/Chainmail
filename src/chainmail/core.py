@@ -360,7 +360,13 @@ class Proposal:
 
     def signing_dict(self) -> Dict[str, Any]:
         """The subset of the proposal that a signature must bind. Any field an
-        attacker could usefully tamper with is included."""
+        attacker could usefully tamper with is included -- notably
+        ``confidence`` (it alone decides CONTINUE vs RESTRICT vs RECHECK via
+        low_confidence_max / anomaly_confidence_min, and feeds re-entry risk)
+        and ``assumptions`` (structured claims a future contextual check could
+        weigh). A signature that didn't bind these would let a validly-signed
+        low-confidence proposal be resubmitted at high confidence, or vice
+        versa, without invalidating the signature."""
         return {
             "proposal_id": self.proposal_id,
             "agent_id": self.agent_id,
@@ -371,6 +377,16 @@ class Proposal:
                 "max_budget": self.required_permission.max_budget,
             },
             "objective_fragment": self.objective_fragment,
+            "confidence": self.confidence,
+            "assumptions": [
+                {
+                    "text": a.text,
+                    "source_agent": a.source_agent,
+                    "timestamp": a.timestamp,
+                    "confidence": a.confidence,
+                }
+                for a in self.assumptions
+            ],
             "parent_proposal_id": self.parent_proposal_id,
             "payload": self.payload,
             "nonce": self.nonce,

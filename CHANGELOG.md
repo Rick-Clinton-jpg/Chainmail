@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed — proposal signature didn't bind confidence or assumptions (independent audit, P0 #2)
+
+`Proposal.signing_dict()` omitted `confidence` and `assumptions`, even though
+`confidence` alone decides `CONTINUE` vs `RESTRICT` (`low_confidence_max`),
+feeds `ASSUMPTION_ANOMALY`, and factors into re-entry risk. Confirmed before
+fixing: `signing_dict()` at core.py:361-377 genuinely excluded `confidence`. A
+validly-signed proposal could have its `confidence` (or `assumptions`)
+changed after signing without invalidating the signature. Both fields are now
+included in the canonical signing payload. New tests
+(`test_confidence_is_signed_not_forgeable`,
+`test_assumptions_are_signed_not_forgeable` in `tests/test_crypto.py`): sign
+at low confidence, mutate upward without resigning, confirm
+`SIGNATURE_INVALID`; same for an injected assumption.
+
 ### Fixed — quorum ran after execution, not before it (independent audit, P0 #1)
 
 `ChainmailGovernor.evaluate()` called `execution_boundary.execute()` (step 15)
