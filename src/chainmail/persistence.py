@@ -17,6 +17,7 @@ an audit-write failure as fail-closed (escalate to HUMAN, do not execute).
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -150,36 +151,84 @@ class HashChainLog:
                 previous = claimed
             return ReceiptVerification(True, len(self.entries), last_valid_hash=previous)
 
+    @staticmethod
+    def _build_entry(entry_type: str, data: Dict[str, Any], phase: str,
+                     execution_id: Optional[str], prev_hash: str) -> Dict[str, Any]:
+        entry = {
+            "record_version": RECORD_VERSION,
+            "type": entry_type,
+            "data": sanitize(data),
+            "phase": phase,
+            "execution_id": execution_id,
+            "timestamp": time.time(),
+            "prev_hash": prev_hash,
+            "nonce": secrets.token_hex(8),
+        }
+        canonical = json.dumps(entry, sort_keys=True, separators=(",", ":"), default=str)
+        entry["hash"] = hashlib.sha256(canonical.encode()).hexdigest()
+        return entry
+
     # -- append -------------------------------------------------------
     def append(self, entry_type: str, data: Dict[str, Any], *, phase: str = "completed",
                execution_id: Optional[str] = None) -> str:
         with self._lock:
+            if self.filepath:
+                # Multiple processes may share this file (e.g. several
+                # governor processes pointed at the same audit log). An
+                # in-process lock and this instance's in-memory `entries`
+                # only serialise appends within one process; another
+                # process's append is invisible to both. An OS-level
+                # exclusive lock on the file serialises appends across
+                # processes, and reading the file's own last line under
+                # that lock -- rather than trusting in-memory state -- is
+                # what makes prev_hash correctly chain onto whatever the
+                # last writer (this process or another) actually wrote.
+                path = Path(self.filepath).expanduser().resolve()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a+", encoding="utf-8") as handle:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    try:
+                        handle.seek(0)
+                        prev_hash = GENESIS_HASH
+                        last_line_no = 0
+                        for line_no, line in enumerate(handle, start=1):
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                prev_hash = json.loads(line)["hash"]
+                            except (json.JSONDecodeError, KeyError) as exc:
+                                raise ReceiptIntegrityError(
+                                    f"chain file {self.filepath} line {line_no}: "
+                                    f"not a valid chain record ({exc})"
+                                ) from exc
+                            last_line_no = line_no
+                        entry = self._build_entry(entry_type, data, phase, execution_id, prev_hash)
+                        handle.seek(0, os.SEEK_END)
+                        handle.write(json.dumps(entry, default=str) + "\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    finally:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                # Reflect what's now on disk: if another process appended
+                # entries this instance never loaded, catch back up so this
+                # instance's own view (verify()/entries) stays consistent
+                # with the file it just wrote to.
+                if last_line_no > len(self.entries):
+                    self.load()
+                else:
+                    self.entries.append(entry)
+                return entry["hash"]
+
             verification = self.verify()
             if not verification.valid:
                 raise ReceiptIntegrityError(
                     f"refusing to extend corrupt receipt chain at record "
                     f"{verification.failed_record}: {verification.reason}"
                 )
-            entry = {
-                "record_version": RECORD_VERSION,
-                "type": entry_type,
-                "data": sanitize(data),
-                "phase": phase,
-                "execution_id": execution_id,
-                "timestamp": time.time(),
-                "prev_hash": verification.last_valid_hash,
-                "nonce": secrets.token_hex(8),
-            }
-            canonical = json.dumps(entry, sort_keys=True, separators=(",", ":"), default=str)
-            entry["hash"] = hashlib.sha256(canonical.encode()).hexdigest()
+            entry = self._build_entry(entry_type, data, phase, execution_id,
+                                      verification.last_valid_hash)
             self.entries.append(entry)
-            if self.filepath:
-                path = Path(self.filepath).expanduser().resolve()
-                path.parent.mkdir(parents=True, exist_ok=True)
-                with path.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(entry, default=str) + "\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
             return entry["hash"]
 
 

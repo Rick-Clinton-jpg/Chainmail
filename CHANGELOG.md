@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Fixed — HashChainLog.append() was not safe for multiple processes sharing one file (independent audit, P2)
+
+`HashChainLog.append()` computed each new entry's `prev_hash` from its own
+*in-memory* `self.entries`, and serialised concurrent appends only with a
+`threading.RLock` -- scoped to one process. Two governor processes pointed
+at the same `--hash-chain` file (a supported, documented configuration)
+each track their own in-memory chain state; neither sees the other's
+appends. Interleaved writes from two such processes produce a file where
+some records' `prev_hash` doesn't match the record actually before them --
+`verify()` on reload reports the chain broken, defeating the tamper-evidence
+guarantee the log exists for. This reproduces with two plain `HashChainLog`
+instances pointed at the same path, no real multiprocessing needed.
+
+Fix, in `src/chainmail/persistence.py`: when a `filepath` is configured,
+`append()` now takes an OS-level exclusive lock (`fcntl.flock`) on the file
+for the read-then-write critical section, and reads the file's own last
+line under that lock to determine `prev_hash` -- the file, not in-memory
+state, is the source of truth for what the chain's tip actually is. If
+another process appended entries this instance never loaded, it reloads
+the full chain after writing so its own `entries`/`verify()` stay
+consistent with what's on disk. The no-`filepath` (pure in-memory) path is
+unchanged. Entry construction is factored into `HashChainLog._build_entry`,
+shared by both paths.
+
+New test `test_two_independent_instances_sharing_a_file_produce_a_valid_chain`
+in `tests/test_persistence.py`: two independent `HashChainLog` instances
+(simulating two processes) interleave appends to the same file; a fresh
+reload verifies the resulting 4-entry chain is valid and in write order.
+
 ### Fixed — security_report() called a quorum "configured" even with no real peer transport (independent audit, P2)
 
 `security_report()`'s `quorum_configured` was `self.quorum is not None` —

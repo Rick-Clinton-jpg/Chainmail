@@ -58,6 +58,29 @@ def test_chain_reload_and_verify(tmp_path):
     assert HashChainLog(path).verify().valid
 
 
+def test_two_independent_instances_sharing_a_file_produce_a_valid_chain(tmp_path):
+    # Simulates two separate processes (each with its own HashChainLog
+    # instance and in-memory state, unaware of the other's appends) sharing
+    # one hash-chain file -- e.g. two governor processes pointed at the same
+    # --hash-chain path. Each append must chain onto whatever the *file's*
+    # last entry actually is, not this instance's possibly-stale in-memory
+    # view, or the interleaved file fails verification once reloaded.
+    path = str(tmp_path / "chain.jsonl")
+    proc_a = HashChainLog(path)
+    proc_b = HashChainLog(path)
+
+    proc_a.append("t", {"who": "a", "n": 1})
+    proc_b.append("t", {"who": "b", "n": 1})   # proc_b doesn't know about a's append
+    proc_a.append("t", {"who": "a", "n": 2})
+    proc_b.append("t", {"who": "b", "n": 2})
+
+    reopened = HashChainLog(path)              # a fresh reader sees the whole file
+    assert len(reopened.entries) == 4
+    result = reopened.verify()
+    assert result.valid, result.reason
+    assert [e["data"]["who"] for e in reopened.entries] == ["a", "b", "a", "b"]
+
+
 def test_chain_reload_detects_file_tamper(tmp_path):
     path = tmp_path / "chain.jsonl"
     log = HashChainLog(str(path))
