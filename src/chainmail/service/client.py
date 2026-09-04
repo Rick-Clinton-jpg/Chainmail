@@ -86,11 +86,16 @@ class GovernorClient:
         return self._call({"op": "evaluate", "proposal": proposal_to_dict(proposal)})
 
     def register_delegation(self, from_agent: str, to_agent: str, reason: str,
-                            offered: Authority) -> Dict[str, Any]:
+                            offered: Authority, *, merge: bool = False) -> Dict[str, Any]:
+        """``merge=True`` accumulates ``offered`` onto whatever ``to_agent``
+        currently holds instead of replacing it outright -- see
+        ``ChainmailGovernor.register_delegation``'s docstring. Refused
+        (not merged) if it would collide with a permission ``to_agent``
+        already holds."""
         return self._call({
             "op": "register_delegation",
             "from_agent": from_agent, "to_agent": to_agent, "reason": reason,
-            "offered": authority_to_dict(offered),
+            "offered": authority_to_dict(offered), "merge": merge,
         })
 
     def revoke_delegation(self, to_agent: str) -> bool:

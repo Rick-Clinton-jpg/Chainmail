@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### Added — register_delegation(merge=True) to accumulate authority from multiple delegators
+
+The previous commit documented that `register_delegation` replaces the
+recipient's entire live authority rather than merging -- a deliberate
+security property (no accumulation across many small, individually-
+unremarkable delegations), but also a real usability gap: an agent that
+legitimately needs authority from more than one source (e.g. two peers each
+granting access to a different resource) had no way to receive it except
+as a single delegation call carrying the full union itself.
+
+New `merge: bool = False` keyword on `ChainmailGovernor.register_delegation`.
+With `merge=True`, the offered (already role-checked, `is_subset_of`-checked,
+ceiling-clamped) authority is unioned with whatever the recipient currently,
+durably holds -- fresh read, same as everywhere else authority is resolved.
+A merge that would collide with a permission already held (same
+`(name, scope)`) is refused outright (fail closed) rather than guessing a
+resolution -- summing budgets, one replacing the other, or taking the max
+are all equally defensible and equally arbitrary, so none is chosen
+automatically; the caller must `revoke_delegation` first or delegate
+without `merge=True` to deliberately replace a colliding grant. The
+default (`merge=False`) behavior, and every existing test asserting it, is
+completely unchanged.
+
+Wired through the service layer too: `GovernorClient.register_delegation`
+and the wire protocol's `register_delegation` op both accept `merge`.
+
+New tests: `test_delegation_merge_accumulates_from_multiple_sources`,
+`test_delegation_merge_refuses_a_colliding_permission` (and that the
+recipient's existing grant is left byte-for-byte unchanged on refusal),
+`test_delegation_merge_is_durable_across_restart` (in `tests/
+test_governor.py`), and `test_register_delegation_merge_over_wire` (in
+`tests/test_service.py`, proving the parameter round-trips through the
+actual Unix-socket protocol, not just the in-process API).
+
+208 passed, 8 skipped (was 204/8 before this commit).
+
 ### Docs — clarified that register_delegation replaces, never merges, live authority
 
 An external review raised "delegation chain amplification" (many small

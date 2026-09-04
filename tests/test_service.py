@@ -9,8 +9,8 @@ import time
 import pytest
 
 from chainmail import (
-    ALGO_HMAC, Authority, ChainmailGovernor, GovernorConfig, Proposal, TfidfEmbeddingEngine,
-    make_permission, sign_proposal,
+    ALGO_HMAC, Authority, AuthorityEnvelope, ChainmailGovernor, GovernorConfig, Proposal,
+    TfidfEmbeddingEngine, make_permission, sign_proposal,
 )
 from chainmail.service import CallerIdentity, GovernorClient, GovernorClientError, UnixSocketGovernorServer
 from chainmail.service.server import _build_verifier, main
@@ -66,6 +66,50 @@ def test_register_delegation_over_wire(running_server):
         bad = c.register_delegation("agent_research", "ghost", "x", offered)
         assert bad["accepted"] is False
     assert len(g.provenance) == before + 1
+
+
+def test_register_delegation_merge_over_wire(short_tmpdir):
+    """merge=True round-trips through the wire protocol (client -> frame ->
+    server -> ChainmailGovernor.register_delegation): two delegators
+    granting distinct permissions to the same recipient accumulate rather
+    than the second replacing the first."""
+    env = AuthorityEnvelope(
+        objective="Operate a small fleet",
+        agent_authorities={
+            "agent_a": Authority(permissions={make_permission("read", "file1")}),
+            "agent_b": Authority(permissions={make_permission("read", "file2")}),
+            "agent_target": Authority(permissions={make_permission("read", "file1"),
+                                                   make_permission("read", "file2")}),
+        },
+        allowed_delegations={}, agent_roles={}, max_fleet_steps=100,
+    )
+    sock = os.path.join(short_tmpdir, "merge.sock")
+    g = ChainmailGovernor(env, config=GovernorConfig(),
+                          embedding=TfidfEmbeddingEngine(), auto_embedding=False)
+    server = UnixSocketGovernorServer(g, sock, auth_token="secret-token")
+    server.start()
+    try:
+        with GovernorClient(sock, auth_token="secret-token") as c:
+            reset = c.register_delegation("agent_a", "agent_target", "reset",
+                                          Authority(permissions=set()))
+            assert reset["accepted"] is True
+
+            r1 = c.register_delegation("agent_a", "agent_target", "share file1",
+                                       Authority(permissions={make_permission("read", "file1")}),
+                                       merge=True)
+            assert r1["accepted"] is True
+            assert "merged" in r1["message"]
+
+            r2 = c.register_delegation("agent_b", "agent_target", "share file2",
+                                       Authority(permissions={make_permission("read", "file2")}),
+                                       merge=True)
+            assert r2["accepted"] is True
+
+        target_auth = g.live_authority["agent_target"]
+        assert target_auth.can(make_permission("read", "file1"))
+        assert target_auth.can(make_permission("read", "file2"))
+    finally:
+        server.stop()
 
 
 def test_role_violation_over_wire(running_server):

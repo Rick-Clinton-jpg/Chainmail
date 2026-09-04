@@ -137,6 +137,136 @@ def test_delegation_replaces_rather_than_merges_across_multiple_sources(make_gov
     assert not target_auth.can(make_permission("read", "file1"))
 
 
+def _reset_to_empty(g, from_agent, to_agent):
+    """A non-merging delegation of an *empty* offer -- vacuously a subset
+    of anything from_agent holds -- resets to_agent's live authority to
+    nothing, regardless of from_agent's own permissions. Test-only setup
+    helper: the envelope's own agent_authorities double as the initial
+    seed (there is no separate "ceiling but zero initial holding" concept
+    in this schema -- see register_delegation's docstring), so a merge
+    test that wants to start from nothing must reset explicitly first."""
+    ok, msg = g.register_delegation(from_agent, to_agent, "test setup: reset",
+                                    Authority(permissions=set()))
+    assert ok, msg
+
+
+def test_delegation_merge_accumulates_from_multiple_sources(make_governor):
+    """merge=True is the opt-in escape from replace-not-merge: two agents
+    each delegating a distinct permission to the same recipient, with
+    merge=True, must leave the recipient holding both -- addressing the
+    usability gap the default (replace) semantics deliberately impose."""
+    from chainmail import AuthorityEnvelope
+
+    env = AuthorityEnvelope(
+        objective="Operate a small fleet",
+        agent_authorities={
+            "agent_a": Authority(permissions={make_permission("read", "file1")}),
+            "agent_b": Authority(permissions={make_permission("read", "file2")}),
+            "agent_target": Authority(permissions={make_permission("read", "file1"),
+                                                   make_permission("read", "file2")}),
+        },
+        allowed_delegations={}, agent_roles={}, max_fleet_steps=100,
+    )
+    g = make_governor(env)
+    _reset_to_empty(g, "agent_a", "agent_target")
+
+    ok1, msg1 = g.register_delegation("agent_a", "agent_target", "share file1",
+                                      Authority(permissions={make_permission("read", "file1")}),
+                                      merge=True)
+    assert ok1, msg1
+    assert "merged" in msg1
+    target_auth = g.live_authority["agent_target"]
+    assert target_auth.can(make_permission("read", "file1"))
+
+    ok2, msg2 = g.register_delegation("agent_b", "agent_target", "share file2",
+                                      Authority(permissions={make_permission("read", "file2")}),
+                                      merge=True)
+    assert ok2, msg2
+    target_auth = g.live_authority["agent_target"]
+    assert target_auth.can(make_permission("read", "file1"))
+    assert target_auth.can(make_permission("read", "file2"))
+
+
+def test_delegation_merge_refuses_a_colliding_permission(make_governor):
+    """A merge that would collide with an existing permission (same
+    (name, scope) already held) is refused outright, not resolved by
+    guessing (summing budgets, replacing, taking the max) -- fail closed
+    on ambiguity. The recipient's existing grant is left untouched."""
+    from chainmail import AuthorityEnvelope
+
+    env = AuthorityEnvelope(
+        objective="Operate a small fleet",
+        agent_authorities={
+            "agent_a": Authority(permissions={make_permission("deploy", "staging", max_budget=5)}),
+            "agent_b": Authority(permissions={make_permission("deploy", "staging", max_budget=3)}),
+            "agent_target": Authority(permissions={make_permission("deploy", "staging", max_budget=5)}),
+        },
+        allowed_delegations={}, agent_roles={}, max_fleet_steps=100,
+    )
+    g = make_governor(env)
+    _reset_to_empty(g, "agent_a", "agent_target")
+
+    ok1, _ = g.register_delegation("agent_a", "agent_target", "grant",
+                                   Authority(permissions={make_permission("deploy", "staging", 5)},
+                                            budget_remaining={"deploy:staging": 5}),
+                                   merge=True)
+    assert ok1
+    before = g.live_authority["agent_target"].copy()
+
+    ok2, msg2 = g.register_delegation("agent_b", "agent_target", "second grant",
+                                      Authority(permissions={make_permission("deploy", "staging", 3)},
+                                               budget_remaining={"deploy:staging": 3}),
+                                      merge=True)
+    assert not ok2
+    assert "merge conflict" in msg2
+    assert "deploy:staging" in msg2
+    # Refused: the recipient's existing grant is completely unchanged.
+    after = g.live_authority["agent_target"]
+    assert after.permissions == before.permissions
+    assert after.budget_remaining == before.budget_remaining
+
+
+def test_delegation_merge_is_durable_across_restart(tmp_path):
+    """merge=True's published state goes through the same
+    replace_live_authority durable write as a non-merging delegation --
+    it computes the full final (merged) authority and writes all of it, so
+    a restart sees the accumulated result, not just the most recent call."""
+    from chainmail import AuditSink, AuthorityEnvelope, ChainmailGovernor, GovernorConfig, SQLiteStore
+    from conftest import JaccardEmbeddingEngine
+
+    env = AuthorityEnvelope(
+        objective="Operate a small fleet",
+        agent_authorities={
+            "agent_a": Authority(permissions={make_permission("read", "file1")}),
+            "agent_b": Authority(permissions={make_permission("read", "file2")}),
+            "agent_target": Authority(permissions={make_permission("read", "file1"),
+                                                   make_permission("read", "file2")}),
+        },
+        allowed_delegations={}, agent_roles={}, max_fleet_steps=100,
+    )
+    db = str(tmp_path / "chainmail.db")
+
+    def _gov():
+        return ChainmailGovernor(env, config=GovernorConfig(), embedding=JaccardEmbeddingEngine(),
+                                 auto_embedding=False, audit=AuditSink(sqlite_store=SQLiteStore(db)))
+
+    g1 = _gov()
+    _reset_to_empty(g1, "agent_a", "agent_target")
+    ok1, _ = g1.register_delegation("agent_a", "agent_target", "share file1",
+                                    Authority(permissions={make_permission("read", "file1")}),
+                                    merge=True)
+    assert ok1
+    ok2, _ = g1.register_delegation("agent_b", "agent_target", "share file2",
+                                    Authority(permissions={make_permission("read", "file2")}),
+                                    merge=True)
+    assert ok2
+
+    g2 = _gov()  # "restart": a fresh governor, same store
+    restarted_auth = g2._get_live_auth("agent_target")
+    assert restarted_auth.can(make_permission("read", "file1"))
+    assert restarted_auth.can(make_permission("read", "file2"))
+
+
 def test_delegation_rejects_unknown_recipient(governor):
     ok, msg = governor.register_delegation(
         "agent_research", "ghost_agent", "x", Authority(permissions={make_permission("research")}))

@@ -250,6 +250,7 @@ class UnixSocketGovernorServer:
                 offered = authority_from_dict(req.get("offered", {}))
                 ok, msg = self.governor.register_delegation(
                     req["from_agent"], req["to_agent"], req.get("reason", ""), offered,
+                    merge=bool(req.get("merge", False)),
                 )
                 return {"id": rid, "ok": True, "result": {"accepted": ok, "message": msg}}
             if op == "revoke_delegation":

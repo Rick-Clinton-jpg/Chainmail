@@ -127,15 +127,22 @@ pytest -q                  # 101 tests
    authority before any agent runs.
 2. **Non-expanding delegation** — delegation preserves or reduces authority and
    is constrained by the `allowed_delegations` role map; it is reduced to the
-   recipient's envelope ceiling. **Delegation replaces, never merges**: each
-   `register_delegation` call *replaces* the recipient's entire live
-   authority with the clamped result of that one call — it is never unioned
-   with whatever the recipient held before, even from a different delegator.
-   Two delegations from different agents to the same recipient do not
-   accumulate; the second call's result is the recipient's only authority
-   afterward. An agent that needs authority from multiple sources must
-   receive it as a single delegation carrying the full union — see
-   `ChainmailGovernor.register_delegation`'s docstring.
+   recipient's envelope ceiling. **`register_delegation` replaces by default,
+   never silently merges**: with the default `merge=False`, each call
+   *replaces* the recipient's entire live authority with the clamped result
+   of that one call — it is never unioned with whatever the recipient held
+   before, even from a different delegator. Two default-mode delegations
+   from different agents to the same recipient do not accumulate; the
+   second call's result is the recipient's only authority afterward. Pass
+   `merge=True` to explicitly accumulate authority from multiple delegators
+   across separate calls instead (a real, supported use case — e.g. two
+   agents each granting access to a different resource) — a merge that
+   would collide with a permission the recipient already holds is refused
+   outright rather than guessing how to reconcile the two (summing budgets,
+   one replacing the other); use `revoke_delegation` first, or a
+   non-merging call, to deliberately replace a colliding grant. See
+   `ChainmailGovernor.register_delegation`'s docstring for the full
+   contract.
 3. **Central authority** — live permissions exist only in the governance plane.
 4. **Context can only tighten** — signals produce `RESTRICT` / `RECHECK` /
    `HUMAN`; they never grant permissions.

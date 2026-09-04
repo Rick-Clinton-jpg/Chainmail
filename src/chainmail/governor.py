@@ -650,7 +650,7 @@ class ChainmailGovernor:
     # delegation
     # ------------------------------------------------------------------
     def register_delegation(self, from_agent: str, to_agent: str, reason: str,
-                            offered: Authority) -> Tuple[bool, str]:
+                            offered: Authority, *, merge: bool = False) -> Tuple[bool, str]:
         """Delegate ``offered`` (clamped to ``to_agent``'s envelope ceiling)
         from ``from_agent`` to ``to_agent``.
 
@@ -660,28 +660,36 @@ class ChainmailGovernor:
         holds at the moment of the call, including its current remaining
         budget, not its original ceiling.
 
-        REPLACE, NOT MERGE: on success, ``to_agent``'s entire live authority
-        is *replaced* by the clamped result of this one delegation -- it is
-        never unioned with whatever ``to_agent`` held before the call, even
-        if that prior authority came from a different delegator. Two
-        delegations from different agents to the same recipient do not
-        accumulate: the second call's result is the recipient's *only*
-        authority afterward, and the first delegation's grant is gone. An
-        agent that needs to hold authority from multiple sources must
-        receive it as a *single* delegation carrying the full union of what
-        it should hold -- there is no way to "add" a permission to what an
-        agent already has via a separate call. This is a stronger form of
-        the "non-expanding delegation" invariant (a delegation can only
-        ever narrow what's live, never broaden it via repeated calls), not
-        a bug: it closes off accumulating access across many small,
-        individually-unremarkable delegations from different agents.
+        REPLACE BY DEFAULT: with ``merge=False`` (the default), on success
+        ``to_agent``'s entire live authority is *replaced* by the clamped
+        result of this one delegation -- it is never unioned with whatever
+        ``to_agent`` held before the call, even if that prior authority came
+        from a different delegator. Two default (non-merging) delegations
+        from different agents to the same recipient do not accumulate: the
+        second call's result is the recipient's *only* authority afterward,
+        and the first delegation's grant is gone.
+
+        ``merge=True`` lets a recipient accumulate authority from multiple
+        delegators across separate calls -- e.g. agent A delegates read
+        access to one resource and, separately, agent B delegates read
+        access to a different one, and the recipient should end up holding
+        both. The offered (already clamped) permissions are unioned with
+        whatever ``to_agent`` currently, durably holds -- fresh read, same
+        as everywhere else authority is resolved. A merge that would
+        collide with an existing permission (same ``(name, scope)`` already
+        held) is refused outright rather than guessing how to reconcile two
+        different grants for the same permission (e.g. summing budgets, or
+        one replacing the other) -- fail closed on ambiguity, matching this
+        module's posture everywhere else. Use ``revoke_delegation`` first,
+        or a non-merging call, to deliberately replace a colliding grant.
 
         Returns ``(True, message)`` on success (message notes whether
-        ``offered`` was reduced to fit ``to_agent``'s envelope ceiling) or
-        ``(False, reason)`` on refusal -- an unknown agent, a role-map
-        violation, an offer exceeding what ``from_agent`` currently holds,
-        or a durable-store failure (fails closed: the delegation is treated
-        as never having happened, not silently retried or approximated).
+        ``offered`` was reduced to fit ``to_agent``'s envelope ceiling, and
+        whether it was merged with prior authority) or ``(False, reason)``
+        on refusal -- an unknown agent, a role-map violation, an offer
+        exceeding what ``from_agent`` currently holds, a merge collision, or
+        a durable-store failure (fails closed: the delegation is treated as
+        never having happened, not silently retried or approximated).
         """
         with self._lock:
             if not self.envelope.knows_agent(from_agent):
@@ -707,6 +715,28 @@ class ChainmailGovernor:
                 return False, "Delegator attempted to grant authority it does not hold"
 
             new_auth = offered.clamp_to_ceiling(max_to)
+            clamped_permission_count = len(new_auth.permissions)
+            merged = False
+
+            if merge:
+                try:
+                    current = self._get_live_auth(to_agent)
+                except sqlite3.Error as exc:
+                    logger.exception("durable authority store is unavailable")
+                    return False, f"durable authority store is unavailable: {type(exc).__name__}"
+                current_keys = {p.key() for p in current.permissions}
+                offered_keys = {p.key() for p in new_auth.permissions}
+                colliding = current_keys & offered_keys
+                if colliding:
+                    return (False,
+                           f"merge conflict: {to_agent} already holds a permission for "
+                           f"{sorted(colliding)} -- refusing to guess a resolution "
+                           f"(revoke first, or delegate without merge=True to replace it)")
+                new_auth = Authority(
+                    permissions=current.permissions | new_auth.permissions,
+                    budget_remaining={**current.budget_remaining, **new_auth.budget_remaining},
+                )
+                merged = True
 
             # Audit before publication: record the decision durably (when
             # audit is active) before this delegation becomes live state.
@@ -752,7 +782,12 @@ class ChainmailGovernor:
                 delegated_authority=new_auth.copy(),
             ))
 
-            if len(new_auth.permissions) < len(offered.permissions):
+            reduced = clamped_permission_count < len(offered.permissions)
+            if merged and reduced:
+                return True, "Delegation merged with existing authority, after reduction to recipient envelope"
+            if merged:
+                return True, "Delegation merged with existing authority"
+            if reduced:
                 return True, "Delegation accepted after reduction to recipient envelope"
             return True, "Delegation accepted (authority preserved or reduced)"
 
