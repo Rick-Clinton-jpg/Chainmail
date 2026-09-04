@@ -28,7 +28,17 @@ Evaluation order (every failing gate returns HUMAN):
      still CONTINUE post-quorum) -- MUST also precede execution, for the
      same reason: the atomic UPDATE is the actual cross-process enforcement
      point (the check at 11 is only an early exit), so it must gate a real
-     side effect, not follow one
+     side effect, not follow one. FRESHNESS RULE: this re-resolves
+     authority against the durable store right here (via
+     _effective_authority, a fresh call, not the live_auth/current_auth
+     captured at step 10) and re-checks .can() before consuming --
+     real elapsed work (contextual-risk checks, quorum collection)
+     separates step 10 from here, during which another governor process
+     sharing the store could have durably revoked or narrowed this exact
+     agent's authority. A previously-resolved Authority object is never
+     reused as the basis for a spend decision; store unavailability at this
+     re-check fails closed (HUMAN / AUTHORITY_STORE_UNAVAILABLE), it never
+     falls back to the stale in-memory object
  16. execution boundary (only if CONTINUE, i.e. quorum and durable budget
      consumption -- if applicable -- also agreed)
  17. consume permission budget  (non-durable / in-memory path only; the
@@ -1033,26 +1043,62 @@ class ChainmailGovernor:
         # not after. Consumption is still only attempted on a real CONTINUE
         # (post-quorum), matching the documented "spent only on the
         # decision/state transition that actually requires it" invariant.
+        #
+        # Freshness rule: this re-resolves authority against the durable
+        # store right here, rather than reusing `live_auth`/`current_auth`
+        # captured at step (10) -- by this point, quorum collection and the
+        # contextual-risk checks have run, real elapsed time in which
+        # another governor process sharing this store could have durably
+        # revoked or narrowed this exact agent's authority (e.g. an upstream
+        # register_delegation/revoke_delegation call landing concurrently).
+        # A stale Authority object resolved minutes (or even a few function
+        # calls) earlier must never be the thing that decides whether a
+        # budget is spent or an action executes; every decision that spends
+        # authority re-asks the store, at the moment it spends it.
         if decision == Decision.CONTINUE and self.audit.sqlite is not None:
-            matched = live_auth.resolve(proposal.required_permission)
-            if matched is not None and matched.max_budget is not None:
-                try:
-                    consumed = self.audit.sqlite.consume_permission_budget(
-                        namespace=self.deployment_namespace, agent_id=proposal.agent_id,
-                        permission_name=matched.name, permission_scope=matched.scope, amount=1,
-                    )
-                except sqlite3.Error as exc:
-                    logger.exception("durable authority store is unavailable")
+            try:
+                fresh_auth = self._effective_authority(proposal.agent_id)
+            except sqlite3.Error as exc:
+                logger.exception("durable authority/restriction store is unavailable")
+                decision = Decision.HUMAN
+                reason_parts.append(
+                    f"Durable authority/restriction store is unavailable: {type(exc).__name__}")
+                signals.append(RiskSignal.AUTHORITY_STORE_UNAVAILABLE)
+                fresh_auth = None
+            if fresh_auth is not None:
+                # Supersede the step-(10) snapshot either way: whatever is
+                # reported back (GovernanceResult.effective_authority) and
+                # handed to the execution boundary must reflect what this
+                # decision actually saw, not a possibly-stale earlier read.
+                current_auth = fresh_auth
+                if not fresh_auth.can(proposal.required_permission):
                     decision = Decision.HUMAN
                     reason_parts.append(
-                        f"Durable authority store is unavailable: {type(exc).__name__}")
-                    signals.append(RiskSignal.AUTHORITY_STORE_UNAVAILABLE)
+                        f"Agent {proposal.agent_id} no longer holds permission "
+                        f"{proposal.required_permission} (revoked or narrowed since the "
+                        f"earlier check)")
+                    signals.append(RiskSignal.AUTHORITY_ABUSE)
                 else:
-                    if not consumed:
-                        decision = Decision.HUMAN
-                        reason_parts.append(
-                            "Budget exhausted (consumed by a concurrent evaluation)")
-                        signals.append(RiskSignal.BUDGET_EXHAUSTED)
+                    matched = fresh_auth.resolve(proposal.required_permission)
+                    if matched is not None and matched.max_budget is not None:
+                        try:
+                            consumed = self.audit.sqlite.consume_permission_budget(
+                                namespace=self.deployment_namespace, agent_id=proposal.agent_id,
+                                permission_name=matched.name, permission_scope=matched.scope,
+                                amount=1,
+                            )
+                        except sqlite3.Error as exc:
+                            logger.exception("durable authority store is unavailable")
+                            decision = Decision.HUMAN
+                            reason_parts.append(
+                                f"Durable authority store is unavailable: {type(exc).__name__}")
+                            signals.append(RiskSignal.AUTHORITY_STORE_UNAVAILABLE)
+                        else:
+                            if not consumed:
+                                decision = Decision.HUMAN
+                                reason_parts.append(
+                                    "Budget exhausted (consumed by a concurrent evaluation)")
+                                signals.append(RiskSignal.BUDGET_EXHAUSTED)
 
         # (16) execution boundary -- only once quorum (if configured) has
         # also agreed to CONTINUE, and (for the durable path) only once the

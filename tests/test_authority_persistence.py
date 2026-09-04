@@ -18,9 +18,9 @@ import threading
 import pytest
 
 from chainmail import (
-    AuthorityEnvelope, Authority, AuditSink, ChainmailGovernor, DenyAllExecutionBoundary,
-    GovernorConfig, Permission, Proposal, RiskSignal, SQLiteStore, build_demo_envelope,
-    make_permission,
+    AuthorityEnvelope, Authority, AuditSink, ChainmailGovernor, Decision,
+    DenyAllExecutionBoundary, GovernorConfig, GovernorVote, Permission, Proposal, QuorumAggregator,
+    RiskSignal, SQLiteStore, build_demo_envelope, make_permission,
 )
 
 from conftest import JaccardEmbeddingEngine
@@ -391,3 +391,165 @@ def test_v4_database_upgrades_to_v5_without_disturbing_existing_data(tmp_path):
     assert store_v5.initialize_agent_authority(
         namespace="default", agent_id="agent_research",
         permissions=[("research", "*", None)], envelope_fingerprint="fp1") is True
+
+
+# -- freshness rule: no previously-resolved Authority reused across hops/decisions --
+#
+# ChainmailGovernor._evaluate_locked() fetches live_auth/current_auth once,
+# early (around the permission/budget *check*, step 10-11) -- but the
+# durable-path *consumption* decision (15b) re-resolves authority fresh
+# against the store right at that point, rather than reusing the object
+# fetched several steps earlier. This matters because real time (and real
+# elapsed work: contextual-risk checks, quorum collection) passes between
+# the two, during which another governor process sharing the same store can
+# durably revoke or narrow the agent's authority.
+
+def test_upstream_revocation_blocks_a_downstream_consume_racing_against_it(tmp_path):
+    """A quorum transport is a natural place for another process's action to
+    land mid-evaluate(): its collect() call is where this test revokes
+    agent_sub's authority via a *second* governor sharing the same store,
+    while the *first* governor's evaluate() call is paused exactly between
+    fetching live_auth (step 10) and the durable consume (15b). Without the
+    freshness re-check at 15b, the first governor would still consume budget
+    and (if an execution boundary were wired in) execute, using the
+    Authority object it resolved before the revocation landed."""
+    db = str(tmp_path / "chainmail.db")
+    env = _narrowable_envelope()
+    store = SQLiteStore(db)
+    revoker = _gov(store, envelope=env)  # a separate governor "process"
+
+    class RevokeDuringQuorum:
+        def collect(self, own):
+            ok, msg = revoker.register_delegation(
+                "agent_root", "agent_sub", "revoke-mid-flight", Authority(permissions=set()))
+            assert ok, msg
+            return [own]
+
+    g = _gov(store, envelope=env, quorum=QuorumAggregator(), quorum_transport=RevokeDuringQuorum())
+    r = g.evaluate(_prop("p1", "agent_sub", make_permission("deploy", "staging")))
+    assert r.decision == Decision.HUMAN
+    assert RiskSignal.AUTHORITY_ABUSE in r.signals
+    # And the revocation, not a stale pre-revocation view, is what's reported.
+    assert not r.effective_authority.can(make_permission("deploy", "staging"))
+
+
+def _three_tier_envelope():
+    """agent_admin -> agent_mid -> agent_leaf, so a *middle* agent's
+    authority (the thing register_delegation checks with is_subset_of) can
+    itself be narrowed by an upstream actor, independent of the envelope
+    ceiling. Used only by the delegation-side freshness test."""
+    return AuthorityEnvelope(
+        objective=OBJ,
+        agent_authorities={
+            "agent_admin": Authority(permissions={make_permission("deploy", "staging")}),
+            "agent_mid": Authority(permissions={make_permission("deploy", "staging")}),
+            "agent_leaf": Authority(permissions={make_permission("deploy", "staging")}),
+        },
+        allowed_delegations={"admin": {"mid"}, "mid": {"leaf"}, "leaf": set()},
+        agent_roles={"agent_admin": "admin", "agent_mid": "mid", "agent_leaf": "leaf"},
+        max_fleet_steps=100,
+    )
+
+
+def test_upstream_narrowing_blocks_a_downstream_delegation_using_stale_authority(tmp_path):
+    """register_delegation resolves from_auth fresh, inside the call, from
+    the durable store -- never from anything the caller could have fetched
+    and held onto earlier. A delegator (agent_mid) whose own authority is
+    narrowed to nothing by a separate governor process, moments before it
+    tries to delegate onward, cannot succeed: there is no code path by
+    which a previously-resolved Authority object could reach
+    register_delegation's is_subset_of check instead of a fresh read."""
+    db = str(tmp_path / "chainmail.db")
+    env = _three_tier_envelope()
+    store = SQLiteStore(db)
+    g1 = _gov(store, envelope=env)  # will attempt mid -> leaf
+    g2 = _gov(store, envelope=env)  # narrows mid, as a separate process
+
+    # Confirm agent_mid genuinely holds the permission before narrowing.
+    assert g1._get_live_auth("agent_mid").can(make_permission("deploy", "staging"))
+
+    ok, msg = g2.register_delegation("agent_admin", "agent_mid", "narrow-mid",
+                                     Authority(permissions=set()))
+    assert ok, msg
+    assert not g1._get_live_auth("agent_mid").can(make_permission("deploy", "staging"))
+
+    # g1 now attempts to delegate from agent_mid, which it never separately
+    # "resolved and cached" -- register_delegation must see the narrowed
+    # state, not the ceiling agent_mid started with.
+    ok, msg = g1.register_delegation("agent_mid", "agent_leaf", "onward",
+                                     Authority(permissions={make_permission("deploy", "staging")}))
+    assert not ok
+    assert "does not hold" in msg
+
+
+def test_two_governors_racing_for_the_last_budget_unit_only_one_wins_v2(tmp_path):
+    """Same guarantee as test_two_governors_racing_for_the_last_budget_unit_
+    only_one_wins above, restated here under the freshness-rule section
+    since it is the same atomic-consume mechanism the freshness re-check
+    (15b) now gates -- kept as a second, independent instance rather than a
+    duplicate to make this section self-contained."""
+    db = str(tmp_path / "chainmail.db")
+    store = SQLiteStore(db)
+    g1 = _gov(store)
+    g2 = _gov(store)
+    for i in range(4):
+        assert g1.evaluate(_prop(f"drain{i}", "agent_deploy", DEPLOY)).decision.value == "CONTINUE"
+
+    results = [None, None]
+
+    def go(g, idx, pid):
+        results[idx] = g.evaluate(_prop(pid, "agent_deploy", DEPLOY)).decision.value
+
+    t1 = threading.Thread(target=go, args=(g1, 0, "race-a"))
+    t2 = threading.Thread(target=go, args=(g2, 1, "race-b"))
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+    assert results.count("CONTINUE") == 1
+    assert results.count("HUMAN") == 1
+
+
+def test_restart_after_partial_budget_consumption_survives_exactly(tmp_path):
+    """Consume 2 of 5 units, then 'restart' (fresh governor, same store) --
+    remaining must be exactly 3, never reset to the envelope ceiling (5)."""
+    db = str(tmp_path / "chainmail.db")
+    g1 = _gov(SQLiteStore(db))
+    for i in range(2):
+        assert g1.evaluate(_prop(f"p{i}", "agent_deploy", DEPLOY)).decision.value == "CONTINUE"
+
+    g2 = _gov(SQLiteStore(db))  # "restart"
+    remaining = g2._get_live_auth("agent_deploy").budget_remaining.get(DEPLOY.key())
+    assert remaining == 3
+
+    # And it keeps counting down correctly from exactly there, not from 5.
+    for i in range(3):
+        assert g2.evaluate(_prop(f"q{i}", "agent_deploy", DEPLOY)).decision.value == "CONTINUE"
+    r = g2.evaluate(_prop("q-over", "agent_deploy", DEPLOY))
+    assert r.decision.value == "HUMAN"
+    assert RiskSignal.BUDGET_EXHAUSTED in r.signals
+
+
+def test_store_unavailable_during_the_freshness_recheck_fails_closed(tmp_path):
+    """Breaking the store specifically at the point the freshness re-check
+    (15b) queries it -- not the earlier check at (10-11) -- must still fail
+    closed. Simulated by making active_restrictions (called inside
+    _effective_authority, which 15b calls fresh) raise only after the first
+    successful call, so the early check at (10) succeeds and the freshness
+    re-check at (15b) is what hits the failure."""
+    db = str(tmp_path / "chainmail.db")
+    store = SQLiteStore(db)
+    g = _gov(store)
+
+    real_active_restrictions = store.active_restrictions
+    calls = {"n": 0}
+
+    def flaky(**kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_active_restrictions(**kwargs)
+
+    store.active_restrictions = flaky
+    r = g.evaluate(_prop("p1", "agent_deploy", DEPLOY))
+    assert r.decision.value == "HUMAN"
+    assert RiskSignal.AUTHORITY_STORE_UNAVAILABLE in r.signals
+    assert calls["n"] >= 2  # proves the freshness re-check really ran (and failed)

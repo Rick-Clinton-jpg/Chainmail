@@ -12,10 +12,20 @@ not deleted -- they exist so this design has an executable definition of
 
 The durable live-authority/permission-budget/step-counter persistence
 (`SQLiteStore` schema v5: `live_authority`, `live_authority_agents`,
-`step_counters`) makes state survive a **process restart** and makes
-consumption **atomic across concurrent processes sharing one file**. Neither
-of those guarantees says anything about whether the file itself can be
-tampered with by something with direct filesystem access to it -- an operator
+`step_counters`) makes state survive a **process restart**, makes
+consumption **atomic across concurrent processes sharing one file**, and
+enforces a **freshness rule**: authority is resolved against the durable
+store at each decision that depends on it (the permission/budget check, and
+separately the durable consumption decision, each re-read fresh -- no
+previously-resolved `Authority` object is reused across hops or across the
+two), with store unavailability at any of those points failing closed
+rather than falling back to an in-memory or cached view. See
+`ChainmailGovernor._evaluate_locked`'s step 15b and
+`tests/test_authority_persistence.py`'s freshness-rule section for the
+concrete enforcement and its adversarial tests.
+
+None of that says anything about whether the file itself can be tampered
+with by something with direct filesystem access to it -- an operator
 error, a compromised host, or a deliberate attack that edits, replaces, or
 rolls back the SQLite file outside of Chainmail's own code path entirely.
 

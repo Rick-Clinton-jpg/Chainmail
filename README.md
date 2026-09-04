@@ -303,6 +303,20 @@ depends on, stated precisely:
   the single-process in-memory path -- the atomic UPDATE is the actual
   cross-process enforcement point, and it must gate a real side effect, not
   follow one.
+* **Authority is resolved against the durable store at each decision that
+  depends on it -- never reused across hops or decisions.** The permission/
+  budget *check* early in `evaluate()` is only an early exit; the durable
+  *consumption* decision re-resolves authority fresh, right at the point it
+  spends it, rather than reusing whatever was read several checks earlier
+  (real elapsed work -- contextual-risk checks, quorum collection -- sits in
+  between, during which another governor process sharing the store can
+  durably revoke or narrow that exact agent's authority).
+  `register_delegation` has no code path that accepts a caller-supplied
+  Authority to check against, either -- it always re-reads the delegator's
+  effective authority fresh, inside the call. Durable-store unavailability
+  at any of these re-checks fails closed (`HUMAN` /
+  `AUTHORITY_STORE_UNAVAILABLE` / `STEP_STORE_UNAVAILABLE`); it never falls
+  back to a cached or in-memory view, in production or otherwise.
 * **A policy/envelope change never resets consumed state.** All of the above
   is scoped by `(deployment_namespace, agent_id, ...)` only -- deliberately
   never by the envelope's fingerprint, for the same reason replay claims and
@@ -475,7 +489,8 @@ copyright holder.
 |---|---|
 | Must | Network quorum transport (Raft / PBFT) with real peer governors |
 | Must | mTLS / SPIFFE identity for the service instead of shared/per-caller tokens |
-| Must | Durable `live_authority` and STEP_BUDGET/permission budgets with a store + local fallback, rebuilt from the audit log on restart — pattern from `Quorum/gate/firestore_*.py` (replay set and restrictions are already durable) |
+| Must | Durable STEP_BUDGET-policy restriction budgets and `provenance` (`live_authority`, permission budgets, and fleet/per-agent step budgets are durable as of schema v5 — see "Durability" above) |
+| Must | Keyed row authentication and a host-external rollback checkpoint for the durable-authority store (design in `docs/DURABILITY.md`, not yet implemented) |
 | Should | Encrypted key material at rest in `KeyRegistry`; HSM/KMS backend |
 | Should | Formal TLA+ model of the delegation invariants |
 | Should | Wall-clock fleet budgets and sliding-window rate limits |
