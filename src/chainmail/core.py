@@ -55,6 +55,8 @@ class RiskSignal(str, Enum):
     UNKNOWN_AGENT = "UNKNOWN_AGENT"
     REPLAY_STORE_UNAVAILABLE = "REPLAY_STORE_UNAVAILABLE"
     RESTRICTION_STORE_UNAVAILABLE = "RESTRICTION_STORE_UNAVAILABLE"
+    AUTHORITY_STORE_UNAVAILABLE = "AUTHORITY_STORE_UNAVAILABLE"
+    STEP_STORE_UNAVAILABLE = "STEP_STORE_UNAVAILABLE"
 
 
 class RestrictPolicy(str, Enum):
@@ -130,6 +132,15 @@ class Authority:
             p.name, p.scope,
         ))
         return candidates[0]
+
+    def resolve(self, required: Permission) -> Optional[Permission]:
+        """Public accessor for the deterministic matching ``_match`` performs
+        internally for ``has_budget``/``consume_budget``/``is_subset_of``.
+        Lets a caller outside this class -- e.g. a durable persistence layer
+        recording *which specific granted permission's* budget a decision
+        consumes -- discover the same answer this class's own budget checks
+        use, without duplicating the matching logic."""
+        return self._match(required)
 
     def has_budget(self, required: Permission) -> bool:
         p = self._match(required)

@@ -193,12 +193,14 @@ def test_production_config_requires_durable_replay_storage():
     import dataclasses
 
     from chainmail import (
-        AuditSink, ChainmailGovernor, CompositeVerifier, KeyRegistry, RestrictPolicy,
-        SQLiteStore, build_demo_envelope,
+        AuditSink, ChainmailGovernor, CompositeVerifier, DenyAllExecutionBoundary, KeyRegistry,
+        RestrictPolicy, SQLiteStore, build_demo_envelope,
     )
 
     # production_mode also rejects TTL_STEPS (see the dedicated test below);
     # use TTL_WALLCLOCK here so this test isolates the durable-storage check.
+    # A real execution boundary is also required (see the dedicated test
+    # below) -- DenyAllExecutionBoundary isolates that too.
     env = dataclasses.replace(build_demo_envelope(), restrict_policy=RestrictPolicy.TTL_WALLCLOCK)
 
     with pytest.raises(ValueError, match="production_mode"):
@@ -206,6 +208,7 @@ def test_production_config_requires_durable_replay_storage():
             env,
             config=GovernorConfig.production(),
             verifier=CompositeVerifier(KeyRegistry()),
+            execution_boundary=DenyAllExecutionBoundary(),
             auto_embedding=False,
         )
     # with a durable store wired in, construction succeeds
@@ -213,10 +216,12 @@ def test_production_config_requires_durable_replay_storage():
         env,
         config=GovernorConfig.production(),
         verifier=CompositeVerifier(KeyRegistry()),
+        execution_boundary=DenyAllExecutionBoundary(),
         audit=AuditSink(sqlite_store=SQLiteStore()),
         auto_embedding=False,
     )
     assert g.security_report()["durable_replay_protection"] is True
+    assert g.security_report()["durable_authority_and_budgets"] is True
 
 
 def test_production_config_rejects_ttl_steps_restrictions():
@@ -226,8 +231,8 @@ def test_production_config_rejects_ttl_steps_restrictions():
     still-active restriction as expired purely because its own step_count
     happens to be higher. production_mode refuses this envelope outright."""
     from chainmail import (
-        AuditSink, ChainmailGovernor, CompositeVerifier, KeyRegistry, RestrictPolicy,
-        SQLiteStore, build_demo_envelope,
+        AuditSink, ChainmailGovernor, CompositeVerifier, DenyAllExecutionBoundary, KeyRegistry,
+        RestrictPolicy, SQLiteStore, build_demo_envelope,
     )
 
     assert build_demo_envelope().restrict_policy == RestrictPolicy.TTL_STEPS
@@ -236,9 +241,30 @@ def test_production_config_rejects_ttl_steps_restrictions():
             build_demo_envelope(),
             config=GovernorConfig.production(),
             verifier=CompositeVerifier(KeyRegistry()),
+            execution_boundary=DenyAllExecutionBoundary(),
             audit=AuditSink(sqlite_store=SQLiteStore()),
             auto_embedding=False,
         )
+
+
+def test_production_config_rejects_permissive_or_missing_execution_boundary():
+    from chainmail import (
+        AuditSink, ChainmailGovernor, CompositeVerifier, KeyRegistry, PermissiveExecutionBoundary,
+        RestrictPolicy, SQLiteStore, build_demo_envelope,
+    )
+    import dataclasses
+
+    env = dataclasses.replace(build_demo_envelope(), restrict_policy=RestrictPolicy.TTL_WALLCLOCK)
+    kwargs = dict(
+        config=GovernorConfig.production(),
+        verifier=CompositeVerifier(KeyRegistry()),
+        audit=AuditSink(sqlite_store=SQLiteStore()),
+        auto_embedding=False,
+    )
+    with pytest.raises(ValueError, match="execution boundary"):
+        ChainmailGovernor(env, **kwargs)  # no execution_boundary at all
+    with pytest.raises(ValueError, match="execution boundary"):
+        ChainmailGovernor(env, execution_boundary=PermissiveExecutionBoundary(), **kwargs)
 
 
 def test_canonical_bytes_are_stable():

@@ -41,6 +41,7 @@ from ..builders import build_demo_envelope
 from ..config import GovernorConfig
 from ..core import RestrictPolicy
 from ..crypto import ALGO_ED25519, ALGO_HMAC, CompositeVerifier, KeyRegistry
+from ..execution_boundary import DenyAllExecutionBoundary
 from ..governor import ChainmailGovernor
 from ..persistence import AuditSink, HashChainLog, SQLiteStore
 from .protocol import (
@@ -375,7 +376,16 @@ def main(argv: Optional[list] = None, *, _block: Optional[Callable[[], None]] = 
         # TTL_WALLCLOCK so --production is usable without a custom envelope;
         # a real deployment should still supply its own AuthorityEnvelope.
         envelope = dataclasses.replace(envelope, restrict_policy=RestrictPolicy.TTL_WALLCLOCK)
-    governor = ChainmailGovernor(envelope, config=config, audit=audit, verifier=verifier)
+    # production_mode requires a non-permissive execution boundary, and this
+    # CLI has no flag for wiring in a real one (a genuine execution handler
+    # is a Python callable, not something expressible as a command-line
+    # argument) -- default to DenyAllExecutionBoundary so --production is
+    # usable standalone. A real deployment that needs to actually execute
+    # anything should use ChainmailGovernor directly with a real
+    # execution_boundary=, not this CLI.
+    execution_boundary = DenyAllExecutionBoundary() if args.production else None
+    governor = ChainmailGovernor(envelope, config=config, audit=audit, verifier=verifier,
+                                 execution_boundary=execution_boundary)
 
     server = UnixSocketGovernorServer(
         governor, args.socket, auth_token=token, auth_tokens=token_map,

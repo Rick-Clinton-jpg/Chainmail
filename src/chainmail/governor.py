@@ -24,8 +24,15 @@ Evaluation order (every failing gate returns HUMAN):
  14. audit "started"
  15. quorum (only if CONTINUE) -- MUST precede execution; a peer veto is
      meaningless after the side effect has already happened
- 16. execution boundary (only if CONTINUE, i.e. quorum also agreed)
- 17. consume permission budget  (only if the final decision is CONTINUE)
+ 15b. durable permission-budget consumption (durable path only; only if
+     still CONTINUE post-quorum) -- MUST also precede execution, for the
+     same reason: the atomic UPDATE is the actual cross-process enforcement
+     point (the check at 11 is only an early exit), so it must gate a real
+     side effect, not follow one
+ 16. execution boundary (only if CONTINUE, i.e. quorum and durable budget
+     consumption -- if applicable -- also agreed)
+ 17. consume permission budget  (non-durable / in-memory path only; the
+     durable path already consumed atomically at 15b)
  18. apply restriction          (only if the final decision is RESTRICT)
  19. audit "completed"
 """
@@ -96,11 +103,27 @@ class ChainmailGovernor:
             raise ValueError(
                 "config.production_mode=True (set by GovernorConfig.production()) "
                 "requires durable storage, but no SQLiteStore is wired into audit: "
-                "in-memory-only nonce/proposal-ID replay protection and restriction "
-                "state do not survive a restart and offer no protection across "
-                "multiple governor processes. Pass "
-                "audit=AuditSink(sqlite_store=SQLiteStore(...)), or build a "
-                "non-production GovernorConfig() for development."
+                "in-memory-only nonce/proposal-ID replay protection, restriction "
+                "state, live authority, and permission/step budgets do not survive "
+                "a restart and offer no protection across multiple governor "
+                "processes. Pass audit=AuditSink(sqlite_store=SQLiteStore(...)), or "
+                "build a non-production GovernorConfig() for development."
+            )
+        if self.config.production_mode and (
+            execution_boundary is None
+            or isinstance(execution_boundary, PermissiveExecutionBoundary)
+        ):
+            raise ValueError(
+                "config.production_mode=True but no real execution boundary is "
+                "wired: an absent boundary or PermissiveExecutionBoundary "
+                "authorises every CONTINUE decision unconditionally, which makes "
+                "every other production_mode guarantee (signatures, durable "
+                "replay/authority/budgets) meaningless -- Chainmail's own decision "
+                "is never final on its own. Pass an explicit execution_boundary= "
+                "(e.g. a GuardedExecutorAdapter wrapping a real handler, or "
+                "DenyAllExecutionBoundary if this deployment genuinely never "
+                "executes anything), or build a non-production GovernorConfig() "
+                "for development."
             )
         if self.config.production_mode and self.envelope.restrict_policy == RestrictPolicy.TTL_STEPS:
             raise ValueError(
@@ -135,6 +158,33 @@ class ChainmailGovernor:
         self.proposal_log: Deque[Proposal] = deque(maxlen=self.config.proposal_log_max)
         self.step_count = 0
         self._agent_steps: Counter = Counter()
+
+        # Durable live authority + budgets (when a SQLiteStore is wired into
+        # audit): each known agent is seeded into the durable store exactly
+        # once per (namespace, agent_id) -- initialize_agent_authority is a
+        # no-op if that agent already has durable state, so a restart never
+        # overwrites previously delegated-away or consumed authority/budget
+        # with the envelope's ceiling values (invariant: restarting must
+        # never increase authority or renew a consumed budget). self.live_
+        # authority above is then overwritten with whatever the durable
+        # store actually holds for each agent -- which may differ from the
+        # envelope ceiling if this agent was already initialized -- so it is
+        # never stale even before the first evaluate() call. It remains a
+        # convenience mirror for snapshot()/introspection only: every
+        # authoritative check re-reads the durable store fresh (see
+        # _get_live_auth), the same pattern already used for restrictions.
+        if self.audit.sqlite is not None:
+            for agent_id, ceiling in envelope.agent_authorities.items():
+                if not self.audit.sqlite.is_authority_initialized(
+                        namespace=self.deployment_namespace, agent_id=agent_id):
+                    self.audit.sqlite.initialize_agent_authority(
+                        namespace=self.deployment_namespace, agent_id=agent_id,
+                        permissions=[(p.name, p.scope, p.max_budget) for p in ceiling.permissions],
+                        envelope_fingerprint=envelope._construction_fingerprint,
+                    )
+                self.live_authority[agent_id] = self._get_live_auth_durable(agent_id)
+            self.step_count = self.audit.sqlite.peek_step_counter(
+                namespace=self.deployment_namespace, scope="fleet")
 
         # restrictions: agent -> list of (permission, kind, expiry) where kind is
         # "steps" (expiry is a step count), "wall" (expiry is a wall-clock time),
@@ -222,20 +272,27 @@ class ChainmailGovernor:
                 "observe restrictions imposed by one another; wire a SQLiteStore "
                 "into AuditSink for durable restriction storage"
             )
-        # Unlike replay protection and restrictions, there is currently no
-        # durable-storage option for any of this -- wiring in a SQLiteStore
-        # does not change it, and production_mode does not (yet) refuse to
-        # start without it. Always reported, so production_mode=True is
-        # never mistaken for "everything survives a restart or extends
-        # across processes" when it doesn't.
+        durable_authority = self.audit.sqlite is not None
+        if not durable_authority:
+            weaknesses.append(
+                "live_authority (delegated authority) and permission/step budgets are "
+                "in-memory only -- a restart resets delegated authority to the "
+                "envelope ceiling and renews all budgets, and running multiple "
+                "governor processes multiplies budgets and lets one process's "
+                "delegation be invisible to another's; wire a SQLiteStore into "
+                "AuditSink for durable authority and budgets"
+            )
+        # provenance (the human-readable delegation chain) has no durable
+        # storage option -- it is a diagnostic record, not authoritative
+        # state (live_authority now is), so this is reported regardless of
+        # durable_authority, unconditionally, so production_mode=True is
+        # never mistaken for "the delegation history itself survives a
+        # restart" when it doesn't.
         weaknesses.append(
-            "live_authority (delegated authority), permission budgets, "
-            "fleet/per-agent step budgets, and provenance are in-memory only "
-            "with no durable-storage option yet -- a restart resets delegated "
-            "authority to the envelope ceiling and renews all budgets; running "
-            "multiple governor processes multiplies budgets and lets one "
-            "process's delegation be invisible to another's. production_mode "
-            "does not (yet) prevent this configuration -- see CHANGELOG.md"
+            "provenance (the human-readable delegation chain) is in-memory only "
+            "with no durable-storage option yet -- a restart loses it; this does "
+            "not affect the authoritative delegated-authority state itself, which "
+            "is durable when a SQLiteStore is wired in -- see CHANGELOG.md"
         )
         return {
             "governor_id": self.governor_id,
@@ -251,7 +308,7 @@ class ChainmailGovernor:
             "dedupe_proposal_ids": self.config.dedupe_proposal_ids,
             "durable_replay_protection": durable_replay,
             "durable_restriction_protection": durable_restrictions,
-            "durable_authority_and_budgets": False,
+            "durable_authority_and_budgets": durable_authority,
             "production_mode": self.config.production_mode,
             "deployment_namespace": self.deployment_namespace,
             "weaknesses": weaknesses,
@@ -400,7 +457,28 @@ class ChainmailGovernor:
                           [RiskSignal.REPLAY_STORE_UNAVAILABLE], execution_id=execution_id)
 
     def _get_live_auth(self, agent_id: str) -> Authority:
+        """The agent's current live (granted) authority -- the durable path
+        (a SQLiteStore wired into audit) always reads fresh from the store,
+        never the possibly-stale ``self.live_authority`` mirror, so this
+        reflects delegation or consumption performed by *any* governor
+        process sharing the store, not just this one. Same pattern as
+        ``_active_restrictions``/``_active_restrictions_durable``."""
+        if self.audit.sqlite is not None:
+            return self._get_live_auth_durable(agent_id)
         return self.live_authority.get(agent_id, Authority())
+
+    def _get_live_auth_durable(self, agent_id: str) -> Authority:
+        rows = self.audit.sqlite.get_live_authority_rows(
+            namespace=self.deployment_namespace, agent_id=agent_id)
+        permissions = {
+            Permission(r["permission_name"], r["permission_scope"], r["max_budget"])
+            for r in rows
+        }
+        budget_remaining = {
+            f"{r['permission_name']}:{r['permission_scope']}": r["remaining"]
+            for r in rows if r["max_budget"] is not None
+        }
+        return Authority(permissions=permissions, budget_remaining=budget_remaining)
 
     def _is_restriction_live(self, kind: str, expiry: float) -> bool:
         if kind == "human":
@@ -569,7 +647,11 @@ class ChainmailGovernor:
             if not self.envelope.knows_agent(to_agent):
                 return False, f"unknown recipient agent '{to_agent}'"
 
-            from_auth = self._effective_authority(from_agent)
+            try:
+                from_auth = self._effective_authority(from_agent)
+            except sqlite3.Error as exc:
+                logger.exception("durable authority/restriction store is unavailable")
+                return False, f"durable authority/restriction store is unavailable: {type(exc).__name__}"
             max_to = self.envelope.get_max_authority(to_agent)
 
             from_role = self.envelope.get_role(from_agent)
@@ -602,6 +684,26 @@ class ChainmailGovernor:
                 logger.exception("delegation audit write failed")
                 return False, "delegation audit write failed; delegation not recorded"
 
+            # Durable publish: the authoritative state change. When durable
+            # authority storage is configured this -- not the in-memory dict
+            # below -- is the source of truth every governor process reads
+            # (see _get_live_auth_durable), so it must itself succeed before
+            # anything is reported accepted; a failure here must leave the
+            # delegation exactly as unpublished as a failed audit write does.
+            if self.audit.sqlite is not None:
+                try:
+                    self.audit.sqlite.replace_live_authority(
+                        namespace=self.deployment_namespace, agent_id=to_agent,
+                        permissions=[(p.name, p.scope, p.max_budget) for p in new_auth.permissions],
+                        source="delegation",
+                        envelope_fingerprint=self.envelope._construction_fingerprint,
+                    )
+                except sqlite3.Error as exc:
+                    logger.exception("durable authority store is unavailable")
+                    return (False,
+                           f"durable authority store is unavailable: {type(exc).__name__}; "
+                           "delegation not recorded")
+
             self.live_authority[to_agent] = new_auth
             self.provenance.append(ProvenanceLink(
                 from_id=from_agent, to_id=to_agent, reason=reason,
@@ -613,11 +715,34 @@ class ChainmailGovernor:
             return True, "Delegation accepted (authority preserved or reduced)"
 
     def revoke_delegation(self, to_agent: str) -> bool:
-        """Reset an agent's live authority back to its envelope ceiling."""
+        """Reset an agent's live authority back to its envelope ceiling.
+
+        An explicit administrative action, not a restart -- deliberately
+        allowed to restore authority up to (never beyond) the envelope
+        ceiling, unlike a bare process restart (see
+        initialize_agent_authority, which never overwrites existing durable
+        state). Durably published the same way delegation is: on a durable
+        authority-store failure this returns False without mutating
+        in-memory state, rather than reporting success for a revoke that
+        did not actually take effect for other governor processes sharing
+        the store.
+        """
         with self._lock:
             if not self.envelope.knows_agent(to_agent):
                 return False
-            self.live_authority[to_agent] = self.envelope.get_max_authority(to_agent).copy()
+            ceiling = self.envelope.get_max_authority(to_agent)
+            if self.audit.sqlite is not None:
+                try:
+                    self.audit.sqlite.replace_live_authority(
+                        namespace=self.deployment_namespace, agent_id=to_agent,
+                        permissions=[(p.name, p.scope, p.max_budget) for p in ceiling.permissions],
+                        source="revoke",
+                        envelope_fingerprint=self.envelope._construction_fingerprint,
+                    )
+                except sqlite3.Error:
+                    logger.exception("durable authority store is unavailable")
+                    return False
+            self.live_authority[to_agent] = ceiling.copy()
             self.provenance.append(ProvenanceLink(
                 from_id="<governor>", to_id=to_agent, reason="delegation revoked",
             ))
@@ -705,9 +830,33 @@ class ChainmailGovernor:
         if denial is not None:
             return denial
 
-        # commit: this is a real evaluation attempt
-        self.step_count += 1
-        self._agent_steps[proposal.agent_id] += 1
+        # commit: this is a real evaluation attempt. Step budgets are spent
+        # by the attempt itself, regardless of the eventual decision --
+        # unlike permission budgets (spent only on a true CONTINUE, see (16a)
+        # below), matching the pre-existing in-memory semantics exactly.
+        if self.audit.sqlite is not None:
+            try:
+                fleet_count, fleet_within = self.audit.sqlite.increment_step_counter(
+                    namespace=self.deployment_namespace, scope="fleet",
+                    max_allowed=self.envelope.max_fleet_steps)
+                agent_scope = f"agent:{proposal.agent_id}"
+                agent_count, agent_within = self.audit.sqlite.increment_step_counter(
+                    namespace=self.deployment_namespace, scope=agent_scope,
+                    max_allowed=(self.config.per_agent_step_budget or None))
+            except sqlite3.Error as exc:
+                logger.exception("durable step-counter store is unavailable")
+                return self._deny(Decision.HUMAN,
+                                  f"Durable step-counter store is unavailable: {type(exc).__name__}",
+                                  [RiskSignal.STEP_STORE_UNAVAILABLE], execution_id=execution_id)
+            self.step_count = fleet_count
+            self._agent_steps[proposal.agent_id] = agent_count
+        else:
+            self.step_count += 1
+            self._agent_steps[proposal.agent_id] += 1
+            fleet_within = self.step_count <= self.envelope.max_fleet_steps
+            agent_within = not (self.config.per_agent_step_budget
+                                and self._agent_steps[proposal.agent_id]
+                                > self.config.per_agent_step_budget)
         self.proposal_log.append(proposal)
         self._refit_embedding()
 
@@ -715,11 +864,10 @@ class ChainmailGovernor:
         reason_parts: List[str] = []
 
         # (7) step budgets
-        if self.step_count > self.envelope.max_fleet_steps:
+        if not fleet_within:
             return self._deny(Decision.HUMAN, "Fleet step budget exhausted",
                               [RiskSignal.FLEET_BUDGET_EXHAUSTED], execution_id=execution_id)
-        if (self.config.per_agent_step_budget
-                and self._agent_steps[proposal.agent_id] > self.config.per_agent_step_budget):
+        if not agent_within:
             return self._deny(Decision.HUMAN,
                               f"Per-agent step budget exhausted for {proposal.agent_id}",
                               [RiskSignal.AGENT_BUDGET_EXHAUSTED], execution_id=execution_id)
@@ -740,7 +888,13 @@ class ChainmailGovernor:
                               [RiskSignal.AUTHORITY_ABUSE], execution_id=execution_id)
 
         # (10) permission
-        live_auth = self._get_live_auth(proposal.agent_id)
+        try:
+            live_auth = self._get_live_auth(proposal.agent_id)
+        except sqlite3.Error as exc:
+            logger.exception("durable authority store is unavailable")
+            return self._deny(Decision.HUMAN,
+                              f"Durable authority store is unavailable: {type(exc).__name__}",
+                              [RiskSignal.AUTHORITY_STORE_UNAVAILABLE], execution_id=execution_id)
         try:
             current_auth = self._effective_authority(proposal.agent_id)
         except sqlite3.Error as exc:
@@ -863,8 +1017,46 @@ class ChainmailGovernor:
                 reason_parts.append(f"quorum: {q_reason}")
                 signals.extend(q_signals)
 
+        # (15b) durable permission-budget consumption -- MUST happen before
+        # the execution boundary, for the same reason quorum does (15):
+        # once a real side effect has happened it cannot be taken back. The
+        # in-memory path's consumption is a single-process dict decrement
+        # with no cross-process race to defend against, so it stays at (17)
+        # below, after the boundary, exactly where it always was. The
+        # durable path is different: two governor processes sharing this
+        # store could both reach this point believing the same last unit of
+        # budget is available (the check at (11) above is only an early
+        # exit, not the enforcement point). The single atomic UPDATE in
+        # consume_permission_budget is the actual enforcement -- whichever
+        # process's UPDATE commits first leaves nothing for the other, which
+        # must then be denied *before* it ever calls the execution boundary,
+        # not after. Consumption is still only attempted on a real CONTINUE
+        # (post-quorum), matching the documented "spent only on the
+        # decision/state transition that actually requires it" invariant.
+        if decision == Decision.CONTINUE and self.audit.sqlite is not None:
+            matched = live_auth.resolve(proposal.required_permission)
+            if matched is not None and matched.max_budget is not None:
+                try:
+                    consumed = self.audit.sqlite.consume_permission_budget(
+                        namespace=self.deployment_namespace, agent_id=proposal.agent_id,
+                        permission_name=matched.name, permission_scope=matched.scope, amount=1,
+                    )
+                except sqlite3.Error as exc:
+                    logger.exception("durable authority store is unavailable")
+                    decision = Decision.HUMAN
+                    reason_parts.append(
+                        f"Durable authority store is unavailable: {type(exc).__name__}")
+                    signals.append(RiskSignal.AUTHORITY_STORE_UNAVAILABLE)
+                else:
+                    if not consumed:
+                        decision = Decision.HUMAN
+                        reason_parts.append(
+                            "Budget exhausted (consumed by a concurrent evaluation)")
+                        signals.append(RiskSignal.BUDGET_EXHAUSTED)
+
         # (16) execution boundary -- only once quorum (if configured) has
-        # also agreed to CONTINUE.
+        # also agreed to CONTINUE, and (for the durable path) only once the
+        # permission budget has actually been atomically consumed.
         execution_output: Any = None
         if decision == Decision.CONTINUE and self.execution_boundary is not None:
             try:
@@ -878,8 +1070,10 @@ class ChainmailGovernor:
                 reason_parts.append(f"Execution boundary error: {type(exc).__name__}")
                 signals.append(RiskSignal.VERIFIER_ERROR)
 
-        # (17) consume permission budget -- only on a real CONTINUE
-        if decision == Decision.CONTINUE:
+        # (17) consume permission budget -- non-durable (in-memory) path
+        # only. The durable path already consumed atomically at (15b),
+        # before the execution boundary ran.
+        if decision == Decision.CONTINUE and self.audit.sqlite is None:
             live_auth.consume_budget(proposal.required_permission)
 
         # (18) apply restriction. Durable persistence, when configured, is

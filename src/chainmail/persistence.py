@@ -1050,6 +1050,18 @@ class SQLiteStore:
             within = max_allowed is None or new_count <= max_allowed
             return new_count, within
 
+    def peek_step_counter(self, *, namespace: str, scope: str) -> int:
+        """Read the current count for ``scope`` without incrementing it --
+        for startup, to sync an in-memory mirror (``step_count``,
+        ``_agent_steps``) to the durable value instead of resetting it to
+        zero. Returns 0 if the scope has no row yet (never incremented)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT count FROM step_counters WHERE deployment_namespace = ? AND scope = ?",
+                (namespace, scope),
+            ).fetchone()
+            return row[0] if row is not None else 0
+
     def log_proposal(self, *, proposal_id: str, agent_id: str, action: str, decision: str,
                      signals: List[str], overlap: float, drift: float, phase: str,
                      execution_id: Optional[str] = None) -> None:
