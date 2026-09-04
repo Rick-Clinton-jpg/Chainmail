@@ -28,7 +28,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from .redaction import scrub_pii
 
@@ -260,7 +260,13 @@ class SQLiteStore:
     # v4: + restrictions, restriction_events (durable restriction state --
     # see impose_restriction / clear_restriction / active_restrictions).
     # Purely additive over v1-v3; no existing table changes shape.
-    SCHEMA_VERSION = 4
+    # v5: + live_authority, live_authority_agents, step_counters (durable
+    # live authority, permission budgets, and fleet/per-agent step budgets --
+    # see initialize_agent_authority / replace_live_authority /
+    # consume_permission_budget / increment_step_counter). Purely additive
+    # over v1-v4; no existing table changes shape, so no data migration is
+    # needed for this hop (unlike v2->v3's replay-table rebuild).
+    SCHEMA_VERSION = 5
 
     def __init__(self, db_path: str = ":memory:", *, synchronous: str = "FULL") -> None:
         if synchronous.upper() not in ("FULL", "NORMAL", "OFF"):
@@ -437,6 +443,75 @@ class SQLiteStore:
                     timestamp REAL NOT NULL
                 )
             """)
+            # Durable live authority + permission budgets.
+            #
+            # ``live_authority_agents`` is an explicit initialization marker,
+            # separate from whether ``live_authority`` currently holds any
+            # rows for that agent. Without it, "no permission rows for this
+            # agent" would be ambiguous between "never initialized -- seed
+            # from the envelope ceiling" and "legitimately reduced to zero
+            # permissions by delegation/consumption" -- collapsing those two
+            # would restore authority on every restart the moment an agent's
+            # authority reached zero, which is exactly invariant #1
+            # ("restarting must never increase an agent's authority") this
+            # table exists to prevent. Governor startup seeds this table
+            # (and one live_authority row per envelope-ceiling permission)
+            # exactly once per (namespace, agent_id) -- see
+            # initialize_agent_authority.
+            #
+            # ``live_authority`` holds the current set of granted
+            # permissions, one row per (namespace, agent_id, permission_name,
+            # permission_scope). ``remaining`` is NULL iff ``max_budget`` IS
+            # NULL (unlimited); otherwise it is the durable budget counter
+            # consumed by ``consume_permission_budget``'s single atomic
+            # UPDATE. Scoped by (namespace, agent_id) only -- NOT
+            # envelope_fingerprint -- for the same reason replay claims and
+            # restrictions are not scoped by it: a policy/envelope change
+            # must never silently reset consumed budget or restore
+            # authority (invariant #8). envelope_fingerprint is recorded per
+            # row as audit metadata only (the policy version active at last
+            # write), never part of how a row is looked up or matched.
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS live_authority_agents (
+                    deployment_namespace TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    initialized_at REAL NOT NULL,
+                    PRIMARY KEY (deployment_namespace, agent_id)
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS live_authority (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    deployment_namespace TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    permission_name TEXT NOT NULL,
+                    permission_scope TEXT NOT NULL,
+                    max_budget INTEGER,
+                    remaining INTEGER,
+                    source TEXT NOT NULL,
+                    envelope_fingerprint TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    UNIQUE (deployment_namespace, agent_id, permission_name, permission_scope)
+                )
+            """)
+            # Durable fleet/per-agent step (runtime) budgets. ``scope`` is
+            # ``"fleet"`` or ``f"agent:{agent_id}"`` -- a monotonic counter
+            # per scope, incremented atomically by increment_step_counter's
+            # single UPSERT+read (never a separate check-then-write). Scoped
+            # by namespace only, matching the in-memory step_count/
+            # _agent_steps this replaces: an evaluation attempt (not just a
+            # CONTINUE) consumes step budget, per the existing evaluate()
+            # ordering this table must not change the semantics of.
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS step_counters (
+                    deployment_namespace TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (deployment_namespace, scope)
+                )
+            """)
             c.execute("CREATE INDEX IF NOT EXISTS ix_proposals_agent ON proposals(agent_id)")
             c.execute("CREATE INDEX IF NOT EXISTS ix_proposals_ts ON proposals(timestamp)")
             c.execute("CREATE INDEX IF NOT EXISTS ix_proposals_pid ON proposals(proposal_id)")
@@ -445,6 +520,8 @@ class SQLiteStore:
                      "ON restrictions(deployment_namespace, agent_id, status)")
             c.execute("CREATE INDEX IF NOT EXISTS ix_restriction_events_rid "
                      "ON restriction_events(restriction_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS ix_live_authority_agent "
+                     "ON live_authority(deployment_namespace, agent_id)")
             if migrating:
                 self._migrate_replay_data_from_v2(c)
             c.commit()
@@ -799,6 +876,191 @@ class SQLiteStore:
                 )
             cols = [d[0] for d in cur.description]
             return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    # -- durable live authority + permission budgets ---------------------
+    #
+    # See the live_authority_agents / live_authority table comments in
+    # _init_db for the initialization-marker rationale and the scoping
+    # rationale (namespace + agent_id, deliberately not envelope_fingerprint).
+    #
+    # Permission sets are passed as (name, scope, max_budget) tuples --
+    # this module has no dependency on chainmail.core.Permission, keeping
+    # the storage layer's own API narrow: a proposal (agent-controlled) never
+    # reaches these methods directly, only ChainmailGovernor's own resolved
+    # (namespace, agent_id, name, scope) keys do.
+
+    def is_authority_initialized(self, *, namespace: str, agent_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM live_authority_agents WHERE deployment_namespace = ? "
+                "AND agent_id = ?", (namespace, agent_id),
+            ).fetchone()
+            return row is not None
+
+    def initialize_agent_authority(self, *, namespace: str, agent_id: str,
+                                   permissions: Iterable[Tuple[str, str, Optional[int]]],
+                                   envelope_fingerprint: Optional[str]) -> bool:
+        """Seed ``agent_id``'s durable live authority from ``permissions``
+        -- but only the first time this is ever called for this
+        ``(namespace, agent_id)``. Returns True if this call performed the
+        seeding, False if the agent was already initialized (a no-op -- the
+        existing durable state, however it got there, is authoritative and
+        must never be silently overwritten by envelope-ceiling values on a
+        later restart; that would restore previously delegated-away or
+        consumed authority, which invariant #1 forbids).
+
+        Atomic: the initialization marker and every permission row are
+        written in one transaction, so a crash partway through can never
+        leave a marked-initialized agent with a partial permission set.
+        """
+        now = time.time()
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "INSERT INTO live_authority_agents (deployment_namespace, agent_id, "
+                    "initialized_at) VALUES (?, ?, ?)", (namespace, agent_id, now),
+                )
+            except sqlite3.IntegrityError:
+                self._conn.rollback()
+                return False
+            for name, scope, max_budget in permissions:
+                self._conn.execute(
+                    "INSERT INTO live_authority (deployment_namespace, agent_id, "
+                    "permission_name, permission_scope, max_budget, remaining, source, "
+                    "envelope_fingerprint, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'envelope_ceiling', ?, ?, ?)",
+                    (namespace, agent_id, name, scope, max_budget, max_budget,
+                     envelope_fingerprint, now, now),
+                )
+            self._conn.commit()
+            return True
+
+    def get_live_authority_rows(self, *, namespace: str, agent_id: str) -> List[Dict[str, Any]]:
+        """Every current permission row for ``(namespace, agent_id)``. An
+        empty list is a valid, meaningful answer once the agent is
+        initialized (zero permissions is a legitimate state, e.g. fully
+        delegated away) -- callers that need to distinguish "not yet
+        initialized" from "legitimately zero permissions" must check
+        ``is_authority_initialized`` separately.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT permission_name, permission_scope, max_budget, remaining "
+                "FROM live_authority WHERE deployment_namespace = ? AND agent_id = ?",
+                (namespace, agent_id),
+            )
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def replace_live_authority(self, *, namespace: str, agent_id: str,
+                               permissions: Iterable[Tuple[str, str, Optional[int]]],
+                               source: str, envelope_fingerprint: Optional[str]) -> None:
+        """Atomically replace ``agent_id``'s entire durable permission set
+        with ``permissions``. Used by delegation and revocation -- the old
+        rows are deleted and the new ones inserted in one transaction, so a
+        reader can never observe a mix of old and new permissions, and a
+        crash partway through leaves the pre-transaction state intact
+        (SQLite rolls back an uncommitted transaction automatically). Also
+        marks the agent initialized (idempotent) so a later restart never
+        re-seeds from the envelope ceiling over this.
+        """
+        now = time.time()
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "INSERT INTO live_authority_agents (deployment_namespace, agent_id, "
+                    "initialized_at) VALUES (?, ?, ?)", (namespace, agent_id, now),
+                )
+            except sqlite3.IntegrityError:
+                pass  # already initialized -- this call still replaces the rows below
+            self._conn.execute(
+                "DELETE FROM live_authority WHERE deployment_namespace = ? AND agent_id = ?",
+                (namespace, agent_id),
+            )
+            for name, scope, max_budget in permissions:
+                self._conn.execute(
+                    "INSERT INTO live_authority (deployment_namespace, agent_id, "
+                    "permission_name, permission_scope, max_budget, remaining, source, "
+                    "envelope_fingerprint, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (namespace, agent_id, name, scope, max_budget, max_budget,
+                     source, envelope_fingerprint, now, now),
+                )
+            self._conn.commit()
+
+    def consume_permission_budget(self, *, namespace: str, agent_id: str, permission_name: str,
+                                  permission_scope: str, amount: int = 1) -> bool:
+        """Atomically consume ``amount`` from the durable budget for one
+        specific permission -- a single UPDATE, never a SELECT followed by
+        a separate UPDATE, so two governor processes racing to spend the
+        last unit of a budget cannot both succeed: whichever UPDATE commits
+        first leaves too little for the second, whose WHERE clause then
+        matches zero rows.
+
+        A permission with ``max_budget IS NULL`` (unlimited) always
+        succeeds without decrementing anything. Returns True if consumption
+        succeeded (or the permission is unlimited), False if the row does
+        not exist or has insufficient remaining budget -- the caller must
+        treat False as "do not proceed" (fail closed), never retry with the
+        same amount expecting a different outcome.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE live_authority SET "
+                "remaining = CASE WHEN max_budget IS NULL THEN remaining ELSE remaining - ? END, "
+                "updated_at = ? "
+                "WHERE deployment_namespace = ? AND agent_id = ? AND permission_name = ? "
+                "AND permission_scope = ? AND (max_budget IS NULL OR remaining >= ?)",
+                (amount, time.time(), namespace, agent_id, permission_name, permission_scope, amount),
+            )
+            self._conn.commit()
+            return bool(cur.rowcount)
+
+    # -- durable step (runtime) budgets -----------------------------------
+
+    def increment_step_counter(self, *, namespace: str, scope: str,
+                               max_allowed: Optional[int]) -> Tuple[int, bool]:
+        """Atomically increment the durable counter for ``scope`` (e.g.
+        ``"fleet"`` or ``f"agent:{agent_id}"``) within ``namespace`` and
+        return ``(new_count, within_budget)``. ``within_budget`` is True
+        when ``max_allowed`` is None (no cap) or ``new_count <= max_allowed``.
+
+        The increment (UPSERT) and the read of the resulting value happen
+        inside one transaction on this connection -- SQLite holds the write
+        lock for the whole transaction, so no other writer's increment can
+        land between them; the count this call observes is exactly the
+        count its own increment produced, making concurrent increments
+        from multiple processes safely serialised rather than lost.
+        """
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO step_counters (deployment_namespace, scope, count, updated_at) "
+                "VALUES (?, ?, 1, ?) "
+                "ON CONFLICT(deployment_namespace, scope) DO UPDATE SET "
+                "count = count + 1, updated_at = excluded.updated_at",
+                (namespace, scope, now),
+            )
+            row = self._conn.execute(
+                "SELECT count FROM step_counters WHERE deployment_namespace = ? AND scope = ?",
+                (namespace, scope),
+            ).fetchone()
+            self._conn.commit()
+            new_count = row[0]
+            within = max_allowed is None or new_count <= max_allowed
+            return new_count, within
+
+    def peek_step_counter(self, *, namespace: str, scope: str) -> int:
+        """Read the current count for ``scope`` without incrementing it --
+        for startup, to sync an in-memory mirror (``step_count``,
+        ``_agent_steps``) to the durable value instead of resetting it to
+        zero. Returns 0 if the scope has no row yet (never incremented)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT count FROM step_counters WHERE deployment_namespace = ? AND scope = ?",
+                (namespace, scope),
+            ).fetchone()
+            return row[0] if row is not None else 0
 
     def log_proposal(self, *, proposal_id: str, agent_id: str, action: str, decision: str,
                      signals: List[str], overlap: float, drift: float, phase: str,

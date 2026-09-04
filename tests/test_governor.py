@@ -500,7 +500,10 @@ def test_security_report_flags_defaults(make_governor):
     assert report["durable_replay_protection"] is False
     assert report["durable_restriction_protection"] is False
     assert report["durable_authority_and_budgets"] is False
-    assert len(report["weaknesses"]) == 6
+    # signature, execution boundary, quorum, durable replay, durable
+    # restrictions, durable authority/budgets, and the always-present
+    # provenance-is-in-memory-only note.
+    assert len(report["weaknesses"]) == 7
 
 
 def test_security_report_clears_weaknesses_when_hardened(make_governor):
@@ -525,18 +528,16 @@ def test_security_report_clears_weaknesses_when_hardened(make_governor):
     assert report["quorum_has_peer_transport"] is True
     assert report["durable_replay_protection"] is True
     assert report["durable_restriction_protection"] is True
-    # durable_authority_and_budgets has no wiring-in option yet (unlike
-    # replay/restrictions), so it -- and its weakness -- is always present
-    # regardless of how hardened everything else is.
-    assert report["durable_authority_and_budgets"] is False
+    # live_authority and permission/step budgets are now durable when a
+    # SQLiteStore is wired in, same as replay/restrictions. Only provenance
+    # (the human-readable delegation log, not authoritative state) has no
+    # durable-storage option yet, so its weakness is always present.
+    assert report["durable_authority_and_budgets"] is True
     assert report["weaknesses"] == [
-        "live_authority (delegated authority), permission budgets, "
-        "fleet/per-agent step budgets, and provenance are in-memory only "
-        "with no durable-storage option yet -- a restart resets delegated "
-        "authority to the envelope ceiling and renews all budgets; running "
-        "multiple governor processes multiplies budgets and lets one "
-        "process's delegation be invisible to another's. production_mode "
-        "does not (yet) prevent this configuration -- see CHANGELOG.md"
+        "provenance (the human-readable delegation chain) is in-memory only "
+        "with no durable-storage option yet -- a restart loses it; this does "
+        "not affect the authoritative delegated-authority state itself, which "
+        "is durable when a SQLiteStore is wired in -- see CHANGELOG.md"
     ]
 
 

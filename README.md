@@ -47,16 +47,25 @@ adversarial mutation harness challenges the boundary on every CI run.
   `required_permission` are self-reported by the agent. Chainmail checks the
   declared intent against policy; whether the action *does* what it says is the
   execution boundary's job.
-- **Partially durable operational state.** Nonce/proposal-ID replay
-  protection and restriction state are durable and atomic *when a
-  `SQLiteStore` is wired into `AuditSink`* (see `SQLiteStore.claim_nonce`/
-  `claim_proposal_id`/`impose_restriction`/`clear_restriction`); without
-  one, or for `live_authority` and STEP_BUDGET restriction/permission
-  budgets, state still lives only in RAM and a governor restart resets it.
-  Multi-process quorum, KMS-backed keys, and durable budgets are tracked for
-  v6.
+- **Durable operational state, single-host SQLite.** Nonce/proposal-ID replay
+  protection, restriction state, live (delegated) authority, and permission/
+  step budgets are all durable and atomic *when a `SQLiteStore` is wired into
+  `AuditSink`* -- see "Durability" below for exactly what that does and does
+  not guarantee. Without one, all of this lives only in RAM and a governor
+  restart resets it (development only; `production_mode` refuses to start
+  without a `SQLiteStore`). STEP_BUDGET *restriction* budgets (as opposed to
+  the fleet/per-agent step budgets above) and `provenance` (the human-
+  readable delegation log, not authoritative state) still have no durable
+  option. Multi-process quorum and KMS-backed keys are tracked for v6.
 - **No formal proof.** The no-authority-laundering property is tested by example
   and challenged by the mutation harness, not proven.
+- **No tamper-rollback detection yet.** A `SQLiteStore`'s hash chain (via
+  `HashChainLog`) detects insertion/deletion/edits to the *append-only audit
+  log*, but nothing here detects a whole-database swap back to an earlier,
+  internally-valid `SQLiteStore` file (a "replace with yesterday's backup"
+  attack) -- that requires a host-held secret and an external monotonic
+  checkpoint outside SQLite itself, which is not implemented. See
+  `docs/DURABILITY.md` for the design and why it is a separate piece of work.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full list of fixes. The v4 code is
 under [`legacy/`](legacy/) and is unmaintained.
@@ -268,6 +277,79 @@ gov = ChainmailGovernor(env, audit=audit)
 * `SQLiteStore.prune(before_timestamp=..., keep_last=...)` for retention.
 * `gov.suggest_envelope()` mines the SQLite history for tuning hints.
 
+### Durability: what survives a restart, and what doesn't
+
+With a `SQLiteStore` wired into `AuditSink`, all of the following are durable
+and atomic (schema v5): nonce/proposal-ID replay claims, restriction state,
+**live (delegated) authority**, and **permission/step budgets**. A governor
+process can crash or restart and none of this resets. Two guarantees this
+depends on, stated precisely:
+
+* **Restart never increases authority or renews a budget.** Each agent's
+  durable live authority is seeded from the envelope ceiling exactly *once*
+  per `(deployment_namespace, agent_id)` -- a marker row records that it
+  happened. Every later restart sees the marker and leaves existing state
+  alone, however it got there (delegation, consumption, or the original
+  seed). There is no "reload from the envelope" path once an agent is
+  initialized.
+* **Budget consumption is one atomic SQL statement, never check-then-write.**
+  `consume_permission_budget` is a single `UPDATE ... WHERE remaining >= ?`;
+  the row count it reports *is* the answer to "did this succeed", with no
+  window between reading and writing for a second writer to land in. Two
+  governor processes racing for the last unit of a budget: exactly one
+  `UPDATE` matches a row, the other matches zero and is denied. This is why
+  durable permission-budget consumption happens *before* the execution
+  boundary runs (right after quorum, if configured) rather than after, unlike
+  the single-process in-memory path -- the atomic UPDATE is the actual
+  cross-process enforcement point, and it must gate a real side effect, not
+  follow one.
+* **Authority is resolved against the durable store at each decision that
+  depends on it -- never reused across hops or decisions.** The permission/
+  budget *check* early in `evaluate()` is only an early exit; the durable
+  *consumption* decision re-resolves authority fresh, right at the point it
+  spends it, rather than reusing whatever was read several checks earlier
+  (real elapsed work -- contextual-risk checks, quorum collection -- sits in
+  between, during which another governor process sharing the store can
+  durably revoke or narrow that exact agent's authority).
+  `register_delegation` has no code path that accepts a caller-supplied
+  Authority to check against, either -- it always re-reads the delegator's
+  effective authority fresh, inside the call. Durable-store unavailability
+  at any of these re-checks fails closed (`HUMAN` /
+  `AUTHORITY_STORE_UNAVAILABLE` / `STEP_STORE_UNAVAILABLE`); it never falls
+  back to a cached or in-memory view, in production or otherwise.
+* **A policy/envelope change never resets consumed state.** All of the above
+  is scoped by `(deployment_namespace, agent_id, ...)` only -- deliberately
+  never by the envelope's fingerprint, for the same reason replay claims and
+  restrictions aren't: updating the envelope must not silently un-consume a
+  budget or restore delegated-away authority. The fingerprint is still
+  recorded on each row as audit metadata (which policy version was active at
+  last write), just never part of the lookup key.
+* **Single-host SQLite.** All of this is one SQLite database file (WAL mode,
+  `synchronous=FULL` by default). It is safe for multiple *processes* on the
+  same host sharing the same file (see above). It is not a multi-host,
+  multi-region, or high-availability store -- there is no replication, and
+  nothing here coordinates across two separate database files. Fleet
+  deployments that need that are out of scope for this layer.
+* **What still isn't durable.** `provenance` (the human-readable delegation
+  chain, not authoritative state) and STEP_BUDGET-policy restriction budgets
+  (as opposed to the fleet/per-agent step budgets described above) have no
+  durable-storage option yet -- see `security_report()`'s `weaknesses` list,
+  which always names exactly what's still in-memory-only for a given
+  governor instance.
+* **What durability does *not* mean.** Durable and atomic is not the same as
+  tamper-evident against a whole-file rollback. See "No tamper-rollback
+  detection yet" above and `docs/DURABILITY.md`.
+
+Development mode (no `SQLiteStore`, or `GovernorConfig()` instead of
+`GovernorConfig.production()`) trades all of this away for a simpler local
+setup -- and says so loudly: `security_report()` (logged as a warning at
+governor startup) always lists exactly which protections are not active,
+and `demo_v5.py` labels itself as a development-only walkthrough throughout.
+`GovernorConfig.production()` refuses to construct a governor at all unless
+a real signature verifier, a `SQLiteStore`, and a non-permissive
+`execution_boundary` are all genuinely wired in -- it cannot be satisfied by
+accident.
+
 ---
 
 ## Governor as a service
@@ -361,6 +443,38 @@ print(report.to_dict())
 
 CI runs this on the demo envelope and fails the build on any survivor.
 
+A second, self-contained family -- `authority_laundering_mutant_family()` --
+targets the durable live-authority/permission-budget path (schema v5) and the
+freshness rule on top of it specifically, not the deterministic per-proposal
+checks `standard_mutant_family()` already covers: delegating more than a
+delegator's current durable remaining, reusing authority after an upstream
+revocation, forging `required_permission`'s own budget field to bypass
+consumption, laundering authority through a multi-hop delegation chain that
+looks individually valid at each hop, and two governor instances racing to
+double-spend the last unit of a budget. It builds its own 3-tier delegation
+envelope (a real delegation graph is required to attack; `standard_mutant_
+family`'s single flat envelope has none) and *requires* a governor factory
+with a real `SQLiteStore` wired in -- run against a non-durable factory, its
+mutations' setup silently cannot happen and the report correctly shows
+survivors rather than passing vacuously.
+
+```python
+from chainmail import (
+    AUTHORITY_LAUNDERING_INVARIANTS, AuditSink, ChainmailGovernor, MutationRunner,
+    SQLiteStore, authority_laundering_mutant_family,
+)
+
+envelope, seed_proposal, family = authority_laundering_mutant_family()
+report = MutationRunner(
+    lambda: ChainmailGovernor(envelope, auto_embedding=False,
+                              audit=AuditSink(sqlite_store=SQLiteStore(":memory:"))),
+    required_invariants=AUTHORITY_LAUNDERING_INVARIANTS,
+).run(seed_proposal, family)
+assert report.passed
+```
+
+`demo_v5.py` runs both families (step 9 and 9b).
+
 ---
 
 ## Audit-surface PII redaction
@@ -387,6 +501,16 @@ because they are the point of an audit trail. (Adapted from
 - The demo envelope's agent authorities are deliberately disjoint, so demo
   delegations reduce to the empty set — that is the "non-expanding" invariant
   doing its job, not a bug.
+- `authority_laundering_mutant_family()` covers 5 laundering patterns
+  (over-delegating past durable remaining, stale authority after a
+  revocation, a forged `required_permission` budget, multi-hop laundering
+  that looks individually valid per hop, concurrent double-spend of the
+  last budget unit) — not an exhaustive family. Not yet covered: many small
+  delegations accumulating instead of one obvious expansion, sibling agents
+  recombining partial permissions, re-entry after a prior refusal
+  specifically in a delegation context, a policy/envelope-fingerprint
+  change mid-chain, identity/namespace substitution, and a restart inserted
+  midway through a delegation chain.
 
 ---
 
@@ -407,7 +531,8 @@ copyright holder.
 |---|---|
 | Must | Network quorum transport (Raft / PBFT) with real peer governors |
 | Must | mTLS / SPIFFE identity for the service instead of shared/per-caller tokens |
-| Must | Durable `live_authority` and STEP_BUDGET/permission budgets with a store + local fallback, rebuilt from the audit log on restart — pattern from `Quorum/gate/firestore_*.py` (replay set and restrictions are already durable) |
+| Must | Durable STEP_BUDGET-policy restriction budgets and `provenance` (`live_authority`, permission budgets, and fleet/per-agent step budgets are durable as of schema v5 — see "Durability" above) |
+| Must | Keyed row authentication and a host-external rollback checkpoint for the durable-authority store (design in `docs/DURABILITY.md`, not yet implemented) |
 | Should | Encrypted key material at rest in `KeyRegistry`; HSM/KMS backend |
 | Should | Formal TLA+ model of the delegation invariants |
 | Should | Wall-clock fleet budgets and sliding-window rate limits |

@@ -4,6 +4,11 @@ Chainmail v5 --- interactive walkthrough.
 
     python demo_v5.py
 
+DEVELOPMENT-ONLY, REDUCED PROTECTION: a non-production GovernorConfig(), an
+in-memory SQLiteStore, and no real execution boundary. See main()'s startup
+banner and security_report() for exactly what that means; see README.md's
+"Durability" section for what GovernorConfig.production() actually requires.
+
 Runs entirely in-process. If ``model2vec`` is installed the real static-embedding
 engine is used; otherwise it falls back to TF-IDF. If ``cryptography`` is
 installed the signing demo uses Ed25519; otherwise HMAC.
@@ -31,6 +36,19 @@ def show(result: cm.GovernanceResult) -> None:
 
 
 def main() -> None:
+    print(f"\n{RULE}")
+    print("DEVELOPMENT-ONLY DEMO -- REDUCED PROTECTION")
+    print(RULE)
+    print(
+        "This walkthrough uses GovernorConfig() (not .production()), an\n"
+        "in-memory SQLiteStore(':memory:'), and no execution boundary --\n"
+        "none of it is durable across a restart, and nothing here executes\n"
+        "a real action. It exists to show the decision logic, not to model\n"
+        "a production deployment. See security_report() below (and its\n"
+        "startup warning) for exactly which protections are inactive, and\n"
+        "README.md's 'Durability' section for what GovernorConfig.production()\n"
+        "actually requires."
+    )
     env = cm.build_demo_envelope()
     audit = cm.AuditSink(hash_chain=cm.HashChainLog(), sqlite_store=cm.SQLiteStore(":memory:"))
 
@@ -130,6 +148,21 @@ def main() -> None:
     print(f"  survivors      : {d['survivors'] or 'none'}")
     print(f"  invariants not exercised: {d['unexercised_invariants'] or 'none'}")
     print(f"  report.passed  : {report.passed}")
+
+    hdr("9b. Authority-laundering mutant family (durable authority/budgets)")
+    laundering_env, laundering_seed, laundering_fam = cm.authority_laundering_mutant_family()
+    laundering_report = cm.MutationRunner(
+        lambda: cm.ChainmailGovernor(
+            laundering_env, auto_embedding=False,
+            audit=cm.AuditSink(sqlite_store=cm.SQLiteStore(":memory:")),
+        ),
+        required_invariants=cm.AUTHORITY_LAUNDERING_INVARIANTS,
+    ).run(laundering_seed, laundering_fam)
+    ld = laundering_report.to_dict()
+    print(f"  mutants killed : {ld['killed']}/{ld['total']}   score={ld['score']}")
+    print(f"  survivors      : {ld['survivors'] or 'none'}")
+    print(f"  invariants not exercised: {ld['unexercised_invariants'] or 'none'}")
+    print(f"  report.passed  : {laundering_report.passed}")
 
     hdr("10. Fleet snapshot")
     for k, val in gov.snapshot().items():

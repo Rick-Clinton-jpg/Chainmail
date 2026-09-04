@@ -2,6 +2,130 @@
 
 ## Unreleased
 
+### Added — authority-laundering mutant family for the durable authority/budget path
+
+`standard_mutant_family()` targets the deterministic per-proposal checks
+against a caller-supplied flat envelope; it has no way to attack a real
+delegation graph. New `authority_laundering_mutant_family()`
+(`chainmail.evaluation`) is a self-contained second family, with its own
+purpose-built 3-tier delegation envelope (`agent_root` -> `agent_mid` ->
+`agent_leaf`), covering 5 laundering patterns against the durable live-
+authority/permission-budget path and the freshness rule on top of it:
+
+- delegating more authority than the delegator's current durable remaining
+  (not its original ceiling)
+- reusing authority after an upstream revocation (the freshness rule)
+- forging `required_permission`'s own `max_budget` field to claim
+  "unlimited" and bypass consumption, which resolves against the agent's
+  actually-held permission and its real remaining, never the proposal's
+  own claim
+- multi-hop delegation laundering that looks individually valid at each
+  hop (offered <= what the delegator once received) but tries to exceed
+  what it currently, durably holds
+- two governor instances racing to double-spend the last unit of a budget
+
+Every mutation's setup consumes budget by calling `SQLiteStore.
+consume_permission_budget` directly rather than through repeated
+`gov.evaluate()` calls -- `MutationRunner.run()`'s deny-and-record
+execution boundary downgrades every would-be `CONTINUE` to `HUMAN`, and a
+`HUMAN` decision is recorded in the intent graph as a refusal boundary;
+priming through real `evaluate()` calls would poison the target agent's
+intent-graph history with harness-induced "refusals" before the real
+attack proposal ever runs, triggering `OBJECTIVE_REENTRY` on it for a
+reason unrelated to the invariant under test (discovered by running the
+family and finding every mutant reported that signal instead of its
+intended one -- fixed before landing, not shipped and found later).
+
+New `AUTHORITY_LAUNDERING_INVARIANTS` (parallel to `STANDARD_INVARIANTS`).
+`demo_v5.py` runs both families (step 9 standard, step 9b laundering).
+Discriminating-power verified directly: with `Authority.is_subset_of`
+patched to always return `True` (simulating a real regression), exactly
+the two mutations that specifically attack that check survive and no
+others -- proving the family isn't a vacuous pass.
+
+New tests in `tests/test_evaluation.py`: all 5 laundering mutants killed
+against a correct governor; the family requires durable storage (a
+non-durable factory does not pass); the family never lets a real execution
+boundary run; and the `is_subset_of`-break discriminating-power check
+above. 203 passed, 8 skipped (was 199/8 before this commit).
+
+Covers 5 of the laundering patterns worth testing, not an exhaustive
+family -- see README.md's "Notes & known limitations" for what's not yet
+covered (many small delegations accumulating, sibling agents recombining
+partial permissions, re-entry after a prior refusal in a delegation
+context, a policy/fingerprint change mid-chain, identity/namespace
+substitution, a restart mid-delegation-chain).
+
+### Added — durable live authority, permission budgets, and step (runtime) budgets
+
+Live (delegated) authority, permission budgets, and fleet/per-agent step
+budgets previously lived only in process memory: a restart reset delegated
+authority to the envelope ceiling and renewed every budget, and running
+multiple governor processes let each multiply budgets and hide delegations
+from one another. This closes that gap the same way replay claims and
+restriction state were already closed: SQLite schema v5, purely additive
+(`live_authority`, `live_authority_agents`, `step_counters`), wired into
+`ChainmailGovernor` whenever a `SQLiteStore` is configured.
+
+Key guarantees (see `README.md`'s new "Durability" section and
+`tests/test_authority_persistence.py`'s 17 tests for the adversarial
+verification of each):
+
+- A restart never restores surrendered authority or renews a consumed
+  budget -- each agent's durable state is seeded from the envelope ceiling
+  exactly once, tracked by an explicit initialization marker separate from
+  whether the agent currently holds any permissions (so "zero permissions"
+  is never mistaken for "never initialized").
+- Budget consumption is a single atomic `UPDATE`, never check-then-write --
+  two governor processes racing for the last unit of a budget: exactly one
+  wins. This required moving the durable path's permission-budget
+  consumption to *before* the execution boundary runs (right after quorum),
+  not after, since the atomic UPDATE is the real cross-process enforcement
+  point and must gate a real side effect rather than follow one; the
+  non-durable in-memory path is unchanged.
+- A policy/envelope change never resets consumed budget or restores
+  delegated-away authority -- scoped by `(namespace, agent_id)` only, never
+  by the envelope fingerprint, matching the replay/restriction precedent.
+- `ChainmailGovernor.register_delegation`/`revoke_delegation` durably
+  publish the new authority (atomic delete+reinsert) before mutating
+  in-memory state; a durable-store failure fails the delegation closed.
+- `GovernorConfig.production()` now also requires a real (non-permissive,
+  non-absent) `execution_boundary` -- previously only signatures and
+  durable storage were enforced, leaving `PermissiveExecutionBoundary` (or
+  no boundary at all) able to silently authorise every `CONTINUE` even
+  under a "production" config.
+- New RiskSignals `AUTHORITY_STORE_UNAVAILABLE`, `STEP_STORE_UNAVAILABLE`
+  for durable-store failures at their respective checks, distinct from the
+  existing replay/restriction-store signals.
+- `security_report()`'s `durable_authority_and_budgets` now reflects real
+  state; the old unconditional "always in-memory" weakness is now
+  conditional (mirroring replay/restrictions) plus a new always-present
+  weakness scoped specifically to `provenance` (the human-readable
+  delegation log, not authoritative state, which has no durable option).
+- `demo_v5.py` now prints an explicit "DEVELOPMENT-ONLY DEMO -- REDUCED
+  PROTECTION" banner naming exactly what it doesn't enforce, rather than
+  relying solely on the governor's own startup log warning.
+- `docs/DURABILITY.md`: a design spec (not implemented) for a keyed-
+  authentication and rollback-checkpoint layer on top of this durability
+  work -- what it would guarantee, what it explicitly cannot (rollback
+  detection needs a *host-external* trusted checkpoint; a local key alone
+  cannot bootstrap it), and why it's separate follow-on work. Paired with
+  `tests/test_authority_integrity_spec.py`, skipped tests pinning down
+  that design's "done" state for whoever implements it.
+
+`tests/test_authority_persistence.py` (new, 17 tests): restart doesn't
+restore authority or renew permission/step budgets; two/five governor
+instances racing or hammering a budget concurrently never exceed it (25x
+repeated with no flakiness); a failed atomic consumption or delegation
+publish leaves state completely unchanged; corrupted or fully closed
+storage fails closed; cross-namespace isolation; an agent cannot reach
+another's budget via its own proposal fields; an envelope/fingerprint
+change doesn't reset consumed budget; a delegator can't offer authority it
+doesn't hold, and an unlimited offer is durably clamped to the recipient's
+own ceiling across a restart; high-confidence contextual signals can't
+grant authority an agent lacks; production mode requires durable authority
+storage; and a v4 database upgrades to v5 without disturbing existing data.
+
 ### Fixed — Authority permission matching picked an arbitrary permission among overlapping matches (independent audit, P2)
 
 `Authority._match()` returned the first permission in `self.permissions`

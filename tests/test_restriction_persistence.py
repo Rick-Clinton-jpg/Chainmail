@@ -16,9 +16,9 @@ import sqlite3
 import pytest
 
 from chainmail import (
-    ALGO_HMAC, AuditSink, ChainmailGovernor, CompositeVerifier, Decision, GovernorConfig,
-    KeyRegistry, Proposal, RiskSignal, SQLiteStore, build_demo_envelope, make_permission,
-    sign_proposal,
+    ALGO_HMAC, AuditSink, ChainmailGovernor, CompositeVerifier, Decision, DenyAllExecutionBoundary,
+    GovernorConfig, KeyRegistry, Proposal, RiskSignal, SQLiteStore, build_demo_envelope,
+    make_permission, sign_proposal,
 )
 
 from conftest import JaccardEmbeddingEngine
@@ -375,12 +375,14 @@ def test_production_mode_requires_durable_restriction_storage():
             env,
             config=GovernorConfig.production(),
             verifier=CompositeVerifier(KeyRegistry()),
+            execution_boundary=DenyAllExecutionBoundary(),
             auto_embedding=False,
         )
     g = ChainmailGovernor(
         env,
         config=GovernorConfig.production(),
         verifier=CompositeVerifier(KeyRegistry()),
+        execution_boundary=DenyAllExecutionBoundary(),
         audit=AuditSink(sqlite_store=SQLiteStore()),
         auto_embedding=False,
     )
