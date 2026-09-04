@@ -5,10 +5,14 @@ deliberately weakened."""
 import pytest
 
 from chainmail import (
-    ALGO_HMAC, ChainmailGovernor, CompositeVerifier, Decision, GovernorConfig, KeyRegistry,
-    Proposal, RiskSignal, TfidfEmbeddingEngine, make_permission, sign_proposal,
+    ALGO_HMAC, AuditSink, Authority, ChainmailGovernor, CompositeVerifier, Decision,
+    GovernorConfig, KeyRegistry, Proposal, RiskSignal, SQLiteStore, TfidfEmbeddingEngine,
+    make_permission, sign_proposal,
 )
-from chainmail.evaluation import Mutation, MutationRunner, standard_mutant_family
+from chainmail.evaluation import (
+    AUTHORITY_LAUNDERING_INVARIANTS, Mutation, MutationRunner, authority_laundering_mutant_family,
+    standard_mutant_family,
+)
 from chainmail.execution_boundary import ExecutionBoundary, PermissiveExecutionBoundary
 
 
@@ -157,3 +161,100 @@ def test_resign_is_threaded_through_mutants_and_primers(envelope):
         signed_seed, standard_mutant_family(signed_seed, envelope))
     assert report.passed, report.to_dict()
     assert not any("SIGNATURE_MISSING" in o.signals for o in report.outcomes)
+
+
+# -- authority-laundering mutant family (durable live authority/budgets) ----
+
+def _laundering_factory(envelope):
+    def make():
+        return ChainmailGovernor(
+            envelope, config=GovernorConfig(), embedding=TfidfEmbeddingEngine(),
+            auto_embedding=False, audit=AuditSink(sqlite_store=SQLiteStore(":memory:")),
+        )
+    return make
+
+
+def test_authority_laundering_family_all_killed_against_a_correct_governor():
+    envelope, seed, family = authority_laundering_mutant_family()
+    assert {m.name for m in family} == {
+        "delegate_more_than_durable_remaining",
+        "stale_authority_after_revocation",
+        "forged_unlimited_required_permission",
+        "multi_hop_delegation_launder",
+        "concurrent_double_spend_last_unit",
+    }
+    report = MutationRunner(
+        _laundering_factory(envelope), required_invariants=AUTHORITY_LAUNDERING_INVARIANTS,
+    ).run(seed, family)
+    assert report.passed, report.to_dict()
+    assert report.score == 1.0
+    assert not report.unexercised_invariants
+
+
+def test_authority_laundering_family_requires_durable_storage():
+    """Every mutation in this family sets up its attack by directly
+    consuming durable budget (see evaluation._consume) -- run against a
+    governor factory with no SQLiteStore wired in, priming raises
+    (gov.audit.sqlite is None), which MutationRunner swallows per its
+    documented "priming failure is not the mutation's verdict" contract.
+    The family's own docstring says a durable factory is required; this
+    proves it's not silently a no-op instead of an error the caller would
+    notice -- least one mutation must NOT be killed when durability isn't
+    wired in, since none of the intended attack setup actually happened."""
+    envelope, seed, family = authority_laundering_mutant_family()
+
+    def non_durable_factory():
+        return ChainmailGovernor(envelope, config=GovernorConfig(),
+                                 embedding=TfidfEmbeddingEngine(), auto_embedding=False)
+
+    report = MutationRunner(non_durable_factory).run(seed, family)
+    assert not report.passed
+
+
+def test_authority_laundering_family_never_executes_a_real_action():
+    """Same deny-and-record guarantee standard_mutant_family already has --
+    MutationRunner.run() forcibly replaces the execution boundary
+    regardless of what the factory wires in, so even a factory carrying a
+    real (exploding) boundary must never reach it for real."""
+    envelope, seed, family = authority_laundering_mutant_family()
+
+    class _ExplodingBoundary(ExecutionBoundary):
+        def execute(self, proposal, authority):
+            raise AssertionError("the mutation harness executed a real action")
+
+    def make():
+        return ChainmailGovernor(
+            envelope, config=GovernorConfig(), embedding=TfidfEmbeddingEngine(),
+            auto_embedding=False, audit=AuditSink(sqlite_store=SQLiteStore(":memory:")),
+            execution_boundary=_ExplodingBoundary(),
+        )
+
+    report = MutationRunner(make, required_invariants=AUTHORITY_LAUNDERING_INVARIANTS).run(
+        seed, family)
+    assert report.passed, report.to_dict()
+
+
+def test_authority_laundering_family_detects_a_broken_is_subset_of_check():
+    """Discriminating-power check: with Authority.is_subset_of forced to
+    always report True (simulating a real regression -- a delegator could
+    offer authority it doesn't durably hold), exactly the two mutations
+    that specifically attack that check must survive, and no others --
+    proving each mutation exercises what it claims to, not a vacuous pass
+    that would 'kill' anything regardless of whether the governor is
+    actually correct."""
+    envelope, seed, family = authority_laundering_mutant_family()
+    orig = Authority.is_subset_of
+    Authority.is_subset_of = lambda self, other: True
+    try:
+        report = MutationRunner(_laundering_factory(envelope)).run(seed, family)
+    finally:
+        Authority.is_subset_of = orig
+    assert not report.passed
+    assert set(o.name for o in report.survivors) == {
+        "delegate_more_than_durable_remaining", "multi_hop_delegation_launder",
+    }
+    # And every mutation NOT about is_subset_of is still correctly killed.
+    survivor_names = {o.name for o in report.survivors}
+    for outcome in report.outcomes:
+        if outcome.name not in survivor_names:
+            assert outcome.killed, outcome

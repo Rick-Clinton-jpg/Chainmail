@@ -30,7 +30,8 @@ from .embeddings import (
 )
 from .envelope import AuthorityEnvelope
 from .evaluation import (
-    Mutation, MutationReport, MutationRunner, STANDARD_INVARIANTS, standard_mutant_family,
+    AUTHORITY_LAUNDERING_INVARIANTS, Mutation, MutationReport, MutationRunner, STANDARD_INVARIANTS,
+    authority_laundering_mutant_family, standard_mutant_family,
 )
 from .governor import ChainmailGovernor, ChainmailV5
 from .intent import IntentGraph, IntentGraphEntry, ReentryRisk
@@ -63,7 +64,7 @@ __all__ = [
     "IntentGraph", "IntentGraphEntry", "ReentryRisk",
     # adversarial evaluation
     "MutationRunner", "Mutation", "MutationReport", "standard_mutant_family",
-    "STANDARD_INVARIANTS",
+    "STANDARD_INVARIANTS", "authority_laundering_mutant_family", "AUTHORITY_LAUNDERING_INVARIANTS",
     # redaction + tracing
     "scrub_pii", "tracing",
     # crypto

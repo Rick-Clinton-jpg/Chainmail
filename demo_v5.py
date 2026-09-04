@@ -149,6 +149,21 @@ def main() -> None:
     print(f"  invariants not exercised: {d['unexercised_invariants'] or 'none'}")
     print(f"  report.passed  : {report.passed}")
 
+    hdr("9b. Authority-laundering mutant family (durable authority/budgets)")
+    laundering_env, laundering_seed, laundering_fam = cm.authority_laundering_mutant_family()
+    laundering_report = cm.MutationRunner(
+        lambda: cm.ChainmailGovernor(
+            laundering_env, auto_embedding=False,
+            audit=cm.AuditSink(sqlite_store=cm.SQLiteStore(":memory:")),
+        ),
+        required_invariants=cm.AUTHORITY_LAUNDERING_INVARIANTS,
+    ).run(laundering_seed, laundering_fam)
+    ld = laundering_report.to_dict()
+    print(f"  mutants killed : {ld['killed']}/{ld['total']}   score={ld['score']}")
+    print(f"  survivors      : {ld['survivors'] or 'none'}")
+    print(f"  invariants not exercised: {ld['unexercised_invariants'] or 'none'}")
+    print(f"  report.passed  : {laundering_report.passed}")
+
     hdr("10. Fleet snapshot")
     for k, val in gov.snapshot().items():
         print(f"  {k:22}: {val}")

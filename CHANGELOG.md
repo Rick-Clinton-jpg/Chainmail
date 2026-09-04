@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+### Added — authority-laundering mutant family for the durable authority/budget path
+
+`standard_mutant_family()` targets the deterministic per-proposal checks
+against a caller-supplied flat envelope; it has no way to attack a real
+delegation graph. New `authority_laundering_mutant_family()`
+(`chainmail.evaluation`) is a self-contained second family, with its own
+purpose-built 3-tier delegation envelope (`agent_root` -> `agent_mid` ->
+`agent_leaf`), covering 5 laundering patterns against the durable live-
+authority/permission-budget path and the freshness rule on top of it:
+
+- delegating more authority than the delegator's current durable remaining
+  (not its original ceiling)
+- reusing authority after an upstream revocation (the freshness rule)
+- forging `required_permission`'s own `max_budget` field to claim
+  "unlimited" and bypass consumption, which resolves against the agent's
+  actually-held permission and its real remaining, never the proposal's
+  own claim
+- multi-hop delegation laundering that looks individually valid at each
+  hop (offered <= what the delegator once received) but tries to exceed
+  what it currently, durably holds
+- two governor instances racing to double-spend the last unit of a budget
+
+Every mutation's setup consumes budget by calling `SQLiteStore.
+consume_permission_budget` directly rather than through repeated
+`gov.evaluate()` calls -- `MutationRunner.run()`'s deny-and-record
+execution boundary downgrades every would-be `CONTINUE` to `HUMAN`, and a
+`HUMAN` decision is recorded in the intent graph as a refusal boundary;
+priming through real `evaluate()` calls would poison the target agent's
+intent-graph history with harness-induced "refusals" before the real
+attack proposal ever runs, triggering `OBJECTIVE_REENTRY` on it for a
+reason unrelated to the invariant under test (discovered by running the
+family and finding every mutant reported that signal instead of its
+intended one -- fixed before landing, not shipped and found later).
+
+New `AUTHORITY_LAUNDERING_INVARIANTS` (parallel to `STANDARD_INVARIANTS`).
+`demo_v5.py` runs both families (step 9 standard, step 9b laundering).
+Discriminating-power verified directly: with `Authority.is_subset_of`
+patched to always return `True` (simulating a real regression), exactly
+the two mutations that specifically attack that check survive and no
+others -- proving the family isn't a vacuous pass.
+
+New tests in `tests/test_evaluation.py`: all 5 laundering mutants killed
+against a correct governor; the family requires durable storage (a
+non-durable factory does not pass); the family never lets a real execution
+boundary run; and the `is_subset_of`-break discriminating-power check
+above. 203 passed, 8 skipped (was 199/8 before this commit).
+
+Covers 5 of the laundering patterns worth testing, not an exhaustive
+family -- see README.md's "Notes & known limitations" for what's not yet
+covered (many small delegations accumulating, sibling agents recombining
+partial permissions, re-entry after a prior refusal in a delegation
+context, a policy/fingerprint change mid-chain, identity/namespace
+substitution, a restart mid-delegation-chain).
+
 ### Added — durable live authority, permission budgets, and step (runtime) budgets
 
 Live (delegated) authority, permission budgets, and fleet/per-agent step
