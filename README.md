@@ -47,16 +47,25 @@ adversarial mutation harness challenges the boundary on every CI run.
   `required_permission` are self-reported by the agent. Chainmail checks the
   declared intent against policy; whether the action *does* what it says is the
   execution boundary's job.
-- **Partially durable operational state.** Nonce/proposal-ID replay
-  protection and restriction state are durable and atomic *when a
-  `SQLiteStore` is wired into `AuditSink`* (see `SQLiteStore.claim_nonce`/
-  `claim_proposal_id`/`impose_restriction`/`clear_restriction`); without
-  one, or for `live_authority` and STEP_BUDGET restriction/permission
-  budgets, state still lives only in RAM and a governor restart resets it.
-  Multi-process quorum, KMS-backed keys, and durable budgets are tracked for
-  v6.
+- **Durable operational state, single-host SQLite.** Nonce/proposal-ID replay
+  protection, restriction state, live (delegated) authority, and permission/
+  step budgets are all durable and atomic *when a `SQLiteStore` is wired into
+  `AuditSink`* -- see "Durability" below for exactly what that does and does
+  not guarantee. Without one, all of this lives only in RAM and a governor
+  restart resets it (development only; `production_mode` refuses to start
+  without a `SQLiteStore`). STEP_BUDGET *restriction* budgets (as opposed to
+  the fleet/per-agent step budgets above) and `provenance` (the human-
+  readable delegation log, not authoritative state) still have no durable
+  option. Multi-process quorum and KMS-backed keys are tracked for v6.
 - **No formal proof.** The no-authority-laundering property is tested by example
   and challenged by the mutation harness, not proven.
+- **No tamper-rollback detection yet.** A `SQLiteStore`'s hash chain (via
+  `HashChainLog`) detects insertion/deletion/edits to the *append-only audit
+  log*, but nothing here detects a whole-database swap back to an earlier,
+  internally-valid `SQLiteStore` file (a "replace with yesterday's backup"
+  attack) -- that requires a host-held secret and an external monotonic
+  checkpoint outside SQLite itself, which is not implemented. See
+  `docs/DURABILITY.md` for the design and why it is a separate piece of work.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full list of fixes. The v4 code is
 under [`legacy/`](legacy/) and is unmaintained.
@@ -267,6 +276,65 @@ gov = ChainmailGovernor(env, audit=audit)
   chain raises `ReceiptIntegrityError` rather than silently forking.
 * `SQLiteStore.prune(before_timestamp=..., keep_last=...)` for retention.
 * `gov.suggest_envelope()` mines the SQLite history for tuning hints.
+
+### Durability: what survives a restart, and what doesn't
+
+With a `SQLiteStore` wired into `AuditSink`, all of the following are durable
+and atomic (schema v5): nonce/proposal-ID replay claims, restriction state,
+**live (delegated) authority**, and **permission/step budgets**. A governor
+process can crash or restart and none of this resets. Two guarantees this
+depends on, stated precisely:
+
+* **Restart never increases authority or renews a budget.** Each agent's
+  durable live authority is seeded from the envelope ceiling exactly *once*
+  per `(deployment_namespace, agent_id)` -- a marker row records that it
+  happened. Every later restart sees the marker and leaves existing state
+  alone, however it got there (delegation, consumption, or the original
+  seed). There is no "reload from the envelope" path once an agent is
+  initialized.
+* **Budget consumption is one atomic SQL statement, never check-then-write.**
+  `consume_permission_budget` is a single `UPDATE ... WHERE remaining >= ?`;
+  the row count it reports *is* the answer to "did this succeed", with no
+  window between reading and writing for a second writer to land in. Two
+  governor processes racing for the last unit of a budget: exactly one
+  `UPDATE` matches a row, the other matches zero and is denied. This is why
+  durable permission-budget consumption happens *before* the execution
+  boundary runs (right after quorum, if configured) rather than after, unlike
+  the single-process in-memory path -- the atomic UPDATE is the actual
+  cross-process enforcement point, and it must gate a real side effect, not
+  follow one.
+* **A policy/envelope change never resets consumed state.** All of the above
+  is scoped by `(deployment_namespace, agent_id, ...)` only -- deliberately
+  never by the envelope's fingerprint, for the same reason replay claims and
+  restrictions aren't: updating the envelope must not silently un-consume a
+  budget or restore delegated-away authority. The fingerprint is still
+  recorded on each row as audit metadata (which policy version was active at
+  last write), just never part of the lookup key.
+* **Single-host SQLite.** All of this is one SQLite database file (WAL mode,
+  `synchronous=FULL` by default). It is safe for multiple *processes* on the
+  same host sharing the same file (see above). It is not a multi-host,
+  multi-region, or high-availability store -- there is no replication, and
+  nothing here coordinates across two separate database files. Fleet
+  deployments that need that are out of scope for this layer.
+* **What still isn't durable.** `provenance` (the human-readable delegation
+  chain, not authoritative state) and STEP_BUDGET-policy restriction budgets
+  (as opposed to the fleet/per-agent step budgets described above) have no
+  durable-storage option yet -- see `security_report()`'s `weaknesses` list,
+  which always names exactly what's still in-memory-only for a given
+  governor instance.
+* **What durability does *not* mean.** Durable and atomic is not the same as
+  tamper-evident against a whole-file rollback. See "No tamper-rollback
+  detection yet" above and `docs/DURABILITY.md`.
+
+Development mode (no `SQLiteStore`, or `GovernorConfig()` instead of
+`GovernorConfig.production()`) trades all of this away for a simpler local
+setup -- and says so loudly: `security_report()` (logged as a warning at
+governor startup) always lists exactly which protections are not active,
+and `demo_v5.py` labels itself as a development-only walkthrough throughout.
+`GovernorConfig.production()` refuses to construct a governor at all unless
+a real signature verifier, a `SQLiteStore`, and a non-permissive
+`execution_boundary` are all genuinely wired in -- it cannot be satisfied by
+accident.
 
 ---
 

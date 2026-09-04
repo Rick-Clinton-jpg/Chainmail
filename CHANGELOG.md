@@ -2,6 +2,76 @@
 
 ## Unreleased
 
+### Added — durable live authority, permission budgets, and step (runtime) budgets
+
+Live (delegated) authority, permission budgets, and fleet/per-agent step
+budgets previously lived only in process memory: a restart reset delegated
+authority to the envelope ceiling and renewed every budget, and running
+multiple governor processes let each multiply budgets and hide delegations
+from one another. This closes that gap the same way replay claims and
+restriction state were already closed: SQLite schema v5, purely additive
+(`live_authority`, `live_authority_agents`, `step_counters`), wired into
+`ChainmailGovernor` whenever a `SQLiteStore` is configured.
+
+Key guarantees (see `README.md`'s new "Durability" section and
+`tests/test_authority_persistence.py`'s 17 tests for the adversarial
+verification of each):
+
+- A restart never restores surrendered authority or renews a consumed
+  budget -- each agent's durable state is seeded from the envelope ceiling
+  exactly once, tracked by an explicit initialization marker separate from
+  whether the agent currently holds any permissions (so "zero permissions"
+  is never mistaken for "never initialized").
+- Budget consumption is a single atomic `UPDATE`, never check-then-write --
+  two governor processes racing for the last unit of a budget: exactly one
+  wins. This required moving the durable path's permission-budget
+  consumption to *before* the execution boundary runs (right after quorum),
+  not after, since the atomic UPDATE is the real cross-process enforcement
+  point and must gate a real side effect rather than follow one; the
+  non-durable in-memory path is unchanged.
+- A policy/envelope change never resets consumed budget or restores
+  delegated-away authority -- scoped by `(namespace, agent_id)` only, never
+  by the envelope fingerprint, matching the replay/restriction precedent.
+- `ChainmailGovernor.register_delegation`/`revoke_delegation` durably
+  publish the new authority (atomic delete+reinsert) before mutating
+  in-memory state; a durable-store failure fails the delegation closed.
+- `GovernorConfig.production()` now also requires a real (non-permissive,
+  non-absent) `execution_boundary` -- previously only signatures and
+  durable storage were enforced, leaving `PermissiveExecutionBoundary` (or
+  no boundary at all) able to silently authorise every `CONTINUE` even
+  under a "production" config.
+- New RiskSignals `AUTHORITY_STORE_UNAVAILABLE`, `STEP_STORE_UNAVAILABLE`
+  for durable-store failures at their respective checks, distinct from the
+  existing replay/restriction-store signals.
+- `security_report()`'s `durable_authority_and_budgets` now reflects real
+  state; the old unconditional "always in-memory" weakness is now
+  conditional (mirroring replay/restrictions) plus a new always-present
+  weakness scoped specifically to `provenance` (the human-readable
+  delegation log, not authoritative state, which has no durable option).
+- `demo_v5.py` now prints an explicit "DEVELOPMENT-ONLY DEMO -- REDUCED
+  PROTECTION" banner naming exactly what it doesn't enforce, rather than
+  relying solely on the governor's own startup log warning.
+- `docs/DURABILITY.md`: a design spec (not implemented) for a keyed-
+  authentication and rollback-checkpoint layer on top of this durability
+  work -- what it would guarantee, what it explicitly cannot (rollback
+  detection needs a *host-external* trusted checkpoint; a local key alone
+  cannot bootstrap it), and why it's separate follow-on work. Paired with
+  `tests/test_authority_integrity_spec.py`, skipped tests pinning down
+  that design's "done" state for whoever implements it.
+
+`tests/test_authority_persistence.py` (new, 17 tests): restart doesn't
+restore authority or renew permission/step budgets; two/five governor
+instances racing or hammering a budget concurrently never exceed it (25x
+repeated with no flakiness); a failed atomic consumption or delegation
+publish leaves state completely unchanged; corrupted or fully closed
+storage fails closed; cross-namespace isolation; an agent cannot reach
+another's budget via its own proposal fields; an envelope/fingerprint
+change doesn't reset consumed budget; a delegator can't offer authority it
+doesn't hold, and an unlimited offer is durably clamped to the recipient's
+own ceiling across a restart; high-confidence contextual signals can't
+grant authority an agent lacks; production mode requires durable authority
+storage; and a v4 database upgrades to v5 without disturbing existing data.
+
 ### Fixed — Authority permission matching picked an arbitrary permission among overlapping matches (independent audit, P2)
 
 `Authority._match()` returned the first permission in `self.permissions`
