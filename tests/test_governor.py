@@ -98,6 +98,45 @@ def test_delegation_preserve_or_reduce(governor):
     assert not governor.live_authority["agent_coder"].can(make_permission("research"))
 
 
+def test_delegation_replaces_rather_than_merges_across_multiple_sources(make_governor):
+    """A second delegation from a different agent must not accumulate on
+    top of a first -- register_delegation replaces the recipient's entire
+    live authority with the clamped result of that one call. Two agents
+    each delegating one distinct permission to the same recipient must
+    leave the recipient holding only the *second* delegation's permission,
+    not the union of both -- accumulating access across several
+    individually-unremarkable delegations is exactly what this replace-not-
+    merge semantic closes off."""
+    from chainmail import AuthorityEnvelope
+
+    env = AuthorityEnvelope(
+        objective="Operate a small fleet",
+        agent_authorities={
+            "agent_a": Authority(permissions={make_permission("read", "file1")}),
+            "agent_b": Authority(permissions={make_permission("read", "file2")}),
+            "agent_target": Authority(permissions={make_permission("read", "file1"),
+                                                   make_permission("read", "file2")}),
+        },
+        allowed_delegations={"a": {"target"}, "b": {"target"}, "target": set()},
+        agent_roles={"agent_a": "a", "agent_b": "b", "agent_target": "target"},
+        max_fleet_steps=100,
+    )
+    g = make_governor(env)
+
+    ok1, _ = g.register_delegation("agent_a", "agent_target", "share file1",
+                                   Authority(permissions={make_permission("read", "file1")}))
+    assert ok1
+    assert g.live_authority["agent_target"].can(make_permission("read", "file1"))
+
+    ok2, _ = g.register_delegation("agent_b", "agent_target", "share file2",
+                                   Authority(permissions={make_permission("read", "file2")}))
+    assert ok2
+    target_auth = g.live_authority["agent_target"]
+    assert target_auth.can(make_permission("read", "file2"))
+    # The first delegation's grant is gone -- not merged, replaced.
+    assert not target_auth.can(make_permission("read", "file1"))
+
+
 def test_delegation_rejects_unknown_recipient(governor):
     ok, msg = governor.register_delegation(
         "agent_research", "ghost_agent", "x", Authority(permissions={make_permission("research")}))

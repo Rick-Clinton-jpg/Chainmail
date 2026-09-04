@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Docs — clarified that register_delegation replaces, never merges, live authority
+
+An external review raised "delegation chain amplification" (many small
+delegations from different agents accumulating into broader combined
+access) as a vulnerability. Verified against the actual code: it isn't
+reachable. `register_delegation` does `self.live_authority[to_agent] =
+new_auth` -- a full replacement of the recipient's entire live authority,
+never a union with whatever it held before. A second delegation from a
+different agent overwrites the first; the recipient ends up with only the
+most recent delegation's (clamped) grant, never the combined set. This was
+previously undocumented -- `register_delegation` had no docstring at all --
+so the absence of a stated contract was a fair thing to flag even though
+the specific attack doesn't work.
+
+Added a full docstring to `ChainmailGovernor.register_delegation` stating
+the replace-not-merge contract explicitly, and a note in README.md's Core
+Invariants section (under "Non-expanding delegation"). New test
+`test_delegation_replaces_rather_than_merges_across_multiple_sources` in
+`tests/test_governor.py`: two agents each delegate one distinct permission
+to the same recipient; the recipient ends up holding only the second
+delegation's permission, proving the first grant was overwritten rather
+than accumulated.
+
+204 passed, 8 skipped (was 203/8 before this commit).
+
 ### Added — authority-laundering mutant family for the durable authority/budget path
 
 `standard_mutant_family()` targets the deterministic per-proposal checks

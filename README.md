@@ -127,7 +127,15 @@ pytest -q                  # 101 tests
    authority before any agent runs.
 2. **Non-expanding delegation** — delegation preserves or reduces authority and
    is constrained by the `allowed_delegations` role map; it is reduced to the
-   recipient's envelope ceiling.
+   recipient's envelope ceiling. **Delegation replaces, never merges**: each
+   `register_delegation` call *replaces* the recipient's entire live
+   authority with the clamped result of that one call — it is never unioned
+   with whatever the recipient held before, even from a different delegator.
+   Two delegations from different agents to the same recipient do not
+   accumulate; the second call's result is the recipient's only authority
+   afterward. An agent that needs authority from multiple sources must
+   receive it as a single delegation carrying the full union — see
+   `ChainmailGovernor.register_delegation`'s docstring.
 3. **Central authority** — live permissions exist only in the governance plane.
 4. **Context can only tighten** — signals produce `RESTRICT` / `RECHECK` /
    `HUMAN`; they never grant permissions.

@@ -651,6 +651,38 @@ class ChainmailGovernor:
     # ------------------------------------------------------------------
     def register_delegation(self, from_agent: str, to_agent: str, reason: str,
                             offered: Authority) -> Tuple[bool, str]:
+        """Delegate ``offered`` (clamped to ``to_agent``'s envelope ceiling)
+        from ``from_agent`` to ``to_agent``.
+
+        ``offered`` must be a subset of ``from_agent``'s own *current*
+        effective authority (``is_subset_of``, checked against a fresh
+        durable read) -- a delegator can never grant more than it itself
+        holds at the moment of the call, including its current remaining
+        budget, not its original ceiling.
+
+        REPLACE, NOT MERGE: on success, ``to_agent``'s entire live authority
+        is *replaced* by the clamped result of this one delegation -- it is
+        never unioned with whatever ``to_agent`` held before the call, even
+        if that prior authority came from a different delegator. Two
+        delegations from different agents to the same recipient do not
+        accumulate: the second call's result is the recipient's *only*
+        authority afterward, and the first delegation's grant is gone. An
+        agent that needs to hold authority from multiple sources must
+        receive it as a *single* delegation carrying the full union of what
+        it should hold -- there is no way to "add" a permission to what an
+        agent already has via a separate call. This is a stronger form of
+        the "non-expanding delegation" invariant (a delegation can only
+        ever narrow what's live, never broaden it via repeated calls), not
+        a bug: it closes off accumulating access across many small,
+        individually-unremarkable delegations from different agents.
+
+        Returns ``(True, message)`` on success (message notes whether
+        ``offered`` was reduced to fit ``to_agent``'s envelope ceiling) or
+        ``(False, reason)`` on refusal -- an unknown agent, a role-map
+        violation, an offer exceeding what ``from_agent`` currently holds,
+        or a durable-store failure (fails closed: the delegation is treated
+        as never having happened, not silently retried or approximated).
+        """
         with self._lock:
             if not self.envelope.knows_agent(from_agent):
                 return False, f"unknown delegator agent '{from_agent}'"
