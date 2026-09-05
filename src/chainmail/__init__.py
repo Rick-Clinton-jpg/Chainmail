@@ -38,8 +38,9 @@ from .intent import IntentGraph, IntentGraphEntry, ReentryRisk
 from .redaction import scrub_pii
 from . import tracing
 from .persistence import (
-    AuditSink, HashChainLog, InMemoryKeyProvider, KeyProvider, ReceiptIntegrityError,
-    ReceiptVerification, RowIntegrityError, SQLiteStore, SchemaVersionError,
+    AuditSink, HashChainLog, InMemoryKeyProvider, InMemoryRollbackCheckpoint, KeyProvider,
+    ReceiptIntegrityError, ReceiptVerification, RollbackCheckpoint, RollbackDetectedError,
+    RowIntegrityError, SQLiteStore, SchemaVersionError,
 )
 from .quorum import (
     GovernorVote, LocalSingleGovernorTransport, QuorumAggregator, StaticPeerTransport,
@@ -74,6 +75,7 @@ __all__ = [
     # persistence
     "AuditSink", "HashChainLog", "SQLiteStore", "ReceiptVerification", "ReceiptIntegrityError",
     "SchemaVersionError", "KeyProvider", "InMemoryKeyProvider", "RowIntegrityError",
+    "RollbackCheckpoint", "InMemoryRollbackCheckpoint", "RollbackDetectedError",
     # quorum
     "QuorumAggregator", "GovernorVote", "VoteTransport", "LocalSingleGovernorTransport",
     "StaticPeerTransport",

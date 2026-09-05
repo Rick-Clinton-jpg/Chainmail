@@ -168,6 +168,67 @@ class InMemoryKeyProvider:
         self._current_id = key_id
 
 
+class RollbackDetectedError(ValueError):
+    """Raised at ``SQLiteStore`` construction when a configured
+    ``RollbackCheckpoint``'s recorded high-water mark is ahead of this
+    database file's own locally-recorded one -- this file is older than a
+    state the external checkpoint already saw committed, exactly what
+    restoring an earlier backup (a "rollback") looks like. Construction
+    fails closed, like ``SchemaVersionError``, rather than opening a
+    database whose own claimed progress cannot be trusted."""
+
+
+class RollbackCheckpoint(Protocol):
+    """A host-provided, externally-trusted monotonic high-water mark for
+    rollback detection (see docs/DURABILITY.md). Must be backed by storage
+    **outside** the SQLite file it protects -- a TPM/secure-enclave
+    monotonic counter, a remote attestation service, another local file
+    with its own integrity protection, or an operator-verified out-of-band
+    value. A purely local, in-process value cannot bootstrap this
+    guarantee on its own (see ``InMemoryRollbackCheckpoint``'s own
+    docstring, and docs/DURABILITY.md's explicit callout): if the attacker
+    can restore an old database file, they can equally well restore an old
+    copy of anything else stored next to it.
+    """
+
+    def read(self) -> int:
+        """Return the current external high-water mark."""
+        ...
+
+    def advance(self, new_value: int) -> None:
+        """Durably record ``new_value`` as the current high-water mark.
+        ``SQLiteStore`` never calls this with a value lower than what it
+        most recently read -- a well-behaved implementation still refuses
+        to move backward regardless, since nothing enforces that callers
+        are well-behaved."""
+        ...
+
+
+class InMemoryRollbackCheckpoint:
+    """A minimal, process-local ``RollbackCheckpoint`` -- state lives only
+    in this object's memory, never written anywhere outside this process.
+
+    **This does not provide real rollback protection.** It exists to
+    exercise the ``RollbackCheckpoint`` protocol and ``SQLiteStore``'s
+    wiring against it in tests, exactly like ``InMemoryKeyProvider`` is not
+    a real secret store. A real deployment needs a genuinely external
+    mechanism -- see docs/DURABILITY.md.
+    """
+
+    def __init__(self, initial: int = 0) -> None:
+        self._value = initial
+
+    def read(self) -> int:
+        return self._value
+
+    def advance(self, new_value: int) -> None:
+        if new_value < self._value:
+            raise ValueError(
+                f"rollback checkpoint cannot move backward: {new_value} < {self._value}"
+            )
+        self._value = new_value
+
+
 def _row_mac(key: bytes, *parts: Any) -> str:
     """HMAC-SHA256 over ``parts`` (each rendered as its own field, joined by
     a separator that cannot appear inside any individual ``str(part)`` for
@@ -409,10 +470,24 @@ class SQLiteStore:
     # caught -- that is the same rollback/truncation gap needing an
     # external checkpoint. Opt-in like v6-v8: only written to and verified
     # when a key_provider is configured.
-    SCHEMA_VERSION = 9
+    # v10: + rollback_checkpoint_state -- a single-row table recording this
+    # database file's own local rollback-checkpoint sequence number (see
+    # RollbackCheckpoint, InMemoryRollbackCheckpoint, RollbackDetectedError,
+    # advance_checkpoint). Opt-in like v6-v9: only meaningful when a
+    # rollback_checkpoint is configured; a fresh row (seq=0) is created
+    # unconditionally so the column always has a defined value to compare,
+    # but nothing reads or compares it unless rollback_checkpoint is set.
+    # This is the first (of two) pieces docs/DURABILITY.md's "host-provided
+    # monotonic checkpoint for rollback detection" section describes --
+    # see the docstrings on RollbackCheckpoint / advance_checkpoint for
+    # what's implemented and what a deployment must still decide for
+    # itself (which external mechanism to use, and how often to call
+    # advance_checkpoint -- there is no one-size-fits-all answer).
+    SCHEMA_VERSION = 10
 
     def __init__(self, db_path: str = ":memory:", *, synchronous: str = "FULL",
-                 key_provider: Optional[KeyProvider] = None) -> None:
+                 key_provider: Optional[KeyProvider] = None,
+                 rollback_checkpoint: Optional[RollbackCheckpoint] = None) -> None:
         if synchronous.upper() not in ("FULL", "NORMAL", "OFF"):
             raise ValueError(f"synchronous must be FULL, NORMAL, or OFF, got {synchronous!r}")
         self.db_path = db_path
@@ -422,6 +497,14 @@ class SQLiteStore:
         # KeyProvider, RowIntegrityError). None preserves exactly the
         # unauthenticated schema-v5 behaviour.
         self._key_provider = key_provider
+        # Optional: when set, this database's own recorded checkpoint
+        # sequence is compared against the external checkpoint's at
+        # construction (see _check_rollback_checkpoint), failing closed
+        # (RollbackDetectedError) if this file is behind it. None preserves
+        # the pre-v10 behaviour: no rollback detection at all (see
+        # docs/DURABILITY.md -- this was always explicitly out of scope
+        # for the row-level MAC/ledger work alone).
+        self._rollback_checkpoint = rollback_checkpoint
         # WAL + synchronous=NORMAL is the common performance-oriented combo,
         # but it can still lose the most recently committed transaction(s)
         # on an OS crash or power loss between the WAL write and its
@@ -697,6 +780,17 @@ class SQLiteStore:
                     UNIQUE (deployment_namespace, agent_id)
                 )
             """)
+            # This database file's own locally-recorded rollback-checkpoint
+            # sequence number -- see the v10 SCHEMA_VERSION comment above
+            # and RollbackCheckpoint / advance_checkpoint. Single row
+            # (id=1), created once with seq=0 and never re-created; only
+            # advance_checkpoint bumps it, always upward.
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS rollback_checkpoint_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    seq INTEGER NOT NULL
+                )
+            """)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS live_authority (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -755,6 +849,48 @@ class SQLiteStore:
             # key_provider attached).
             self._verify_ledger_chain()
             self._verify_restriction_ledger_chain()
+            self._check_rollback_checkpoint()
+
+    def _check_rollback_checkpoint(self) -> None:
+        """At construction, compare this database file's own locally-
+        recorded checkpoint sequence against the configured
+        ``RollbackCheckpoint``'s -- a no-op if none is configured (see
+        docs/DURABILITY.md: rollback detection is opt-in and requires a
+        genuinely external mechanism this repository does not ship).
+
+        Three cases:
+
+        * ``local == external``: consistent, nothing to do.
+        * ``local < external``: this file's own recorded progress is
+          *behind* what the external, trusted checkpoint has already seen
+          committed -- exactly what restoring an earlier (at-the-time
+          validly MAC'd) backup looks like. Raises ``RollbackDetectedError``
+          -- construction fails closed, like ``SchemaVersionError``.
+        * ``local > external``: NOT a rollback signal -- it means a
+          previous process committed local state (via
+          ``advance_checkpoint``) but crashed or failed before its second
+          phase (pushing the same value to the external checkpoint) ran.
+          Self-heals: advances the external checkpoint to match what is
+          already durably committed locally, rather than leaving the two
+          permanently out of sync after an ordinary crash.
+        """
+        if self._rollback_checkpoint is None:
+            return
+        row = self._conn.execute(
+            "SELECT seq FROM rollback_checkpoint_state WHERE id = 1"
+        ).fetchone()
+        local_seq = row[0] if row is not None else 0
+        external_seq = self._rollback_checkpoint.read()
+        if local_seq < external_seq:
+            raise RollbackDetectedError(
+                f"SQLite database {self.db_path!r} has local rollback-checkpoint "
+                f"seq={local_seq}, behind the external checkpoint's seq={external_seq} "
+                f"-- this file is older than a state already recorded as committed; "
+                f"refusing to open it (this is exactly what restoring an earlier "
+                f"backup looks like)"
+            )
+        if local_seq > external_seq:
+            self._rollback_checkpoint.advance(local_seq)
 
     def _rename_pre_v3_replay_tables(self, c: sqlite3.Connection) -> None:
         """Rename a pre-v3 (``scope``-column) replay table out of the way so
@@ -1502,6 +1638,69 @@ class SQLiteStore:
         with self._lock:
             self._verify_ledger_chain()
             self._verify_restriction_ledger_chain()
+
+    @property
+    def rollback_protected(self) -> bool:
+        """Whether a ``RollbackCheckpoint`` is configured (see
+        docs/DURABILITY.md). False means this store's row-level MAC/ledger
+        coverage (schema v6-v9) still detects tampering with individual
+        rows or their deletion, but a whole-database rollback to an
+        earlier, internally-valid backup is NOT detected -- see
+        ``ChainmailGovernor.security_report()``, which surfaces this."""
+        return self._rollback_checkpoint is not None
+
+    @property
+    def row_authentication_configured(self) -> bool:
+        """Whether a ``KeyProvider`` is configured (see docs/DURABILITY.md).
+        False means every durable row is read/written exactly as
+        unauthenticated schema-v5 ``SQLiteStore`` was -- no MAC is checked
+        or written, so a row edited, replaced, or inserted outside this
+        class's own write API is silently trusted."""
+        return self._key_provider is not None
+
+    def advance_checkpoint(self) -> int:
+        """Atomically bump this store's local rollback-checkpoint sequence,
+        then push the same new value to the external ``RollbackCheckpoint``.
+        Returns the new sequence number. Raises ``ValueError`` if no
+        ``rollback_checkpoint`` is configured -- there is nothing to
+        protect against rollback, so calling this is a caller bug.
+
+        Two-phase, in this order: the local bump commits first (a real,
+        atomic SQLite transaction); only then is the external checkpoint's
+        ``advance`` called with that exact value. If the external call then
+        fails or raises, the local sequence is already ahead of the
+        external checkpoint -- exactly the "crashed between phases" window
+        ``_check_rollback_checkpoint`` self-heals from on the next open
+        (advancing the external checkpoint to match, since local-ahead is
+        not itself a rollback signal), never a silent gap that looks like a
+        validated advance. This deliberately never advances the checkpoint
+        as a separate, unsynchronised write disconnected from what it
+        protects -- the pushed value is always exactly the value this call
+        just durably committed locally.
+
+        Callers decide how often to call this and after which writes --
+        there is no one-size-fits-all policy (a TPM counter increment may
+        be expensive or rate-limited; a remote attestation call may be
+        cheap and worth doing after every proposal). This method provides
+        the mechanism, not a policy for when to invoke it.
+        """
+        if self._rollback_checkpoint is None:
+            raise ValueError(
+                "advance_checkpoint() called without a rollback_checkpoint configured"
+            )
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT seq FROM rollback_checkpoint_state WHERE id = 1"
+            ).fetchone()
+            new_seq = (row[0] if row is not None else 0) + 1
+            self._conn.execute(
+                "INSERT INTO rollback_checkpoint_state (id, seq) VALUES (1, ?) "
+                "ON CONFLICT(id) DO UPDATE SET seq = excluded.seq",
+                (new_seq,),
+            )
+            self._conn.commit()
+        self._rollback_checkpoint.advance(new_seq)
+        return new_seq
 
     def _mark_agent_initialized(self, *, namespace: str, agent_id: str, now: float,
                                key_id: Optional[str], key: Optional[bytes]) -> bool:

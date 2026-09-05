@@ -677,7 +677,8 @@ def test_security_report_flags_defaults(make_governor):
 
 def test_security_report_clears_weaknesses_when_hardened(make_governor):
     from chainmail import (
-        AuditSink, CompositeVerifier, Decision, GovernorConfig, GovernorVote, KeyRegistry,
+        AuditSink, CompositeVerifier, Decision, GovernorConfig, GovernorVote,
+        InMemoryKeyProvider, InMemoryRollbackCheckpoint, KeyRegistry,
         QuorumAggregator, SQLiteStore, StaticPeerTransport,
     )
 
@@ -688,7 +689,10 @@ def test_security_report_clears_weaknesses_when_hardened(make_governor):
         quorum=QuorumAggregator(),
         quorum_transport=StaticPeerTransport(
             peer_votes=[GovernorVote("peer-1", Decision.CONTINUE, "peer agrees")]),
-        audit=AuditSink(sqlite_store=SQLiteStore()),
+        audit=AuditSink(sqlite_store=SQLiteStore(
+            key_provider=InMemoryKeyProvider("k1", b"secret-key-material"),
+            rollback_checkpoint=InMemoryRollbackCheckpoint(),
+        )),
     )
     report = g.security_report()
     assert report["signature_enforced"] is True
@@ -702,12 +706,59 @@ def test_security_report_clears_weaknesses_when_hardened(make_governor):
     # (the human-readable delegation log, not authoritative state) has no
     # durable-storage option yet, so its weakness is always present.
     assert report["durable_authority_and_budgets"] is True
+    assert report["row_authentication_configured"] is True
+    assert report["rollback_checkpoint_configured"] is True
     assert report["weaknesses"] == [
         "provenance (the human-readable delegation chain) is in-memory only "
         "with no durable-storage option yet -- a restart loses it; this does "
         "not affect the authoritative delegated-authority state itself, which "
         "is durable when a SQLiteStore is wired in -- see CHANGELOG.md"
     ]
+
+
+def test_security_report_distinguishes_row_authentication_from_rollback_protection(make_governor):
+    # A durable store with row authentication (key_provider) but no
+    # rollback_checkpoint must be flagged specifically for the missing
+    # rollback checkpoint -- never implying the keyed-MAC layer alone
+    # covers a whole-database rollback (see docs/DURABILITY.md).
+    from chainmail import AuditSink, InMemoryKeyProvider, SQLiteStore
+
+    g = make_governor(audit=AuditSink(sqlite_store=SQLiteStore(
+        key_provider=InMemoryKeyProvider("k1", b"secret-key-material"),
+    )))
+    report = g.security_report()
+    assert report["durable_authority_and_budgets"] is True
+    assert report["row_authentication_configured"] is True
+    assert report["rollback_checkpoint_configured"] is False
+    assert not any("not authenticated" in w for w in report["weaknesses"])
+    assert any("no rollback checkpoint is configured" in w for w in report["weaknesses"])
+
+
+def test_security_report_flags_missing_row_authentication_and_rollback_protection(make_governor):
+    from chainmail import AuditSink, SQLiteStore
+
+    g = make_governor(audit=AuditSink(sqlite_store=SQLiteStore()))
+    report = g.security_report()
+    assert report["durable_authority_and_budgets"] is True
+    assert report["row_authentication_configured"] is False
+    assert report["rollback_checkpoint_configured"] is False
+    assert any("not authenticated" in w for w in report["weaknesses"])
+    assert any("no rollback checkpoint is configured" in w for w in report["weaknesses"])
+
+
+def test_security_report_omits_row_authentication_and_rollback_fields_without_durable_storage(
+        make_governor):
+    # No SQLiteStore at all -- neither question applies (there is no
+    # durable row to authenticate or roll back), so both fields are None
+    # and neither weakness is added (the existing "durable storage is
+    # in-memory only" weaknesses already cover this case).
+    g = make_governor()
+    report = g.security_report()
+    assert report["durable_authority_and_budgets"] is False
+    assert report["row_authentication_configured"] is None
+    assert report["rollback_checkpoint_configured"] is None
+    assert not any("not authenticated" in w for w in report["weaknesses"])
+    assert not any("rollback checkpoint" in w for w in report["weaknesses"])
 
 
 def test_security_report_flags_quorum_with_only_echo_transport(make_governor):

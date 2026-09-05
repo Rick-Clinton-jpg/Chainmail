@@ -2,6 +2,71 @@
 
 ## Unreleased
 
+### Added — rollback-checkpoint mechanism (schema v10)
+
+Fifth and final slice of `docs/DURABILITY.md`'s keyed-integrity layer: a
+whole-database rollback (restoring an earlier, internally-valid backup) is
+now detectable, closing the one gap row-level MACs and the two hash-chained
+ledgers (schema v6-v9) cannot -- every row in a restored backup was validly
+written, just earlier, so nothing about the rows themselves looks wrong.
+
+New `rollback_checkpoint_state` table (schema v10, single row): this
+database file's own locally-recorded checkpoint sequence number. New
+`RollbackCheckpoint` protocol (`read()`/`advance()`, backed by storage
+*outside* the SQLite file), `InMemoryRollbackCheckpoint` (a reference
+implementation -- see the caveat below), `RollbackDetectedError`, and
+`SQLiteStore.advance_checkpoint()`:
+
+- `advance_checkpoint()` is a two-phase protocol: the local sequence bump
+  commits first (a real, atomic SQLite transaction), then that exact value
+  is pushed to the external checkpoint's `advance()`. A crash or failure
+  between the two phases leaves local ahead of external -- self-healed at
+  the next construction (not treated as rollback, since local-ahead means
+  "further along than the checkpoint currently knows", not "restored to an
+  earlier state").
+- At construction, `_check_rollback_checkpoint` compares local against
+  external: local < external raises `RollbackDetectedError` (construction
+  fails closed, like `SchemaVersionError`) -- exactly what restoring an
+  earlier backup looks like; local > external self-heals; local == external
+  is the steady state.
+- New `SQLiteStore.rollback_protected` / `row_authentication_configured`
+  properties, surfaced through `ChainmailGovernor.security_report()` as
+  `rollback_checkpoint_configured` / `row_authentication_configured`, with
+  new weaknesses when a durable store is wired in but either is missing --
+  deliberately worded so enabling row authentication alone is never mistaken
+  for rollback protection, and vice versa.
+
+**Important caveat, honestly documented (see updated `docs/DURABILITY.md`):**
+the checkpoint *mechanism* is implemented and correct, but
+`InMemoryRollbackCheckpoint` -- the only implementation this repository
+ships -- provides **no real protection**: its state lives in the same
+process as the database it's supposed to be independent of. A real
+deployment must supply its own `RollbackCheckpoint` backed by genuinely
+external, trusted state (a TPM/secure-enclave counter, a remote attestation
+service, an operator-verified value), and decide its own cadence for
+calling `advance_checkpoint()` -- this repository does not wire it into any
+write path automatically, since the right cadence depends entirely on the
+cost of whichever external mechanism a deployment actually has. Also
+documented as a real, current limitation: `rollback_checkpoint_state`'s
+sequence number is independent of the ledgers' own content, so it does not
+by itself close the `initialization_ledger`/`restriction_ledger`
+tip-deletion gap noted in the previous two commits -- a surgical, live edit
+to just the ledger's tip row leaves the checkpoint sequence untouched.
+
+Un-skips the three remaining tests in `tests/test_authority_integrity_spec.py`
+(`test_rollback_to_an_earlier_valid_database_is_detected_with_a_checkpoint_
+configured`, `test_rollback_without_a_configured_checkpoint_is_honestly_
+unsupported`, `test_checkpoint_advances_atomically_with_the_state_it_
+protects`) -- every test in that file is now un-skipped. New migration test
+proves a genuine pre-v10 database upgrades cleanly. New governor-level
+tests prove `security_report()` distinguishes row authentication from
+rollback protection rather than conflating them, and omits both fields
+entirely when no durable store is wired in at all.
+
+246 passed, 1 skipped (was 239/4 before this commit; the remaining skip is
+unrelated -- an optional embedding dependency not installed in this
+environment).
+
 ### Added — generalize the ledger fix to restrictions' status-flip gap (schema v9)
 
 Fourth slice of the tamper-detection layer: generalizes schema v8's

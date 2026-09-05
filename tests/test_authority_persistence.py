@@ -619,6 +619,32 @@ def test_v8_database_upgrades_to_v9_with_restriction_ledger_usable(tmp_path):
     store_v9.verify_integrity_ledger()
 
 
+def test_v9_database_upgrades_to_v10_with_rollback_checkpoint_state_usable(tmp_path):
+    """A v9 database (no rollback_checkpoint_state table at all) upgrades
+    to v10 by creating that table fresh, same as the earlier ledger
+    tables -- and a rollback_checkpoint attached afterwards can
+    immediately use it."""
+    from chainmail.persistence import InMemoryRollbackCheckpoint
+
+    db = str(tmp_path / "chainmail.db")
+    store_v9 = SQLiteStore(db)
+    store_v9._conn.execute("DROP TABLE rollback_checkpoint_state")
+    store_v9._conn.execute("UPDATE schema_version SET version = 9")
+    store_v9._conn.commit()
+    assert not store_v9._table_exists(store_v9._conn, "rollback_checkpoint_state")
+    store_v9.close()
+
+    checkpoint = InMemoryRollbackCheckpoint()
+    store_v10 = SQLiteStore(db, rollback_checkpoint=checkpoint)
+    assert store_v10._table_exists(store_v10._conn, "rollback_checkpoint_state")
+    assert store_v10.rollback_protected is True
+    # Fresh row (seq=0) matches the fresh checkpoint (0) -- no rollback,
+    # construction succeeded (already proven by reaching this line).
+    new_seq = store_v10.advance_checkpoint()
+    assert new_seq == 1
+    assert checkpoint.read() == 1
+
+
 # -- freshness rule: no previously-resolved Authority reused across hops/decisions --
 #
 # ChainmailGovernor._evaluate_locked() fetches live_auth/current_auth once,

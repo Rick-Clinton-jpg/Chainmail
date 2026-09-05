@@ -1,27 +1,28 @@
 """Executable specification for the keyed-authentication and
 rollback-detection layer described in docs/DURABILITY.md.
 
-Row-level MAC verification for ``live_authority``/``live_authority_agents``
-(step 1 of docs/DURABILITY.md's "Smallest correct next step") is now
-implemented -- see ``SQLiteStore``'s ``key_provider`` seam, ``KeyProvider``/
-``InMemoryKeyProvider``, ``RowIntegrityError``, and ``_verify_mac`` in
-``src/chainmail/persistence.py``. The un-skipped tests below (tamper
-detection, forged-mac rejection, the unauthenticated no-op path, mac staying
-current across ``consume_permission_budget``/``replace_live_authority``, and
-key rotation) exercise that implementation. What remains skipped is the
-deleted-marker gap (a per-row MAC cannot prove a row *used to exist*) and the
-entire rollback-checkpoint half, which needs new external infrastructure this
-repository does not ship -- design only, not implemented. Un-skip the rest
-one at a time as each piece lands; do not weaken an assertion to make it pass
-without the guarantee it names actually existing.
+Everything this file originally set out to pin down is now implemented:
+row-level MAC verification (schema v6-v7), the deleted-marker/status-flip
+ledger fixes (schema v8-v9), and the rollback checkpoint (schema v10) -- see
+``SQLiteStore``'s ``key_provider``/``rollback_checkpoint`` seams,
+``KeyProvider``/``InMemoryKeyProvider``, ``RollbackCheckpoint``/
+``InMemoryRollbackCheckpoint``, ``RowIntegrityError``/
+``RollbackDetectedError``, and their supporting methods in
+``src/chainmail/persistence.py``. Nothing in this file is skipped any more.
+Do not weaken an assertion to make it pass without the guarantee it names
+actually existing.
 """
 
 import hashlib
 import hmac
+import tempfile
 
 import pytest
 
-from chainmail.persistence import InMemoryKeyProvider, RowIntegrityError, SQLiteStore
+from chainmail.persistence import (
+    InMemoryKeyProvider, InMemoryRollbackCheckpoint, RollbackDetectedError,
+    RowIntegrityError, SQLiteStore,
+)
 
 
 def test_tampered_live_authority_row_is_rejected():
@@ -657,12 +658,8 @@ def test_replace_live_authority_first_time_init_also_writes_a_ledger_entry():
     assert store.is_authority_initialized(namespace="default", agent_id="agent_a") is True
 
 
-_STILL_DESIGN_ONLY = pytest.mark.skip(
-    reason="keyed authentication / rollback-checkpoint layer is design-only -- see docs/DURABILITY.md"
-)
+# -- rollback checkpoint (schema v10) ---------------------------------------
 
-
-@_STILL_DESIGN_ONLY
 def test_rollback_to_an_earlier_valid_database_is_detected_with_a_checkpoint_configured():
     """Restoring an older (at-the-time correctly MAC'd) copy of the database
     file, when a host-provided monotonic checkpoint is configured, must be
@@ -670,20 +667,85 @@ def test_rollback_to_an_earlier_valid_database_is_detected_with_a_checkpoint_con
     high-water mark is behind the external checkpoint's, and construction
     fails closed rather than silently accepting the older, valid-looking
     state."""
+    checkpoint = InMemoryRollbackCheckpoint()
+    db_path = ":memory:"
+    # Simulate the "earlier backup" directly against the checkpoint object
+    # (an in-memory :memory: SQLite database can't be file-copied the way a
+    # real deployment's on-disk backup would be, but the property under
+    # test -- local seq behind the external checkpoint's -- is identical
+    # either way): advance the external checkpoint ahead of what any local
+    # database has recorded, simulating a real deployment where later
+    # sessions advanced the checkpoint further than this (older, restored)
+    # copy of the database ever did.
+    store = SQLiteStore(db_path, rollback_checkpoint=checkpoint)
+    store.advance_checkpoint()
+    store.advance_checkpoint()
+    assert checkpoint.read() == 2
+
+    # A fresh connection to a fresh (local seq=0) database, with the
+    # checkpoint already ahead at 2 -- exactly what opening a restored,
+    # older backup looks like.
+    with pytest.raises(RollbackDetectedError):
+        SQLiteStore(":memory:", rollback_checkpoint=checkpoint)
 
 
-@_STILL_DESIGN_ONLY
 def test_rollback_without_a_configured_checkpoint_is_honestly_unsupported():
     """Without an external checkpoint configured, SQLiteStore must not claim
-    to detect rollback -- security_report() (or an equivalent) must say so
-    explicitly, rather than implying the keyed-MAC layer alone (which cannot
-    detect rollback -- see docs/DURABILITY.md) covers this case."""
+    to detect rollback -- rollback_protected (and, at the governor level,
+    security_report()) must say so explicitly, rather than implying the
+    keyed-MAC layer alone (which cannot detect rollback -- see
+    docs/DURABILITY.md) covers this case."""
+    store = SQLiteStore(":memory:", key_provider=InMemoryKeyProvider("k1", b"secret-key-material"))
+    assert store.row_authentication_configured is True
+    assert store.rollback_protected is False
+    with pytest.raises(ValueError):
+        store.advance_checkpoint()
 
 
-@_STILL_DESIGN_ONLY
 def test_checkpoint_advances_atomically_with_the_state_it_protects():
     """The external checkpoint must advance in the same logical step as the
     durable state it protects (e.g. within the same transaction, or with an
     explicit two-phase protocol that fails closed on a partial update) --
     never as a separate, unsynchronised write that could itself race and
     leave the checkpoint behind the state it's supposed to bound."""
+    checkpoint = InMemoryRollbackCheckpoint()
+    db_dir = tempfile.mkdtemp()
+    db_path = f"{db_dir}/chainmail.db"
+
+    store = SQLiteStore(db_path, rollback_checkpoint=checkpoint)
+    new_seq = store.advance_checkpoint()
+    assert new_seq == 1
+    assert checkpoint.read() == 1
+    local_seq = store._conn.execute(
+        "SELECT seq FROM rollback_checkpoint_state WHERE id = 1"
+    ).fetchone()[0]
+    assert local_seq == 1
+    store.close()
+
+    # Reopening against the same (already-advanced, consistent) checkpoint
+    # and database must not raise -- local and external agree.
+    SQLiteStore(db_path, rollback_checkpoint=checkpoint).close()
+
+    # Simulate the "crashed between advance_checkpoint's two phases"
+    # window directly: the local seq is durably ahead of what the external
+    # checkpoint object has recorded (as if a previous process's
+    # advance_checkpoint() call committed the local bump but crashed
+    # before its external advance() call landed). This is NOT a rollback
+    # signal -- the file is legitimately further along than the checkpoint
+    # currently knows -- so the next open must self-heal by pushing the
+    # checkpoint forward to match, never raise RollbackDetectedError
+    # (that's reserved for local BEHIND external).
+    behind_checkpoint = InMemoryRollbackCheckpoint(initial=0)
+    store2 = SQLiteStore(f"{db_dir}/chainmail2.db", rollback_checkpoint=behind_checkpoint)
+    store2.advance_checkpoint()
+    store2.advance_checkpoint()
+    store2.advance_checkpoint()
+    assert behind_checkpoint.read() == 3
+    store2.close()
+
+    # Reopen with a fresh checkpoint object that still reads 0 (simulating
+    # the external advance() calls above never having reached it).
+    lagging_checkpoint = InMemoryRollbackCheckpoint(initial=0)
+    store3 = SQLiteStore(f"{db_dir}/chainmail2.db", rollback_checkpoint=lagging_checkpoint)
+    assert lagging_checkpoint.read() == 3  # self-healed at construction, no exception
+    store3.close()
