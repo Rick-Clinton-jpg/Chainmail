@@ -460,6 +460,85 @@ def test_v5_database_upgrades_to_v6_with_mac_columns_usable(tmp_path):
     assert rows[0]["remaining"] == 5
 
 
+def test_v6_database_upgrades_to_v7_with_mac_columns_usable(tmp_path):
+    """A v6 database (restrictions/replay_nonces/replay_proposal_ids/
+    step_counters without mac/key_id columns -- only live_authority/
+    live_authority_agents had them at v6) upgrades to v7 by adding those
+    columns to the remaining tables -- purely additive, no data migration
+    -- and a key_provider attached afterwards can immediately read/write
+    authenticated rows against them."""
+    from chainmail.persistence import InMemoryKeyProvider
+
+    db = str(tmp_path / "chainmail.db")
+    store_v6 = SQLiteStore(db)
+    store_v6.impose_restriction(
+        namespace="default", agent_id="agent_research", permission_name="research",
+        permission_scope="*", permission_max_budget=None, reason_code="TEST",
+        source_proposal_id="p1", envelope_fingerprint="fp1", expiry_kind="human",
+        expiry_value=None,
+    )
+    # Simulate a genuine pre-v7 `restrictions` shape (no mac/key_id yet).
+    store_v6._conn.executescript("""
+        ALTER TABLE restrictions RENAME TO restrictions_v6;
+        CREATE TABLE restrictions (
+            restriction_id TEXT PRIMARY KEY,
+            deployment_namespace TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            permission_name TEXT NOT NULL,
+            permission_scope TEXT NOT NULL,
+            permission_max_budget INTEGER,
+            status TEXT NOT NULL,
+            reason_code TEXT NOT NULL,
+            source_proposal_id TEXT NOT NULL,
+            envelope_fingerprint TEXT,
+            expiry_kind TEXT NOT NULL,
+            expiry_value REAL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            cleared_by TEXT,
+            cleared_reason TEXT,
+            cleared_policy_version TEXT
+        );
+        INSERT INTO restrictions (restriction_id, deployment_namespace, agent_id,
+            permission_name, permission_scope, permission_max_budget, status,
+            reason_code, source_proposal_id, envelope_fingerprint, expiry_kind,
+            expiry_value, created_at, updated_at, cleared_by, cleared_reason,
+            cleared_policy_version)
+        SELECT restriction_id, deployment_namespace, agent_id, permission_name,
+            permission_scope, permission_max_budget, status, reason_code,
+            source_proposal_id, envelope_fingerprint, expiry_kind, expiry_value,
+            created_at, updated_at, cleared_by, cleared_reason, cleared_policy_version
+        FROM restrictions_v6;
+        DROP TABLE restrictions_v6;
+    """)
+    store_v6._conn.execute("UPDATE schema_version SET version = 6")
+    store_v6._conn.commit()
+    cols_before = {row[1] for row in
+                   store_v6._conn.execute("PRAGMA table_info(restrictions)").fetchall()}
+    assert "mac" not in cols_before
+    store_v6.close()
+
+    key_provider = InMemoryKeyProvider("k1", b"secret-key-material")
+    store_v7 = SQLiteStore(db, key_provider=key_provider)
+    cols_after = {row[1] for row in
+                  store_v7._conn.execute("PRAGMA table_info(restrictions)").fetchall()}
+    assert {"mac", "key_id"} <= cols_after
+    # Pre-existing v6 row has no mac -- reading it now that authentication
+    # is turned on must fail closed, not silently trust it.
+    with pytest.raises(sqlite3.Error):
+        store_v7.active_restrictions(namespace="default", agent_id="agent_research")
+    # A freshly-imposed restriction is authenticated and readable.
+    store_v7.impose_restriction(
+        namespace="default", agent_id="agent_research", permission_name="research",
+        permission_scope="*", permission_max_budget=None, reason_code="TEST2",
+        source_proposal_id="p2", envelope_fingerprint="fp2", expiry_kind="human",
+        expiry_value=None,
+    )
+    assert len(store_v7._conn.execute(
+        "SELECT 1 FROM restrictions WHERE reason_code = 'TEST2'"
+    ).fetchall()) == 1
+
+
 # -- freshness rule: no previously-resolved Authority reused across hops/decisions --
 #
 # ChainmailGovernor._evaluate_locked() fetches live_auth/current_auth once,

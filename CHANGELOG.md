@@ -2,6 +2,55 @@
 
 ## Unreleased
 
+### Added — keyed row authentication for restrictions, replay tables, and step_counters (schema v7)
+
+Second slice of the tamper-detection layer, extending schema v6's
+`live_authority`/`live_authority_agents` row authentication to every
+remaining table `SQLiteStore` treats as authoritative state:
+`restrictions`, `replay_nonces`, `replay_proposal_ids`, `step_counters`.
+Same opt-in, purely-additive shape (`mac`/`key_id` -- `mac_key_id` on
+`replay_nonces`, which already has an unrelated `key_id` column for the
+signing key that verified the claimed proposal's signature) and same
+fail-closed contract (`RowIntegrityError`, a `sqlite3.Error` subclass) as
+v6.
+
+- `active_restrictions` verifies the MAC on every ACTIVE row it returns;
+  `impose_restriction`/`mark_expired`/`clear_restriction` write or refresh
+  a valid MAC on every write, including the ACTIVE -> EXPIRED/CLEARED
+  transitions.
+- `claim_nonce`/`claim_proposal_id` write a MAC on a new claim, and now
+  verify the *existing* row when a claim hits the UNIQUE conflict --
+  a row an attacker planted to pre-emptively block a nonce/proposal_id a
+  legitimate agent hasn't used yet no longer looks like a genuine prior
+  claim.
+- `increment_step_counter`/`peek_step_counter` verify the pre-existing
+  count before building on top of it (so a count reset to renew a step
+  budget is caught) and refresh the MAC after every increment, inside the
+  same transaction as the increment itself.
+
+Honestly documented, not claimed as closed (see updated
+`docs/DURABILITY.md`): `active_restrictions` filters on
+`status = 'ACTIVE'` in SQL *before* any MAC is checked, so an attacker who
+flips an ACTIVE row's `status` column directly (rather than editing one of
+the columns the query still returns) makes it vanish from the result
+silently -- the same category of gap as a deleted
+`live_authority_agents` marker. New test
+`test_restriction_status_flip_bypasses_mac_verification_known_gap` pins
+this down explicitly rather than leaving it merely described in prose.
+
+New migration test `test_v6_database_upgrades_to_v7_with_mac_columns_
+usable` proves a genuine pre-v7 `restrictions` table upgrades cleanly and
+that attaching a `key_provider` afterwards fails closed on a pre-existing
+unauthenticated row.
+
+9 new tests in `tests/test_authority_integrity_spec.py` (tampered/forged
+rows for restrictions, replay_nonces, replay_proposal_ids, and
+step_counters; the documented status-flip gap; transition/rotation/
+non-adversarial regression coverage), plus the migration test above in
+`tests/test_authority_persistence.py`.
+
+225 passed, 5 skipped (was 215/5 before this commit).
+
 ### Added — keyed row authentication for durable live authority (schema v6)
 
 First implemented slice of the tamper-detection layer `docs/DURABILITY.md`

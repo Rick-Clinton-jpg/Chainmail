@@ -1,16 +1,19 @@
 # Durability integrity: keyed authentication and rollback detection
 
-Status: **partially implemented.** Row-level keyed authentication for
-`live_authority`/`live_authority_agents` (schema v6: `mac`/`key_id` columns,
-`SQLiteStore(key_provider=...)`, `KeyProvider`/`InMemoryKeyProvider`,
-`RowIntegrityError`) is done and covered by the un-skipped tests in
-`tests/test_authority_integrity_spec.py`. Still not implemented: the deleted
--marker gap (see "What this layer would still NOT guarantee" below) and the
-entire rollback-checkpoint half, which needs external infrastructure this
-repository does not ship. This document specifies what the remaining piece
-of the keyed-integrity layer would need to guarantee, why it is a separate
-piece of work from the durable-authority/budget persistence it builds on, and
-what it can and cannot honestly promise. The still-skipped tests in
+Status: **partially implemented.** Row-level keyed authentication now covers
+every table `SQLiteStore` treats as authoritative state: `live_authority`/
+`live_authority_agents` (schema v6), and `restrictions`/`replay_nonces`/
+`replay_proposal_ids`/`step_counters` (schema v7) -- `SQLiteStore(key_provider
+=...)`, `KeyProvider`/`InMemoryKeyProvider`, `RowIntegrityError` -- covered by
+the un-skipped tests in `tests/test_authority_integrity_spec.py`. Still not
+implemented: the deleted-marker/status-flip gap (see "What this layer would
+still NOT guarantee" below, and the "known gap" tests in
+`tests/test_authority_integrity_spec.py`) and the entire rollback-checkpoint
+half, which needs external infrastructure this repository does not ship.
+This document specifies what the remaining piece of the keyed-integrity
+layer would need to guarantee, why it is a separate piece of work from the
+durable-authority/budget persistence it builds on, and what it can and
+cannot honestly promise. The still-skipped tests in
 `tests/test_authority_integrity_spec.py` (not deleted) pin down what "done"
 looks like for the rest.
 
@@ -46,22 +49,24 @@ reviewable properties (durability vs. tamper-evidence) into one commit.
 
 ### 1. Keyed authentication of durable rows
 
-**Implemented for `live_authority`/`live_authority_agents`.** Every row
-`SQLiteStore` treats as authoritative state would ideally carry an HMAC
-computed over its own authoritative columns, keyed by a secret held
-**outside the SQLite file** (an environment variable, an OS keyring entry,
-or an external KMS -- never a column in the same database) -- so far this
-covers `live_authority`/`live_authority_agents` only; `restrictions`,
-`replay_nonces`, `replay_proposal_ids`, and `step_counters` remain
-unauthenticated and are the natural next slices of this same work, each its
-own reviewable commit for the same reason this file was split from the
-schema-v5 work in the first place. `get_live_authority_rows` and
-`is_authority_initialized` recompute the MAC on every read and raise
+**Implemented for every authoritative table.** Every row `SQLiteStore`
+treats as authoritative state -- `live_authority`/`live_authority_agents`
+(schema v6), `restrictions`/`replay_nonces`/`replay_proposal_ids`/
+`step_counters` (schema v7) -- carries an HMAC computed over its own
+authoritative columns, keyed by a secret held **outside the SQLite file**
+(an environment variable, an OS keyring entry, or an external KMS -- never a
+column in the same database, via `SQLiteStore(key_provider=...)`).
+`get_live_authority_rows`, `is_authority_initialized`, `active_restrictions`,
+and `peek_step_counter` recompute the MAC on every read and raise
 `RowIntegrityError` (a `sqlite3.Error` subclass, so it fails closed exactly
 like every other durable-store failure `ChainmailGovernor` already handles)
-on a mismatch; `initialize_agent_authority`, `replace_live_authority`, and
-`consume_permission_budget` write/refresh a valid MAC on every authoritative
-write, in the same transaction as the write itself.
+on a mismatch; `claim_nonce`/`claim_proposal_id` verify the *existing* row
+when a claim conflicts, so a forged "already claimed" row cannot be trusted
+as a genuine prior claim. Every write path (`initialize_agent_authority`,
+`replace_live_authority`, `consume_permission_budget`, `impose_restriction`,
+`mark_expired`, `clear_restriction`, `claim_nonce`, `claim_proposal_id`,
+`increment_step_counter`) writes or refreshes a valid MAC in the same
+transaction as the write itself.
 
 This detects: a row edited directly with a SQLite client or a raw file
 editor, a row deleted and replaced with a forged one, and a row inserted
@@ -69,16 +74,28 @@ without going through `SQLiteStore`'s own write API. It does **not** detect
 an edit made by someone who also has the key (the key, not the schema, is
 the trust boundary) -- key custody outside the application is what this
 buys you, not protection against a fully compromised host. It also does
-**not** detect a row being deleted and simply left absent (as opposed to
-replaced) -- for `live_authority_agents`'s initialization marker specifically,
-that gap is real and still open (see `test_deleted_row_is_indistinguishable_
-from_never_having_existed_today_but_wont_be`, still skipped): a marker row's
-own MAC proves the row wasn't tampered with while it existed, not that it
-should still exist. Closing that needs the same kind of durable,
-independently-verifiable "this happened" record `HashChainLog` already
-provides for the audit trail -- cross-referencing against it, or an
-equivalent append-only ledger, rather than anything a per-row MAC alone can
-provide.
+**not** detect a row being deleted, or otherwise made to vanish from the
+specific query a decision reads, rather than edited in place. Two concrete,
+still-open instances of that same gap:
+
+- `live_authority_agents`'s initialization marker: deleting the marker row
+  and re-initializing looks identical to a genuine first-ever startup (see
+  `test_deleted_row_is_indistinguishable_from_never_having_existed_today_
+  but_wont_be`, still skipped) -- a marker row's own MAC proves the row
+  wasn't tampered with while it existed, not that it should still exist.
+- `restrictions`: `active_restrictions` filters on `status = 'ACTIVE'` in
+  SQL before any MAC is checked, so flipping an ACTIVE row's `status`
+  column directly (rather than one of the columns the query still returns)
+  makes it vanish from the result silently, with no `RowIntegrityError`
+  raised (see `test_restriction_status_flip_bypasses_mac_verification_
+  known_gap`, un-skipped and passing -- it pins down the gap itself, not a
+  guarantee). The MAC still catches a forged *new* ACTIVE restriction or an
+  edited-in-place ACTIVE row.
+
+Closing either needs the same kind of durable, independently-verifiable
+"this happened" record `HashChainLog` already provides for the audit trail
+-- cross-referencing against it, or an equivalent append-only ledger, rather
+than anything a per-row MAC alone can provide.
 
 ### 2. A host-provided monotonic checkpoint for rollback detection
 
@@ -131,13 +148,12 @@ design could provide one.
 
 1. ~~Land `tests/test_authority_integrity_spec.py`'s tests un-skipped, one at
    a time, starting with row-level MAC verification~~ -- done for
-   `live_authority`/`live_authority_agents` (schema v6). Still to un-skip,
-   in order of how self-contained each is: (a) `restrictions`/
-   `replay_nonces`/`replay_proposal_ids`/`step_counters` MAC coverage, using
-   the same `key_provider`/`_verify_mac` pattern already landed; (b) the
-   deleted-marker gap, which needs a design decision first (see above) about
-   how to detect an *absent* row, not just a tampered one; (c) rollback
-   detection, below.
+   `live_authority`/`live_authority_agents` (schema v6) and for
+   `restrictions`/`replay_nonces`/`replay_proposal_ids`/`step_counters`
+   (schema v7). Still to un-skip: (a) the deleted-marker/status-flip gap,
+   which needs a design decision first (see above) about how to detect a
+   row made to vanish from a query, not just one that's tampered but still
+   returned; (b) rollback detection, below.
 2. ~~Add a `key_provider` seam to `SQLiteStore.__init__`~~ -- done:
    `KeyProvider` (protocol) / `InMemoryKeyProvider` (a process-local
    reference implementation for tests and single-process deployments; a

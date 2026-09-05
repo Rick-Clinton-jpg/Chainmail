@@ -348,13 +348,26 @@ class SQLiteStore:
     # (see KeyProvider, RowIntegrityError, docs/DURABILITY.md). Purely
     # additive columns, both nullable: a SQLiteStore opened without a
     # `key_provider` reads/writes these tables exactly as it did at v5 (mac
-    # and key_id simply stay NULL). This is the first, narrowest slice of
-    # the tamper-detection layer docs/DURABILITY.md describes -- it covers
+    # and key_id simply stay NULL). This was the first, narrowest slice of
+    # the tamper-detection layer docs/DURABILITY.md describes -- it covered
     # only live_authority/live_authority_agents, not restrictions or the
     # replay tables, and it does not address rollback-to-an-older-database
     # (see docs/DURABILITY.md's "Smallest correct next step" for the
     # deliberately staged remainder).
-    SCHEMA_VERSION = 6
+    # v7: + restrictions.mac/key_id, replay_proposal_ids.mac/key_id,
+    # replay_nonces.mac/mac_key_id (named mac_key_id, not key_id --
+    # replay_nonces already has a `key_id` column recording the signing key
+    # that verified the claimed proposal's signature; that is a different
+    # concept from the MAC key authenticating this row, so it gets its own
+    # column rather than overloading the existing one), step_counters.mac/
+    # key_id. Same opt-in, purely-additive shape as v6: a SQLiteStore
+    # without a key_provider is unaffected. See active_restrictions /
+    # claim_nonce / claim_proposal_id / peek_step_counter /
+    # increment_step_counter for what's verified and, just as importantly,
+    # what still is not (a restriction's `status` column is not part of its
+    # MAC -- see the comment on impose_restriction/_verify_mac's caller
+    # there for why that's a real, documented gap, not an oversight).
+    SCHEMA_VERSION = 7
 
     def __init__(self, db_path: str = ":memory:", *, synchronous: str = "FULL",
                  key_provider: Optional[KeyProvider] = None) -> None:
@@ -421,7 +434,14 @@ class SQLiteStore:
                 # the record that must survive a migration.
                 logger.info("migrating SQLiteStore schema %s -> %s", row[0], self.SCHEMA_VERSION)
                 self._rename_pre_v3_replay_tables(c)
-                self._add_v6_mac_columns(c)
+                if row[0] < 6:
+                    self._add_mac_columns(c, "live_authority_agents")
+                    self._add_mac_columns(c, "live_authority")
+                if row[0] < 7:
+                    self._add_mac_columns(c, "restrictions")
+                    self._add_mac_columns(c, "replay_proposal_ids")
+                    self._add_mac_columns(c, "replay_nonces", key_id_column="mac_key_id")
+                    self._add_mac_columns(c, "step_counters")
                 c.execute("UPDATE schema_version SET version = ?", (self.SCHEMA_VERSION,))
                 migrating = True
             c.execute("""
@@ -473,6 +493,8 @@ class SQLiteStore:
                     key_id TEXT,
                     envelope_fingerprint TEXT,
                     claimed_at REAL NOT NULL,
+                    mac TEXT,
+                    mac_key_id TEXT,
                     UNIQUE (deployment_namespace, agent_id, nonce)
                 )
             """)
@@ -484,6 +506,8 @@ class SQLiteStore:
                     agent_id TEXT NOT NULL,
                     envelope_fingerprint TEXT,
                     claimed_at REAL NOT NULL,
+                    mac TEXT,
+                    key_id TEXT,
                     UNIQUE (deployment_namespace, proposal_id)
                 )
             """)
@@ -519,7 +543,9 @@ class SQLiteStore:
                     updated_at REAL NOT NULL,
                     cleared_by TEXT,
                     cleared_reason TEXT,
-                    cleared_policy_version TEXT
+                    cleared_policy_version TEXT,
+                    mac TEXT,
+                    key_id TEXT
                 )
             """)
             c.execute("""
@@ -609,6 +635,8 @@ class SQLiteStore:
                     scope TEXT NOT NULL,
                     count INTEGER NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL,
+                    mac TEXT,
+                    key_id TEXT,
                     PRIMARY KEY (deployment_namespace, scope)
                 )
             """)
@@ -645,20 +673,21 @@ class SQLiteStore:
             if "scope" in cols:
                 c.execute(f"ALTER TABLE {table} RENAME TO {table}_pre_v3")
 
-    def _add_v6_mac_columns(self, c: sqlite3.Connection) -> None:
-        """Additively add the v6 ``mac``/``key_id`` columns to an
-        existing (pre-v6) ``live_authority``/``live_authority_agents``
-        table. A no-op for a fresh database (created with the columns
-        already present by the ``CREATE TABLE`` statements above) or one
-        already at v6+ (columns already exist)."""
-        for table in ("live_authority_agents", "live_authority"):
-            if not self._table_exists(c, table):
-                continue
-            cols = {row[1] for row in c.execute(f"PRAGMA table_info({table})").fetchall()}
-            if "mac" not in cols:
-                c.execute(f"ALTER TABLE {table} ADD COLUMN mac TEXT")
-            if "key_id" not in cols:
-                c.execute(f"ALTER TABLE {table} ADD COLUMN key_id TEXT")
+    def _add_mac_columns(self, c: sqlite3.Connection, table: str, *,
+                        key_id_column: str = "key_id") -> None:
+        """Additively add a ``mac`` column and a MAC key-id column (named
+        ``key_id_column`` -- ``replay_nonces`` already has an unrelated
+        ``key_id`` column, so it uses ``mac_key_id`` instead) to an
+        existing pre-authentication table. A no-op for a fresh database
+        (created with the columns already present by the ``CREATE TABLE``
+        statements below) or one where the columns already exist."""
+        if not self._table_exists(c, table):
+            return
+        cols = {row[1] for row in c.execute(f"PRAGMA table_info({table})").fetchall()}
+        if "mac" not in cols:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN mac TEXT")
+        if key_id_column not in cols:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {key_id_column} TEXT")
 
     def _migrate_replay_data_from_v2(self, c: sqlite3.Connection) -> None:
         """Copy claim rows forward from a table renamed by
@@ -785,18 +814,43 @@ class SQLiteStore:
         the caller must treat that as a persistence failure and fail closed,
         not as "not a replay".
         """
+        mac_key_id, mac_key = self._signing_key()
         with self._lock:
+            claimed_at = time.time()
+            mac = (
+                _row_mac(mac_key, namespace, agent_id, nonce, claimed_at)
+                if mac_key is not None else None
+            )
             try:
                 self._conn.execute(
                     "INSERT INTO replay_nonces "
                     "(deployment_namespace, agent_id, nonce, key_id, envelope_fingerprint, "
-                    "claimed_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (namespace, agent_id, nonce, key_id, envelope_fingerprint, time.time()),
+                    "claimed_at, mac, mac_key_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (namespace, agent_id, nonce, key_id, envelope_fingerprint, claimed_at,
+                     mac, mac_key_id),
                 )
                 self._conn.commit()
                 return True
             except sqlite3.IntegrityError:
                 self._conn.rollback()
+                # Already claimed -- verify the existing claim itself wasn't
+                # forged (inserted without going through this method) before
+                # trusting it as a genuine replay signal. A row an attacker
+                # planted to pre-emptively block a nonce a legitimate agent
+                # hasn't used yet would otherwise look identical to a real
+                # replay.
+                row = self._conn.execute(
+                    "SELECT nonce, claimed_at, mac, mac_key_id FROM replay_nonces WHERE "
+                    "deployment_namespace = ? AND agent_id = ? AND nonce = ?",
+                    (namespace, agent_id, nonce),
+                ).fetchone()
+                if row is not None:
+                    existing_nonce, existing_claimed_at, existing_mac, existing_key_id = row
+                    self._verify_mac(
+                        stored_mac=existing_mac, key_id=existing_key_id,
+                        parts=(namespace, agent_id, existing_nonce, existing_claimed_at),
+                        context=f"replay_nonces({namespace!r}, {agent_id!r}, {nonce!r})",
+                    )
                 return False
 
     def claim_proposal_id(self, *, namespace: str, proposal_id: str, agent_id: str,
@@ -806,18 +860,39 @@ class SQLiteStore:
         Uniqueness is ``(namespace, proposal_id)`` only. Same return/exception
         contract as ``claim_nonce``.
         """
+        key_id, key = self._signing_key()
         with self._lock:
+            claimed_at = time.time()
+            mac = (
+                _row_mac(key, namespace, proposal_id, agent_id, claimed_at)
+                if key is not None else None
+            )
             try:
                 self._conn.execute(
                     "INSERT INTO replay_proposal_ids "
                     "(deployment_namespace, proposal_id, agent_id, envelope_fingerprint, "
-                    "claimed_at) VALUES (?, ?, ?, ?, ?)",
-                    (namespace, proposal_id, agent_id, envelope_fingerprint, time.time()),
+                    "claimed_at, mac, key_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (namespace, proposal_id, agent_id, envelope_fingerprint, claimed_at,
+                     mac, key_id),
                 )
                 self._conn.commit()
                 return True
             except sqlite3.IntegrityError:
                 self._conn.rollback()
+                # Same rationale as claim_nonce: verify the existing claim
+                # wasn't forged before trusting it as a genuine replay.
+                row = self._conn.execute(
+                    "SELECT proposal_id, agent_id, claimed_at, mac, key_id FROM "
+                    "replay_proposal_ids WHERE deployment_namespace = ? AND proposal_id = ?",
+                    (namespace, proposal_id),
+                ).fetchone()
+                if row is not None:
+                    existing_pid, existing_agent, existing_claimed_at, existing_mac, existing_key_id = row
+                    self._verify_mac(
+                        stored_mac=existing_mac, key_id=existing_key_id,
+                        parts=(namespace, existing_pid, existing_agent, existing_claimed_at),
+                        context=f"replay_proposal_ids({namespace!r}, {proposal_id!r})",
+                    )
                 return False
 
     # -- durable restriction state --------------------------------------
@@ -835,6 +910,31 @@ class SQLiteStore:
     # effect when imposed / cleared), never part of how a restriction is
     # looked up.
 
+    @staticmethod
+    def _restriction_mac_parts(*, namespace: str, agent_id: str, restriction_id: str,
+                              permission_name: str, permission_scope: str,
+                              permission_max_budget: Optional[int], expiry_kind: str,
+                              expiry_value: Optional[float], status: str) -> Tuple[Any, ...]:
+        """The MAC content for one ``restrictions`` row. Includes ``status``
+        so a legitimate ACTIVE -> EXPIRED/CLEARED transition (which changes
+        it) always carries a mac matching its *current* status -- but see
+        ``active_restrictions``: because that query filters on
+        ``status = 'ACTIVE'`` before any mac is checked, an attacker who
+        flips an ACTIVE row's status column directly makes it vanish from
+        the result set entirely, never reaching verification at all. That
+        is the same category of gap as a deleted ``live_authority_agents``
+        marker (see docs/DURABILITY.md) -- this MAC still detects a forged
+        *new* ACTIVE restriction, or edits to an ACTIVE row's other fields,
+        just not an ACTIVE row silently switched to look already-inactive.
+        """
+        return (namespace, agent_id, restriction_id, permission_name, permission_scope,
+                permission_max_budget, expiry_kind, expiry_value, status)
+
+    def _restriction_mac(self, key: Optional[bytes], **kwargs: Any) -> Optional[str]:
+        if key is None:
+            return None
+        return _row_mac(key, *self._restriction_mac_parts(**kwargs))
+
     def impose_restriction(self, *, namespace: str, agent_id: str, permission_name: str,
                            permission_scope: str, permission_max_budget: Optional[int],
                            reason_code: str, source_proposal_id: str,
@@ -847,17 +947,24 @@ class SQLiteStore:
         """
         restriction_id = secrets.token_hex(16)
         now = time.time()
+        key_id, key = self._signing_key()
+        mac = self._restriction_mac(
+            key, namespace=namespace, agent_id=agent_id, restriction_id=restriction_id,
+            permission_name=permission_name, permission_scope=permission_scope,
+            permission_max_budget=permission_max_budget, expiry_kind=expiry_kind,
+            expiry_value=expiry_value, status="ACTIVE",
+        )
         with self._lock:
             try:
                 self._conn.execute(
                     "INSERT INTO restrictions (restriction_id, deployment_namespace, agent_id, "
                     "permission_name, permission_scope, permission_max_budget, status, "
                     "reason_code, source_proposal_id, envelope_fingerprint, expiry_kind, "
-                    "expiry_value, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?)",
+                    "expiry_value, created_at, updated_at, mac, key_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (restriction_id, namespace, agent_id, permission_name, permission_scope,
                      permission_max_budget, reason_code, source_proposal_id, envelope_fingerprint,
-                     expiry_kind, expiry_value, now, now),
+                     expiry_kind, expiry_value, now, now, mac, key_id),
                 )
                 self._conn.execute(
                     "INSERT INTO restriction_events (restriction_id, deployment_namespace, "
@@ -884,12 +991,29 @@ class SQLiteStore:
         with self._lock:
             cur = self._conn.execute(
                 "SELECT restriction_id, permission_name, permission_scope, "
-                "permission_max_budget, expiry_kind, expiry_value FROM restrictions "
-                "WHERE deployment_namespace = ? AND agent_id = ? AND status = 'ACTIVE'",
+                "permission_max_budget, expiry_kind, expiry_value, mac, key_id FROM "
+                "restrictions WHERE deployment_namespace = ? AND agent_id = ? "
+                "AND status = 'ACTIVE'",
                 (namespace, agent_id),
             )
             cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, row)) for row in cur.fetchall()]
+            rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+            for row in rows:
+                self._verify_mac(
+                    stored_mac=row["mac"], key_id=row["key_id"],
+                    parts=self._restriction_mac_parts(
+                        namespace=namespace, agent_id=agent_id,
+                        restriction_id=row["restriction_id"],
+                        permission_name=row["permission_name"],
+                        permission_scope=row["permission_scope"],
+                        permission_max_budget=row["permission_max_budget"],
+                        expiry_kind=row["expiry_kind"], expiry_value=row["expiry_value"],
+                        status="ACTIVE",
+                    ),
+                    context=f"restrictions({namespace!r}, {agent_id!r}, {row['restriction_id']!r})",
+                )
+                del row["mac"], row["key_id"]
+            return rows
 
     def mark_expired(self, *, namespace: str, agent_id: str, restriction_id: str) -> bool:
         """Atomically transition one restriction ACTIVE -> EXPIRED.
@@ -899,6 +1023,7 @@ class SQLiteStore:
         already-cleared/expired restriction, only on a genuine store error.
         """
         now = time.time()
+        key_id, key = self._signing_key()
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE restrictions SET status = 'EXPIRED', updated_at = ? "
@@ -908,14 +1033,26 @@ class SQLiteStore:
             )
             if cur.rowcount:
                 row = self._conn.execute(
-                    "SELECT permission_name, permission_scope FROM restrictions "
-                    "WHERE restriction_id = ?", (restriction_id,),
+                    "SELECT permission_name, permission_scope, permission_max_budget, "
+                    "expiry_kind, expiry_value FROM restrictions WHERE restriction_id = ?",
+                    (restriction_id,),
                 ).fetchone()
+                perm_name, perm_scope, perm_max_budget, expiry_kind, expiry_value = row
+                new_mac = self._restriction_mac(
+                    key, namespace=namespace, agent_id=agent_id, restriction_id=restriction_id,
+                    permission_name=perm_name, permission_scope=perm_scope,
+                    permission_max_budget=perm_max_budget, expiry_kind=expiry_kind,
+                    expiry_value=expiry_value, status="EXPIRED",
+                )
+                self._conn.execute(
+                    "UPDATE restrictions SET mac = ?, key_id = ? WHERE restriction_id = ?",
+                    (new_mac, key_id, restriction_id),
+                )
                 self._conn.execute(
                     "INSERT INTO restriction_events (restriction_id, deployment_namespace, "
                     "agent_id, event_type, permission_name, permission_scope, timestamp) "
                     "VALUES (?, ?, ?, 'EXPIRED', ?, ?, ?)",
-                    (restriction_id, namespace, agent_id, row[0], row[1], now),
+                    (restriction_id, namespace, agent_id, perm_name, perm_scope, now),
                 )
             self._conn.commit()
             return bool(cur.rowcount)
@@ -938,6 +1075,7 @@ class SQLiteStore:
                                       a different agent_id
         """
         now = time.time()
+        key_id, key = self._signing_key()
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE restrictions SET status = 'CLEARED', updated_at = ?, cleared_by = ?, "
@@ -947,14 +1085,27 @@ class SQLiteStore:
             )
             if cur.rowcount:
                 row = self._conn.execute(
-                    "SELECT permission_name, permission_scope FROM restrictions "
-                    "WHERE restriction_id = ?", (restriction_id,),
+                    "SELECT permission_name, permission_scope, permission_max_budget, "
+                    "expiry_kind, expiry_value FROM restrictions WHERE restriction_id = ?",
+                    (restriction_id,),
                 ).fetchone()
+                perm_name, perm_scope, perm_max_budget, expiry_kind, expiry_value = row
+                new_mac = self._restriction_mac(
+                    key, namespace=namespace, agent_id=agent_id, restriction_id=restriction_id,
+                    permission_name=perm_name, permission_scope=perm_scope,
+                    permission_max_budget=perm_max_budget, expiry_kind=expiry_kind,
+                    expiry_value=expiry_value, status="CLEARED",
+                )
+                self._conn.execute(
+                    "UPDATE restrictions SET mac = ?, key_id = ? WHERE restriction_id = ?",
+                    (new_mac, key_id, restriction_id),
+                )
                 self._conn.execute(
                     "INSERT INTO restriction_events (restriction_id, deployment_namespace, "
                     "agent_id, event_type, permission_name, permission_scope, actor, detail, "
                     "timestamp) VALUES (?, ?, ?, 'CLEARED', ?, ?, ?, ?, ?)",
-                    (restriction_id, namespace, agent_id, row[0], row[1], authorised_by, reason, now),
+                    (restriction_id, namespace, agent_id, perm_name, perm_scope, authorised_by,
+                     reason, now),
                 )
                 self._conn.commit()
                 return "cleared"
@@ -1240,7 +1391,28 @@ class SQLiteStore:
         from multiple processes safely serialised rather than lost.
         """
         now = time.time()
+        key_id, key = self._signing_key()
         with self._lock:
+            if key is not None:
+                # Verify the pre-increment row (if any) before building on
+                # top of it -- a tampered count (e.g. reset to 0 to renew a
+                # step budget) must be caught here, not silently
+                # incremented from the forged value. This SELECT doesn't
+                # reintroduce a check-then-write race for the counter
+                # itself: the increment below remains a single atomic
+                # UPSERT, this only decides whether to trust what it's
+                # incrementing from.
+                existing = self._conn.execute(
+                    "SELECT count, mac, key_id FROM step_counters WHERE "
+                    "deployment_namespace = ? AND scope = ?", (namespace, scope),
+                ).fetchone()
+                if existing is not None:
+                    existing_count, existing_mac, existing_key_id = existing
+                    self._verify_mac(
+                        stored_mac=existing_mac, key_id=existing_key_id,
+                        parts=(namespace, scope, existing_count),
+                        context=f"step_counters({namespace!r}, {scope!r})",
+                    )
             self._conn.execute(
                 "INSERT INTO step_counters (deployment_namespace, scope, count, updated_at) "
                 "VALUES (?, ?, 1, ?) "
@@ -1252,8 +1424,14 @@ class SQLiteStore:
                 "SELECT count FROM step_counters WHERE deployment_namespace = ? AND scope = ?",
                 (namespace, scope),
             ).fetchone()
-            self._conn.commit()
             new_count = row[0]
+            if key is not None:
+                new_mac = _row_mac(key, namespace, scope, new_count)
+                self._conn.execute(
+                    "UPDATE step_counters SET mac = ?, key_id = ? WHERE deployment_namespace = ? "
+                    "AND scope = ?", (new_mac, key_id, namespace, scope),
+                )
+            self._conn.commit()
             within = max_allowed is None or new_count <= max_allowed
             return new_count, within
 
@@ -1264,10 +1442,17 @@ class SQLiteStore:
         zero. Returns 0 if the scope has no row yet (never incremented)."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT count FROM step_counters WHERE deployment_namespace = ? AND scope = ?",
-                (namespace, scope),
+                "SELECT count, mac, key_id FROM step_counters WHERE deployment_namespace = ? "
+                "AND scope = ?", (namespace, scope),
             ).fetchone()
-            return row[0] if row is not None else 0
+            if row is None:
+                return 0
+            count, mac, key_id = row
+            self._verify_mac(
+                stored_mac=mac, key_id=key_id, parts=(namespace, scope, count),
+                context=f"step_counters({namespace!r}, {scope!r})",
+            )
+            return count
 
     def log_proposal(self, *, proposal_id: str, agent_id: str, action: str, decision: str,
                      signals: List[str], overlap: float, drift: float, phase: str,
