@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+### Added — generalize the ledger fix to restrictions' status-flip gap (schema v9)
+
+Fourth slice of the tamper-detection layer: generalizes schema v8's
+`initialization_ledger` mechanism to `restrictions`, closing the gap
+noted when v7's row-level MAC coverage landed -- `active_restrictions`
+filters on `status = 'ACTIVE'` in SQL *before* any MAC is checked, so an
+attacker who flipped an ACTIVE row's `status` column directly (rather
+than editing one of the columns the query still returns) made it vanish
+from the result silently, with no `RowIntegrityError` raised.
+
+New `restriction_ledger` table: a keyed, hash-chained, append-only log of
+every restriction IMPOSED/EXPIRED/CLEARED transition, same mechanism as
+`initialization_ledger` (each entry's `mac` chained onto the previous
+entry's, `LEDGER_GENESIS` for the first ever written). The chain-walk
+logic itself was factored out into a shared `_verify_hash_chain` once a
+second ledger needed it, rather than duplicating the loop.
+
+- `active_restrictions` now cross-checks, per call: for every
+  `restriction_id` this agent's ledger has ever recorded a transition
+  for, look at only its *latest* entry (one query per agent, not a full
+  chain walk) -- if that latest transition is IMPOSED ("should still be
+  ACTIVE") but the restriction_id is missing from what the ACTIVE query
+  just returned, that disagreement is exactly a status flip without a
+  matching ledger entry.
+- `impose_restriction`/`mark_expired`/`clear_restriction` each append a
+  ledger entry (IMPOSED/EXPIRED/CLEARED respectively) in the same
+  transaction as the `restrictions` row write.
+- `_verify_restriction_ledger_chain` (a full O(n) walk, part of
+  `verify_integrity_ledger` and also run once automatically at
+  `SQLiteStore` construction) additionally catches a status flip whose
+  ledger entry was deleted too, as long as another restriction's
+  transition was recorded afterward.
+
+Same residual limit as `initialization_ledger`, honestly documented (see
+updated `docs/DURABILITY.md`): deleting the chain's current tip -- the
+single most-recent transition, nothing chained after it yet -- is not
+caught. Still the same rollback/truncation problem tracked as needing an
+external checkpoint.
+
+Rewrote `test_restriction_status_flip_bypasses_mac_verification_known_gap`
+(which asserted the old, now-fixed behavior) into
+`test_restriction_status_flip_is_now_caught_by_the_ledger_cross_check`;
+added 6 more tests covering the non-adversarial legitimate-transition
+path, a forged ledger entry planted to hide a flip (still fails its own
+mac), the middle-entry-deleted chain break, the tip-deletion limit, and
+the unauthenticated no-op path. New migration test
+`test_v8_database_upgrades_to_v9_with_restriction_ledger_usable` proves a
+genuine pre-v9 database upgrades cleanly and that attaching a
+`key_provider` afterwards fails closed on a restriction imposed before
+authentication was turned on.
+
+239 passed, 4 skipped (was 233/4 before this commit; only the three
+rollback-checkpoint tests and one unrelated pre-existing skip remain).
+
 ### Added — keyed, hash-chained ledger closing the deleted-marker gap (schema v8)
 
 Third slice of the tamper-detection layer: a per-row MAC can only verify a

@@ -217,17 +217,18 @@ def test_forged_active_restriction_row_is_rejected():
         store.active_restrictions(namespace="default", agent_id="agent_a")
 
 
-def test_restriction_status_flip_bypasses_mac_verification_known_gap():
-    """Documented, known limitation (see docs/DURABILITY.md and
-    _restriction_mac_parts): active_restrictions() filters on
-    status = 'ACTIVE' in SQL before any mac is checked, so an attacker who
-    flips an ACTIVE row's status column directly (rather than editing one
-    of the columns the query still returns) makes it vanish from the
-    result silently -- the same category of gap as a deleted
-    live_authority_agents marker. This test pins down that this is a real,
-    current gap, not a claim this commit closes -- if it starts failing,
-    either the gap has been closed (update this test and the docs) or a
-    regression made verification even easier to bypass than documented."""
+def test_restriction_status_flip_is_now_caught_by_the_ledger_cross_check():
+    """Previously a known, open gap (see docs/DURABILITY.md's history):
+    active_restrictions() filters on status = 'ACTIVE' in SQL before any
+    row mac is checked, so an attacker who flips an ACTIVE row's status
+    column directly (rather than editing one of the columns the query
+    still returns) used to make it vanish from the result silently -- the
+    same category of gap as a deleted live_authority_agents marker.
+    restriction_ledger (schema v9) now closes this: active_restrictions
+    cross-checks, per call, whether the ledger's latest known transition
+    for each restriction_id it has ever seen for this agent is IMPOSED
+    (i.e. "should still be ACTIVE") against what the ACTIVE query actually
+    returned."""
     key_provider = InMemoryKeyProvider("k1", b"secret-key-material")
     store = SQLiteStore(":memory:", key_provider=key_provider)
     restriction_id = store.impose_restriction(
@@ -244,10 +245,145 @@ def test_restriction_status_flip_bypasses_mac_verification_known_gap():
     )
     store._conn.commit()
 
-    # No exception -- the restriction silently disappears rather than
-    # being flagged as tampered, because the WHERE clause excludes it
-    # before verification ever runs.
-    assert store.active_restrictions(namespace="default", agent_id="agent_a") == []
+    with pytest.raises(RowIntegrityError):
+        store.active_restrictions(namespace="default", agent_id="agent_a")
+
+
+def test_restriction_ledger_keeps_active_restrictions_working_for_legitimate_transitions():
+    """The ledger cross-check must not raise on ordinary, non-adversarial
+    use: impose, then legitimately clear/expire through the real API, and
+    a later active_restrictions call for the same agent (with other,
+    still-active restrictions) must not treat the legitimate transition as
+    tampering."""
+    key_provider = InMemoryKeyProvider("k1", b"secret-key-material")
+    store = SQLiteStore(":memory:", key_provider=key_provider)
+    rid_a = store.impose_restriction(
+        namespace="default", agent_id="agent_a", permission_name="deploy",
+        permission_scope="prod", permission_max_budget=None, reason_code="TEST",
+        source_proposal_id="p1", envelope_fingerprint="fp1", expiry_kind="human",
+        expiry_value=None,
+    )
+    rid_b = store.impose_restriction(
+        namespace="default", agent_id="agent_a", permission_name="deploy",
+        permission_scope="staging", permission_max_budget=None, reason_code="TEST",
+        source_proposal_id="p2", envelope_fingerprint="fp1", expiry_kind="human",
+        expiry_value=None,
+    )
+    assert store.clear_restriction(
+        namespace="default", agent_id="agent_a", restriction_id=rid_a,
+        authorised_by="human_ops", reason="resolved", policy_version="fp1",
+    ) == "cleared"
+
+    active = store.active_restrictions(namespace="default", agent_id="agent_a")
+    assert {row["restriction_id"] for row in active} == {rid_b}
+    store.verify_integrity_ledger()
+
+
+def test_forged_ledger_entry_without_the_key_cannot_hide_a_status_flip():
+    """An attacker who flips status AND tries to plant a matching-looking
+    restriction_ledger row (to make the cross-check's own read agree)
+    cannot produce a valid mac without the key -- the forged ledger entry
+    itself fails verification."""
+    key_provider = InMemoryKeyProvider("k1", b"secret-key-material")
+    store = SQLiteStore(":memory:", key_provider=key_provider)
+    restriction_id = store.impose_restriction(
+        namespace="default", agent_id="agent_a", permission_name="deploy",
+        permission_scope="prod", permission_max_budget=None, reason_code="TEST",
+        source_proposal_id="p1", envelope_fingerprint="fp1", expiry_kind="human",
+        expiry_value=None,
+    )
+    store._conn.execute(
+        "UPDATE restrictions SET status = 'CLEARED' WHERE restriction_id = ?",
+        (restriction_id,),
+    )
+    store._conn.execute(
+        "INSERT INTO restriction_ledger (deployment_namespace, agent_id, restriction_id, "
+        "event_type, permission_name, permission_scope, permission_max_budget, "
+        "expiry_kind, expiry_value, prev_mac, mac, key_id) VALUES "
+        "('default', 'agent_a', ?, 'CLEARED', 'deploy', 'prod', NULL, 'human', NULL, "
+        "?, 'forged', 'k1')",
+        (restriction_id, "0" * 64),
+    )
+    store._conn.commit()
+
+    with pytest.raises(RowIntegrityError):
+        store.active_restrictions(namespace="default", agent_id="agent_a")
+
+
+def test_restriction_ledger_chain_catches_a_middle_entry_deleted():
+    """Same chain-linkage protection as initialization_ledger: deleting an
+    entry that something else was later chained onto breaks the next
+    entry's prev_mac -- detectable via the full walk without needing
+    anything external."""
+    key_provider = InMemoryKeyProvider("k1", b"secret-key-material")
+    store = SQLiteStore(":memory:", key_provider=key_provider)
+    store.impose_restriction(
+        namespace="default", agent_id="agent_a", permission_name="deploy",
+        permission_scope="prod", permission_max_budget=None, reason_code="TEST",
+        source_proposal_id="p1", envelope_fingerprint="fp1", expiry_kind="human",
+        expiry_value=None,
+    )
+    store.impose_restriction(
+        namespace="default", agent_id="agent_b", permission_name="deploy",
+        permission_scope="prod", permission_max_budget=None, reason_code="TEST",
+        source_proposal_id="p2", envelope_fingerprint="fp1", expiry_kind="human",
+        expiry_value=None,
+    )
+    store._conn.execute(
+        "DELETE FROM restriction_ledger WHERE agent_id = 'agent_a'"
+    )
+    store._conn.commit()
+
+    with pytest.raises(RowIntegrityError):
+        store.verify_integrity_ledger()
+
+
+def test_restriction_ledger_does_not_catch_the_current_tip_being_deleted():
+    """Documented, known residual limit shared with initialization_ledger
+    and the rollback problem generally: deleting the single most-recent
+    transition, with nothing chained after it, leaves the remaining chain
+    fully self-consistent."""
+    key_provider = InMemoryKeyProvider("k1", b"secret-key-material")
+    store = SQLiteStore(":memory:", key_provider=key_provider)
+    store.impose_restriction(
+        namespace="default", agent_id="agent_a", permission_name="deploy",
+        permission_scope="prod", permission_max_budget=None, reason_code="TEST",
+        source_proposal_id="p1", envelope_fingerprint="fp1", expiry_kind="human",
+        expiry_value=None,
+    )
+    restriction_id_b = store.impose_restriction(
+        namespace="default", agent_id="agent_b", permission_name="deploy",
+        permission_scope="prod", permission_max_budget=None, reason_code="TEST",
+        source_proposal_id="p2", envelope_fingerprint="fp1", expiry_kind="human",
+        expiry_value=None,
+    )
+    store._conn.execute(
+        "DELETE FROM restriction_ledger WHERE agent_id = 'agent_b'"
+    )
+    store._conn.execute(
+        "UPDATE restrictions SET status = 'CLEARED' WHERE restriction_id = ?",
+        (restriction_id_b,),
+    )
+    store._conn.commit()
+
+    store.verify_integrity_ledger()  # does not raise
+    assert store.active_restrictions(namespace="default", agent_id="agent_b") == []
+
+
+def test_unauthenticated_store_never_writes_to_the_restriction_ledger():
+    """Without a key_provider, restriction_ledger stays untouched --
+    authentication (and the ledger it enables) is entirely opt-in."""
+    store = SQLiteStore(":memory:")
+    store.impose_restriction(
+        namespace="default", agent_id="agent_a", permission_name="deploy",
+        permission_scope="prod", permission_max_budget=None, reason_code="TEST",
+        source_proposal_id="p1", envelope_fingerprint="fp1", expiry_kind="human",
+        expiry_value=None,
+    )
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM restriction_ledger"
+    ).fetchone()[0] == 0
+    store.verify_integrity_ledger()  # no-op, does not raise
 
 
 def test_mark_expired_and_clear_restriction_keep_mac_current():

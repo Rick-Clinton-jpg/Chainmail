@@ -577,6 +577,48 @@ def test_v7_database_upgrades_to_v8_with_initialization_ledger_usable(tmp_path):
     store_v8.verify_integrity_ledger()
 
 
+def test_v8_database_upgrades_to_v9_with_restriction_ledger_usable(tmp_path):
+    """A v8 database (no restriction_ledger table at all) upgrades to v9
+    by creating that table fresh, same as v7->v8 -- and a key_provider
+    attached afterwards can immediately use it."""
+    from chainmail.persistence import InMemoryKeyProvider
+
+    db = str(tmp_path / "chainmail.db")
+    store_v8 = SQLiteStore(db)
+    store_v8.impose_restriction(
+        namespace="default", agent_id="agent_research", permission_name="research",
+        permission_scope="*", permission_max_budget=None, reason_code="TEST",
+        source_proposal_id="p1", envelope_fingerprint="fp1", expiry_kind="human",
+        expiry_value=None,
+    )
+    store_v8._conn.execute("DROP TABLE restriction_ledger")
+    store_v8._conn.execute("UPDATE schema_version SET version = 8")
+    store_v8._conn.commit()
+    assert not store_v8._table_exists(store_v8._conn, "restriction_ledger")
+    store_v8.close()
+
+    key_provider = InMemoryKeyProvider("k1", b"secret-key-material")
+    store_v9 = SQLiteStore(db, key_provider=key_provider)
+    assert store_v9._table_exists(store_v9._conn, "restriction_ledger")
+    store_v9.verify_integrity_ledger()  # empty restriction_ledger, does not raise
+
+    # The restriction imposed before authentication was turned on has no
+    # ledger entry -- the cross-check in active_restrictions must fail
+    # closed rather than silently trusting it.
+    with pytest.raises(sqlite3.Error):
+        store_v9.active_restrictions(namespace="default", agent_id="agent_research")
+
+    # A freshly-imposed restriction gets a matching ledger entry.
+    store_v9.impose_restriction(
+        namespace="default", agent_id="agent_new", permission_name="research",
+        permission_scope="*", permission_max_budget=None, reason_code="TEST2",
+        source_proposal_id="p2", envelope_fingerprint="fp2", expiry_kind="human",
+        expiry_value=None,
+    )
+    assert store_v9.active_restrictions(namespace="default", agent_id="agent_new")
+    store_v9.verify_integrity_ledger()
+
+
 # -- freshness rule: no previously-resolved Authority reused across hops/decisions --
 #
 # ChainmailGovernor._evaluate_locked() fetches live_auth/current_auth once,

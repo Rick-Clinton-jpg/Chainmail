@@ -389,7 +389,27 @@ class SQLiteStore:
     # rollback/truncation gap the design doc already scopes out as needing
     # an external checkpoint. Opt-in like v6/v7: only written to and
     # verified when a key_provider is configured.
-    SCHEMA_VERSION = 8
+    # v9: + restriction_ledger -- the same keyed, hash-chained, append-only
+    # ledger mechanism as v8's initialization_ledger, generalized to
+    # restrictions: one entry per IMPOSED/EXPIRED/CLEARED transition (see
+    # _append_restriction_ledger_entry, _verify_restriction_ledger_chain).
+    # Closes (most of) the gap noted in the v7 comment above: active_
+    # restrictions filters on status = 'ACTIVE' in SQL before any row mac
+    # is checked, so flipping an ACTIVE row's status column directly
+    # (rather than editing one of the columns the query still returns)
+    # used to make it vanish from the result with no RowIntegrityError
+    # raised. active_restrictions now also cross-checks, per call, whether
+    # the ledger's latest known transition for each restriction_id it has
+    # ever seen for this agent is IMPOSED (i.e. "should still be ACTIVE")
+    # against what the ACTIVE query just returned -- a restriction_id the
+    # ledger says should still be active but isn't in that result is
+    # exactly a status flipped without a matching ledger entry. Same
+    # residual limit as v8: deleting the CURRENT TIP of this chain (the
+    # single most-recent transition, with nothing chained after it) is not
+    # caught -- that is the same rollback/truncation gap needing an
+    # external checkpoint. Opt-in like v6-v8: only written to and verified
+    # when a key_provider is configured.
+    SCHEMA_VERSION = 9
 
     def __init__(self, db_path: str = ":memory:", *, synchronous: str = "FULL",
                  key_provider: Optional[KeyProvider] = None) -> None:
@@ -587,6 +607,35 @@ class SQLiteStore:
                     timestamp REAL NOT NULL
                 )
             """)
+            # Keyed, hash-chained, append-only ledger of every restriction
+            # IMPOSED/EXPIRED/CLEARED transition -- see the v9
+            # SCHEMA_VERSION comment above. Only written to / verified when
+            # a key_provider is configured. `seq` is the chain order
+            # (global, across every namespace/agent/restriction); `prev_mac`
+            # is the previous entry's `mac` (or LEDGER_GENESIS for the
+            # first entry ever written). Never updated or deleted in place,
+            # only appended to -- unlike `restrictions` itself, which is
+            # only updated in place, this is the append-only record
+            # active_restrictions cross-checks against.
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS restriction_ledger (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    deployment_namespace TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    restriction_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    permission_name TEXT NOT NULL,
+                    permission_scope TEXT NOT NULL,
+                    permission_max_budget INTEGER,
+                    expiry_kind TEXT NOT NULL,
+                    expiry_value REAL,
+                    prev_mac TEXT NOT NULL,
+                    mac TEXT,
+                    key_id TEXT
+                )
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS ix_restriction_ledger_agent "
+                     "ON restriction_ledger(deployment_namespace, agent_id, restriction_id)")
             # Durable live authority + permission budgets.
             #
             # ``live_authority_agents`` is an explicit initialization marker,
@@ -698,12 +747,14 @@ class SQLiteStore:
             if migrating:
                 self._migrate_replay_data_from_v2(c)
             c.commit()
-            # One-time, full verification of the initialization ledger's
-            # hash chain at open (see the v8 SCHEMA_VERSION comment and
-            # _verify_ledger_chain) -- a no-op if no key_provider is
-            # configured, or if the ledger is empty (a fresh database, or
-            # one that's never had a key_provider attached).
+            # One-time, full verification of every append-only ledger's
+            # hash chain at open (see the v8/v9 SCHEMA_VERSION comments and
+            # _verify_ledger_chain/_verify_restriction_ledger_chain) -- a
+            # no-op if no key_provider is configured, or if a ledger is
+            # empty (a fresh database, or one that's never had a
+            # key_provider attached).
             self._verify_ledger_chain()
+            self._verify_restriction_ledger_chain()
 
     def _rename_pre_v3_replay_tables(self, c: sqlite3.Connection) -> None:
         """Rename a pre-v3 (``scope``-column) replay table out of the way so
@@ -968,15 +1019,16 @@ class SQLiteStore:
                               expiry_value: Optional[float], status: str) -> Tuple[Any, ...]:
         """The MAC content for one ``restrictions`` row. Includes ``status``
         so a legitimate ACTIVE -> EXPIRED/CLEARED transition (which changes
-        it) always carries a mac matching its *current* status -- but see
-        ``active_restrictions``: because that query filters on
-        ``status = 'ACTIVE'`` before any mac is checked, an attacker who
-        flips an ACTIVE row's status column directly makes it vanish from
-        the result set entirely, never reaching verification at all. That
-        is the same category of gap as a deleted ``live_authority_agents``
-        marker (see docs/DURABILITY.md) -- this MAC still detects a forged
-        *new* ACTIVE restriction, or edits to an ACTIVE row's other fields,
-        just not an ACTIVE row silently switched to look already-inactive.
+        it) always carries a mac matching its *current* status -- but by
+        itself, this row-level MAC has the same limit as v6/v7 everywhere
+        else: ``active_restrictions`` filters on ``status = 'ACTIVE'`` in
+        SQL before any mac is checked, so an attacker who flips an ACTIVE
+        row's status column directly makes it vanish from the result set
+        entirely, never reaching this verification at all. ``restriction_
+        ledger`` (schema v9, see ``_append_restriction_ledger_entry`` /
+        ``_cross_check_restriction_ledger``) closes most of that instead --
+        this MAC alone still detects a forged *new* ACTIVE restriction, or
+        edits to an ACTIVE row's other fields.
         """
         return (namespace, agent_id, restriction_id, permission_name, permission_scope,
                 permission_max_budget, expiry_kind, expiry_value, status)
@@ -985,6 +1037,75 @@ class SQLiteStore:
         if key is None:
             return None
         return _row_mac(key, *self._restriction_mac_parts(**kwargs))
+
+    def _append_restriction_ledger_entry(self, *, namespace: str, agent_id: str,
+                                        restriction_id: str, event_type: str,
+                                        permission_name: str, permission_scope: str,
+                                        permission_max_budget: Optional[int], expiry_kind: str,
+                                        expiry_value: Optional[float], key_id: str,
+                                        key: bytes) -> None:
+        """Append one IMPOSED/EXPIRED/CLEARED entry to ``restriction_ledger``,
+        chained onto whatever the current (global) tip's ``mac`` is (or
+        ``LEDGER_GENESIS`` for the very first entry ever written across any
+        namespace/agent/restriction). Must be called inside the same
+        transaction as the ``restrictions`` row write it accompanies."""
+        prev = self._conn.execute(
+            "SELECT mac FROM restriction_ledger ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+        prev_mac = prev[0] if prev is not None else LEDGER_GENESIS
+        mac = _row_mac(key, prev_mac, namespace, agent_id, restriction_id, event_type,
+                      permission_name, permission_scope, permission_max_budget, expiry_kind,
+                      expiry_value)
+        self._conn.execute(
+            "INSERT INTO restriction_ledger (deployment_namespace, agent_id, restriction_id, "
+            "event_type, permission_name, permission_scope, permission_max_budget, "
+            "expiry_kind, expiry_value, prev_mac, mac, key_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (namespace, agent_id, restriction_id, event_type, permission_name, permission_scope,
+             permission_max_budget, expiry_kind, expiry_value, prev_mac, mac, key_id),
+        )
+
+    def _cross_check_restriction_ledger(self, *, namespace: str, agent_id: str,
+                                       active_ids: Set[str]) -> None:
+        """Cheap, per-call cross-check used by ``active_restrictions``: for
+        every ``restriction_id`` this agent's ``restriction_ledger`` has
+        ever recorded a transition for, look at only its *latest* entry (one
+        indexed lookup per restriction_id this agent has ever had, not a
+        full chain walk) and verify that entry's own mac. If the latest
+        recorded transition is IMPOSED (i.e. the ledger's last word is
+        "this should still be ACTIVE") but ``restriction_id`` is not in
+        ``active_ids`` (what the ACTIVE query in ``active_restrictions`` just
+        returned), that disagreement is exactly a status column flipped
+        directly, without a corresponding ledger entry -- fail closed.
+        """
+        rows = self._conn.execute(
+            "SELECT rl.restriction_id, rl.event_type, rl.permission_name, "
+            "rl.permission_scope, rl.permission_max_budget, rl.expiry_kind, "
+            "rl.expiry_value, rl.prev_mac, rl.mac, rl.key_id FROM restriction_ledger rl "
+            "JOIN (SELECT restriction_id, MAX(seq) AS max_seq FROM restriction_ledger "
+            "WHERE deployment_namespace = ? AND agent_id = ? GROUP BY restriction_id) latest "
+            "ON rl.restriction_id = latest.restriction_id AND rl.seq = latest.max_seq "
+            "WHERE rl.deployment_namespace = ? AND rl.agent_id = ?",
+            (namespace, agent_id, namespace, agent_id),
+        ).fetchall()
+        for (restriction_id, event_type, permission_name, permission_scope,
+             permission_max_budget, expiry_kind, expiry_value, prev_mac, mac, key_id) in rows:
+            self._verify_mac(
+                stored_mac=mac, key_id=key_id,
+                parts=(prev_mac, namespace, agent_id, restriction_id, event_type,
+                       permission_name, permission_scope, permission_max_budget,
+                       expiry_kind, expiry_value),
+                context=f"restriction_ledger({namespace!r}, {agent_id!r}, {restriction_id!r})",
+            )
+            if event_type == "IMPOSED" and restriction_id not in active_ids:
+                raise RowIntegrityError(
+                    f"restriction_ledger says restriction {restriction_id!r} for "
+                    f"({namespace!r}, {agent_id!r}) should still be ACTIVE (its latest "
+                    f"recorded transition is IMPOSED with nothing after it), but it is "
+                    f"not in the ACTIVE rows restrictions currently returns -- its "
+                    f"status was changed without a corresponding restriction_ledger "
+                    f"entry, i.e. outside SQLiteStore's own write API"
+                )
 
     def impose_restriction(self, *, namespace: str, agent_id: str, permission_name: str,
                            permission_scope: str, permission_max_budget: Optional[int],
@@ -1025,6 +1146,14 @@ class SQLiteStore:
                     (restriction_id, namespace, agent_id, permission_name, permission_scope,
                      reason_code, source_proposal_id, envelope_fingerprint, None, None, now),
                 )
+                if key is not None:
+                    self._append_restriction_ledger_entry(
+                        namespace=namespace, agent_id=agent_id, restriction_id=restriction_id,
+                        event_type="IMPOSED", permission_name=permission_name,
+                        permission_scope=permission_scope,
+                        permission_max_budget=permission_max_budget, expiry_kind=expiry_kind,
+                        expiry_value=expiry_value, key_id=key_id, key=key,
+                    )
                 self._conn.commit()
                 return restriction_id
             except sqlite3.Error:
@@ -1064,6 +1193,11 @@ class SQLiteStore:
                     context=f"restrictions({namespace!r}, {agent_id!r}, {row['restriction_id']!r})",
                 )
                 del row["mac"], row["key_id"]
+            if self._key_provider is not None:
+                self._cross_check_restriction_ledger(
+                    namespace=namespace, agent_id=agent_id,
+                    active_ids={row["restriction_id"] for row in rows},
+                )
             return rows
 
     def mark_expired(self, *, namespace: str, agent_id: str, restriction_id: str) -> bool:
@@ -1105,6 +1239,14 @@ class SQLiteStore:
                     "VALUES (?, ?, ?, 'EXPIRED', ?, ?, ?)",
                     (restriction_id, namespace, agent_id, perm_name, perm_scope, now),
                 )
+                if key is not None:
+                    self._append_restriction_ledger_entry(
+                        namespace=namespace, agent_id=agent_id, restriction_id=restriction_id,
+                        event_type="EXPIRED", permission_name=perm_name,
+                        permission_scope=perm_scope, permission_max_budget=perm_max_budget,
+                        expiry_kind=expiry_kind, expiry_value=expiry_value, key_id=key_id,
+                        key=key,
+                    )
             self._conn.commit()
             return bool(cur.rowcount)
 
@@ -1158,6 +1300,14 @@ class SQLiteStore:
                     (restriction_id, namespace, agent_id, perm_name, perm_scope, authorised_by,
                      reason, now),
                 )
+                if key is not None:
+                    self._append_restriction_ledger_entry(
+                        namespace=namespace, agent_id=agent_id, restriction_id=restriction_id,
+                        event_type="CLEARED", permission_name=perm_name,
+                        permission_scope=perm_scope, permission_max_budget=perm_max_budget,
+                        expiry_kind=expiry_kind, expiry_value=expiry_value, key_id=key_id,
+                        key=key,
+                    )
                 self._conn.commit()
                 return "cleared"
             # not newly cleared: figure out why, without assuming anything changed
@@ -1264,6 +1414,35 @@ class SQLiteStore:
             (namespace, agent_id, initialized_at, prev_mac, mac, key_id),
         )
 
+    def _verify_hash_chain(self, *, chain_name: str,
+                          rows: Iterable[Tuple[str, str, Optional[str], Optional[str],
+                                              Tuple[Any, ...]]]) -> None:
+        """Generic O(n) hash-chain verification shared by every append-only
+        ledger table (``initialization_ledger``, ``restriction_ledger``,
+        ...). Each item in ``rows`` is ``(identity_label, prev_mac, mac,
+        key_id, content_parts)``, ordered oldest-to-newest. Raises
+        ``RowIntegrityError`` on the first break -- an entry deleted,
+        reordered, or inserted without going through ``SQLiteStore``'s own
+        write API. Does **not** catch the chain's current tip being
+        deleted (nothing chained after it yet leaves everything before it
+        self-consistent) -- see the callers' own docstrings for that
+        residual, documented limit, which is the same rollback/truncation
+        gap docs/DURABILITY.md tracks as needing an external checkpoint.
+        """
+        expected_prev = LEDGER_GENESIS
+        for identity, prev_mac, mac, key_id, content_parts in rows:
+            if prev_mac != expected_prev:
+                raise RowIntegrityError(
+                    f"{chain_name}({identity}): prev_mac does not match the preceding "
+                    f"entry's mac -- an entry was deleted, reordered, or inserted "
+                    f"without going through SQLiteStore's write API"
+                )
+            self._verify_mac(
+                stored_mac=mac, key_id=key_id, parts=(prev_mac,) + content_parts,
+                context=f"{chain_name}({identity})",
+            )
+            expected_prev = mac
+
     def _verify_ledger_chain(self) -> None:
         """Full verification of ``initialization_ledger``'s hash chain, from
         genesis to the current tip -- O(n) in the number of agents ever
@@ -1271,15 +1450,6 @@ class SQLiteStore:
         the per-request hot path (``is_authority_initialized`` does a
         cheaper single-row cross-check instead, see its docstring). Also
         exposed as ``verify_integrity_ledger`` for on-demand use.
-
-        Detects any entry deleted, reordered, or inserted without going
-        through ``SQLiteStore``'s own write API, *except* deleting the
-        current tip (the single most-recently-initialized agent's entry):
-        with nothing chained after it yet, the chain up to whatever
-        entry is now the tip stays fully self-consistent. That is the same
-        rollback/truncation gap docs/DURABILITY.md already scopes out as
-        needing an external, host-provided checkpoint -- not something a
-        purely internal hash chain can close on its own.
         """
         if self._key_provider is None:
             return
@@ -1287,30 +1457,51 @@ class SQLiteStore:
             "SELECT seq, deployment_namespace, agent_id, initialized_at, prev_mac, mac, "
             "key_id FROM initialization_ledger ORDER BY seq"
         ).fetchall()
-        expected_prev = LEDGER_GENESIS
-        for seq, namespace, agent_id, initialized_at, prev_mac, mac, key_id in rows:
-            if prev_mac != expected_prev:
-                raise RowIntegrityError(
-                    f"initialization_ledger(seq={seq}): prev_mac does not match the "
-                    f"preceding entry's mac -- an entry was deleted, reordered, or "
-                    f"inserted without going through SQLiteStore's write API"
-                )
-            self._verify_mac(
-                stored_mac=mac, key_id=key_id, parts=(prev_mac, namespace, agent_id, initialized_at),
-                context=f"initialization_ledger(seq={seq})",
-            )
-            expected_prev = mac
+        self._verify_hash_chain(
+            chain_name="initialization_ledger",
+            rows=(
+                (f"seq={seq}", prev_mac, mac, key_id, (namespace, agent_id, initialized_at))
+                for seq, namespace, agent_id, initialized_at, prev_mac, mac, key_id in rows
+            ),
+        )
+
+    def _verify_restriction_ledger_chain(self) -> None:
+        """Full verification of ``restriction_ledger``'s hash chain -- the
+        same mechanism as ``_verify_ledger_chain``, generalized to
+        restriction IMPOSED/EXPIRED/CLEARED transitions (see
+        ``active_restrictions``'s cheaper, per-call cross-check and this
+        method's shared caller ``verify_integrity_ledger``)."""
+        if self._key_provider is None:
+            return
+        rows = self._conn.execute(
+            "SELECT seq, deployment_namespace, agent_id, restriction_id, event_type, "
+            "permission_name, permission_scope, permission_max_budget, expiry_kind, "
+            "expiry_value, prev_mac, mac, key_id FROM restriction_ledger ORDER BY seq"
+        ).fetchall()
+        self._verify_hash_chain(
+            chain_name="restriction_ledger",
+            rows=(
+                (f"seq={seq}", prev_mac, mac, key_id,
+                 (namespace, agent_id, restriction_id, event_type, permission_name,
+                  permission_scope, permission_max_budget, expiry_kind, expiry_value))
+                for seq, namespace, agent_id, restriction_id, event_type, permission_name,
+                    permission_scope, permission_max_budget, expiry_kind, expiry_value,
+                    prev_mac, mac, key_id in rows
+            ),
+        )
 
     def verify_integrity_ledger(self) -> None:
-        """Public, on-demand full verification of the initialization
-        ledger's hash chain (see ``_verify_ledger_chain`` for what it does
-        and does not catch). Intended for operator/health-check use --
-        SQLiteStore already runs this once at construction; nothing on the
-        per-request path re-runs the full O(n) walk. Raises
-        ``RowIntegrityError`` on any break; a no-op if no ``key_provider``
-        is configured."""
+        """Public, on-demand full verification of every append-only ledger's
+        hash chain (``initialization_ledger`` and ``restriction_ledger`` --
+        see ``_verify_ledger_chain``/``_verify_restriction_ledger_chain``
+        for what each does and does not catch). Intended for operator/
+        health-check use -- SQLiteStore already runs both once at
+        construction; nothing on the per-request path re-runs the full O(n)
+        walk. Raises ``RowIntegrityError`` on any break; a no-op if no
+        ``key_provider`` is configured."""
         with self._lock:
             self._verify_ledger_chain()
+            self._verify_restriction_ledger_chain()
 
     def _mark_agent_initialized(self, *, namespace: str, agent_id: str, now: float,
                                key_id: Optional[str], key: Optional[bytes]) -> bool:

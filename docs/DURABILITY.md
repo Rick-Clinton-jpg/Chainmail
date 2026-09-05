@@ -5,20 +5,22 @@ every table `SQLiteStore` treats as authoritative state: `live_authority`/
 `live_authority_agents` (schema v6), `restrictions`/`replay_nonces`/
 `replay_proposal_ids`/`step_counters` (schema v7) -- `SQLiteStore(key_provider
 =...)`, `KeyProvider`/`InMemoryKeyProvider`, `RowIntegrityError`. On top of
-that, a keyed, hash-chained, append-only `initialization_ledger` (schema v8)
-closes most of the "deleted marker row is indistinguishable from never
-initialized" gap for `live_authority_agents` -- see "What this layer would
-need to do" below for exactly what it does and does not catch. All of the
-above is covered by the un-skipped tests in
-`tests/test_authority_integrity_spec.py`. Still not implemented: the
-`restrictions` status-flip gap (same category, not yet given the same
-ledger-style treatment) and the entire rollback-checkpoint half, which needs
-external infrastructure this repository does not ship. This document
-specifies what the remaining piece of the keyed-integrity layer would need
-to guarantee, why it is a separate piece of work from the durable-authority/
-budget persistence it builds on, and what it can and cannot honestly
-promise. The still-skipped tests in `tests/test_authority_integrity_spec.py`
-(not deleted) pin down what "done" looks like for the rest.
+that, two keyed, hash-chained, append-only ledgers -- `initialization_ledger`
+(schema v8) and `restriction_ledger` (schema v9) -- close most of the "a row
+made to vanish (deleted, or excluded by a status filter) is indistinguishable
+from having never existed / never being ACTIVE" gap, for `live_authority_
+agents`'s initialization marker and for `restrictions`'s status column
+respectively -- see "What this layer would need to do" below for exactly
+what each does and does not catch. All of the above is covered by the
+un-skipped tests in `tests/test_authority_integrity_spec.py`. Still not
+implemented: the entire rollback-checkpoint half, which needs external
+infrastructure this repository does not ship (and is also the residual limit
+both ledgers share -- see below). This document specifies what that
+remaining piece of the keyed-integrity layer would need to guarantee, why it
+is a separate piece of work from the durable-authority/budget persistence it
+builds on, and what it can and cannot honestly promise. The still-skipped
+tests in `tests/test_authority_integrity_spec.py` (not deleted) pin down
+what "done" looks like for the rest.
 
 ## Why this is out of scope for the durability work it follows
 
@@ -81,47 +83,60 @@ buys you, not protection against a fully compromised host. It also does
 from the specific query a decision reads, rather than edited in place --
 that needs the same kind of durable, independently-verifiable "this
 happened" record `HashChainLog` already provides for the audit trail, and
-is what `initialization_ledger` (below) adds for one of the two known
-instances of this gap.
+is exactly what the two ledgers below add.
 
-- **`live_authority_agents`'s initialization marker -- closed, with a
-  documented residual limit.** `initialization_ledger` (schema v8) is a
-  keyed, hash-chained, append-only table: every `initialize_agent_authority`
-  / `replace_live_authority` first-time-init call appends an entry chained
-  onto the previous entry's `mac` (`LEDGER_GENESIS` for the very first ever
-  written). `is_authority_initialized` cheaply cross-checks the marker
-  row's presence against the ledger entry's presence for the same
-  `(namespace, agent_id)` on every call (one indexed lookup, not a chain
-  walk) and raises `RowIntegrityError` on disagreement -- so a marker
-  deleted *alone* (its ledger entry left behind) is caught immediately (see
-  `test_deleted_row_is_indistinguishable_from_never_having_existed_today_
-  but_wont_be`). A full O(n) walk of the entire chain
+Both `initialization_ledger` (schema v8) and `restriction_ledger` (schema
+v9) share one mechanism (`_verify_hash_chain`, factored out once both
+existed): a keyed, hash-chained, append-only table where each entry's `mac`
+is computed over its own content *and* the previous entry's `mac`
+(`LEDGER_GENESIS` for the very first entry ever written, globally across
+every namespace/agent). Deleting or reordering an entry breaks the *next*
+entry's chain linkage -- detectable without needing anything external, as
+long as something was appended after the deleted entry. Both also share the
+same residual limit: deleting the chain's **current tip** (the single most
+recent entry, nothing chained after it yet) leaves everything before it
+fully self-consistent, which is the same rollback/truncation problem as (2)
+below and needs the same external checkpoint to close -- a purely internal
+hash chain cannot bootstrap proof that nothing was ever appended after a
+given point.
+
+- **`live_authority_agents`'s initialization marker -- closed, with that
+  residual limit.** Every `initialize_agent_authority` /
+  `replace_live_authority` first-time-init call appends an
+  `initialization_ledger` entry. `is_authority_initialized` cheaply
+  cross-checks the marker row's presence against the ledger entry's
+  presence for the same `(namespace, agent_id)` on every call (one indexed
+  lookup, not a chain walk) and raises `RowIntegrityError` on disagreement
+  -- so a marker deleted *alone* (its ledger entry left behind) is caught
+  immediately (see `test_deleted_row_is_indistinguishable_from_never_
+  having_existed_today_but_wont_be`). The full O(n) chain walk
   (`verify_integrity_ledger`, also run once automatically at `SQLiteStore`
   construction) additionally catches a marker *and* its ledger entry
   deleted **together**, as long as some other agent was initialized
-  afterward (deleting entry N breaks entry N+1's `prev_mac` linkage -- see
-  `test_ledger_chain_catches_a_middle_entry_deleted_even_when_its_marker_
-  is_also_deleted`). What neither check catches: deleting the *current tip*
-  -- the single most-recently-initialized agent's marker and ledger entry,
-  removed together, with nothing chained after it yet -- which leaves the
-  remaining chain fully self-consistent (see
-  `test_ledger_chain_does_not_catch_the_current_tip_being_deleted`). That
-  residual gap is the same rollback/truncation problem as (2) below, and
-  needs the same external checkpoint to close -- a purely internal hash
-  chain cannot bootstrap proof that nothing was ever appended after a given
-  point.
-- **`restrictions` status-flip -- still open.** `active_restrictions`
-  filters on `status = 'ACTIVE'` in SQL before any MAC is checked, so
-  flipping an ACTIVE row's `status` column directly (rather than one of the
-  columns the query still returns) makes it vanish from the result
-  silently, with no `RowIntegrityError` raised (see
-  `test_restriction_status_flip_bypasses_mac_verification_known_gap`,
-  un-skipped and passing -- it pins down the gap itself, not a guarantee).
-  The MAC still catches a forged *new* ACTIVE restriction or an
-  edited-in-place ACTIVE row. The same ledger-style cross-check that closed
-  the marker-deletion instance above would generalize here (an append-only
-  "restriction transition" ledger, cross-checked the same way), but hasn't
-  been done yet -- a natural next slice of this same work.
+  afterward (see `test_ledger_chain_catches_a_middle_entry_deleted_even_
+  when_its_marker_is_also_deleted`); deleting the current tip is not caught
+  (see `test_ledger_chain_does_not_catch_the_current_tip_being_deleted`).
+- **`restrictions` status-flip -- closed, with that same residual limit.**
+  Every `impose_restriction`/`mark_expired`/`clear_restriction` call appends
+  a `restriction_ledger` entry (IMPOSED/EXPIRED/CLEARED). `active_
+  restrictions` cheaply cross-checks, per call: for every `restriction_id`
+  this agent's ledger has ever recorded a transition for, look at only its
+  *latest* entry (one query per agent, not a full chain walk) -- if that
+  latest transition is IMPOSED (the ledger's last word is "should still be
+  ACTIVE") but the restriction_id is missing from what the ACTIVE query
+  just returned, that disagreement is exactly a status column flipped
+  directly, without a matching ledger entry (see
+  `test_restriction_status_flip_is_now_caught_by_the_ledger_cross_check`,
+  and `test_forged_ledger_entry_without_the_key_cannot_hide_a_status_flip`
+  for why planting a matching-looking forged ledger row doesn't help --
+  it fails its own mac check first). The full chain walk
+  (`_verify_restriction_ledger_chain`, also part of `verify_integrity_
+  ledger`) catches a transition entry deleted together with the
+  `restrictions` row's own status flip, as long as another restriction's
+  transition was recorded afterward (see `test_restriction_ledger_chain_
+  catches_a_middle_entry_deleted`); deleting the current tip is not caught
+  (see `test_restriction_ledger_does_not_catch_the_current_tip_being_
+  deleted`).
 
 ### 2. A host-provided monotonic checkpoint for rollback detection
 
@@ -176,11 +191,12 @@ design could provide one.
    a time, starting with row-level MAC verification~~ -- done for
    `live_authority`/`live_authority_agents` (schema v6),
    `restrictions`/`replay_nonces`/`replay_proposal_ids`/`step_counters`
-   (schema v7), and the `live_authority_agents` deleted-marker gap
-   (schema v8's `initialization_ledger`). Still to un-skip: (a) generalize
-   the same ledger-cross-check pattern to `restrictions`'s status-flip gap;
-   (b) rollback detection, below (which also happens to be the residual
-   limit the v8 ledger itself couldn't close -- see above).
+   (schema v7), the `live_authority_agents` deleted-marker gap (schema v8's
+   `initialization_ledger`), and the `restrictions` status-flip gap (schema
+   v9's `restriction_ledger`, generalizing the same mechanism). Only
+   rollback detection remains, below -- which is also the residual limit
+   both ledgers share (see above): neither can prove its own current tip
+   wasn't truncated.
 2. ~~Add a `key_provider` seam to `SQLiteStore.__init__`~~ -- done:
    `KeyProvider` (protocol) / `InMemoryKeyProvider` (a process-local
    reference implementation for tests and single-process deployments; a

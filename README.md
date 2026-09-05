@@ -60,29 +60,28 @@ adversarial mutation harness challenges the boundary on every CI run.
 - **No formal proof.** The no-authority-laundering property is tested by example
   and challenged by the mutation harness, not proven.
 - **Row-level tamper detection, no rollback detection.**
-  `SQLiteStore(key_provider=...)` (schema v8) authenticates every
+  `SQLiteStore(key_provider=...)` (schema v9) authenticates every
   authoritative row -- `live_authority`, `live_authority_agents`,
   `restrictions`, `replay_nonces`, `replay_proposal_ids`, `step_counters` --
   with a keyed HMAC, detecting a row edited, replaced, or inserted outside
-  `SQLiteStore`'s own write API. A keyed, hash-chained, append-only
-  `initialization_ledger` closes most of a further gap where a per-row MAC
-  alone falls short -- a *deleted* (not tampered) `live_authority_agents`
-  marker row: deleting it alone is caught immediately, and deleting it
-  together with its ledger entry is still caught as long as some other
-  agent was initialized afterward. One known gap remains fully open:
-  flipping an ACTIVE restriction's `status` column directly (rather than
-  editing one of its other columns) makes it silently vanish from
-  `active_restrictions` before any MAC is ever checked -- the same
-  ledger-style fix would generalize here but hasn't been done yet. Nothing
-  here detects a whole-database swap back to an earlier, internally-valid
-  `SQLiteStore` file (a "replace with yesterday's backup" attack, which also
-  covers deleting the *most recent* ledger entry with nothing chained after
-  it) -- that requires a host-held secret and an external monotonic
-  checkpoint outside SQLite itself, which is not implemented. `HashChainLog`'s
-  hash chain remains the only tamper-evidence for the *append-only audit
-  log*, unrelated to this. See
-  `docs/DURABILITY.md` for the design, what's implemented so far, and why
-  the remainder is a separate piece of work.
+  `SQLiteStore`'s own write API. Two keyed, hash-chained, append-only
+  ledgers -- `initialization_ledger` and `restriction_ledger` -- close most
+  of a further gap where a per-row MAC alone falls short: a row *deleted*
+  (not tampered), or a restriction's `status` column *flipped* directly
+  (rather than editing one of its other columns, making it silently vanish
+  from `active_restrictions` before any MAC is ever checked). Both are
+  caught immediately when the deleted/forged row is the only thing wrong;
+  both are still caught even when the accompanying ledger entry is deleted
+  too, as long as something else was recorded afterward. What neither
+  catches: deleting the *current tip* -- the single most-recently-written
+  ledger entry, with nothing chained after it yet -- which is the same
+  problem as a whole-database swap back to an earlier, internally-valid
+  `SQLiteStore` file (a "replace with yesterday's backup" attack); both need
+  a host-held secret and an external monotonic checkpoint outside SQLite
+  itself, which is not implemented. `HashChainLog`'s hash chain remains the
+  only tamper-evidence for the *append-only audit log*, unrelated to this.
+  See `docs/DURABILITY.md` for the design, what's implemented so far, and
+  why the remainder is a separate piece of work.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full list of fixes. The v4 code is
 under [`legacy/`](legacy/) and is unmaintained.
@@ -565,7 +564,7 @@ copyright holder.
 | Must | Network quorum transport (Raft / PBFT) with real peer governors |
 | Must | mTLS / SPIFFE identity for the service instead of shared/per-caller tokens |
 | Must | Durable STEP_BUDGET-policy restriction budgets and `provenance` (`live_authority`, permission budgets, and fleet/per-agent step budgets are durable as of schema v5 — see "Durability" above) |
-| Must | A host-external rollback checkpoint, and generalizing the deleted-marker ledger fix to `restrictions`'s status-flip gap (keyed row authentication — `live_authority`, `restrictions`, replay tables, `step_counters` — plus the `live_authority_agents` deleted-marker ledger fix are done as of storage schema v8 — see `docs/DURABILITY.md`) |
+| Must | A host-external rollback checkpoint (everything else in the keyed-integrity layer — row authentication, and the deleted-marker / status-flip ledger fixes for `live_authority_agents` and `restrictions` — is done as of storage schema v9 — see `docs/DURABILITY.md`) |
 | Should | Encrypted key material at rest in `KeyRegistry`; HSM/KMS backend |
 | Should | Formal TLA+ model of the delegation invariants |
 | Should | Wall-clock fleet budgets and sliding-window rate limits |
