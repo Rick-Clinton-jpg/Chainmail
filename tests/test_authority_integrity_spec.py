@@ -363,19 +363,167 @@ def test_step_counter_keeps_the_mac_current_across_increments():
     assert store.peek_step_counter(namespace="default", scope="fleet") == 3
 
 
+# -- deleted-marker gap: initialization_ledger (schema v8) -------------------
+
+def test_deleted_row_is_indistinguishable_from_never_having_existed_today_but_wont_be():
+    """Deleting a live_authority_agents marker row (bypassing SQLiteStore's
+    write API) while its initialization_ledger entry survives must be
+    detected -- otherwise a deleted marker looks identical to a genuine
+    first-ever startup, and re-initializing would re-seed authority at the
+    envelope ceiling, restoring whatever was previously delegated away or
+    consumed (exactly what invariant #1 forbids, laundered via direct file
+    tampering instead of a restart)."""
+    key_provider = InMemoryKeyProvider("k1", b"secret-key-material")
+    store = SQLiteStore(":memory:", key_provider=key_provider)
+    store.initialize_agent_authority(
+        namespace="default", agent_id="agent_a",
+        permissions=[("read_docs", "*", 10)], envelope_fingerprint="fp1",
+    )
+    assert store.is_authority_initialized(namespace="default", agent_id="agent_a") is True
+
+    store._conn.execute(
+        "DELETE FROM live_authority_agents WHERE agent_id = 'agent_a'"
+    )
+    store._conn.commit()
+
+    with pytest.raises(RowIntegrityError):
+        store.is_authority_initialized(namespace="default", agent_id="agent_a")
+
+
+def test_deleting_both_marker_and_ledger_entry_is_not_caught_by_the_cheap_check():
+    """Documented, known limit of the cheap per-call cross-check: deleting
+    BOTH the marker row and its ledger entry together makes the agent look
+    genuinely never-initialized again, with no disagreement to detect. The
+    full ledger-chain walk (verify_integrity_ledger) still catches this
+    when the deleted entry isn't the chain's current tip -- see the next
+    test -- but the cheap presence-only check used on every
+    is_authority_initialized call cannot, by itself."""
+    key_provider = InMemoryKeyProvider("k1", b"secret-key-material")
+    store = SQLiteStore(":memory:", key_provider=key_provider)
+    store.initialize_agent_authority(
+        namespace="default", agent_id="agent_a",
+        permissions=[("read_docs", "*", 10)], envelope_fingerprint="fp1",
+    )
+    # A second agent is initialized afterward, so agent_a's ledger entry is
+    # no longer the chain's tip.
+    store.initialize_agent_authority(
+        namespace="default", agent_id="agent_b",
+        permissions=[("read_docs", "*", 10)], envelope_fingerprint="fp1",
+    )
+
+    store._conn.execute("DELETE FROM live_authority_agents WHERE agent_id = 'agent_a'")
+    store._conn.execute("DELETE FROM initialization_ledger WHERE agent_id = 'agent_a'")
+    store._conn.commit()
+
+    # The cheap check alone doesn't notice -- both are consistently absent.
+    assert store.is_authority_initialized(namespace="default", agent_id="agent_a") is False
+
+
+def test_ledger_chain_catches_a_middle_entry_deleted_even_when_its_marker_is_also_deleted():
+    """What the cheap check in the previous test misses, the full chain
+    walk still catches: agent_b's ledger entry was chained onto agent_a's
+    (now-deleted) entry's mac, so the chain breaks at agent_b -- detectable
+    without needing anything external, because the deleted entry was not
+    the chain's tip when it was removed."""
+    key_provider = InMemoryKeyProvider("k1", b"secret-key-material")
+    store = SQLiteStore(":memory:", key_provider=key_provider)
+    store.initialize_agent_authority(
+        namespace="default", agent_id="agent_a",
+        permissions=[("read_docs", "*", 10)], envelope_fingerprint="fp1",
+    )
+    store.initialize_agent_authority(
+        namespace="default", agent_id="agent_b",
+        permissions=[("read_docs", "*", 10)], envelope_fingerprint="fp1",
+    )
+    store._conn.execute("DELETE FROM live_authority_agents WHERE agent_id = 'agent_a'")
+    store._conn.execute("DELETE FROM initialization_ledger WHERE agent_id = 'agent_a'")
+    store._conn.commit()
+
+    with pytest.raises(RowIntegrityError):
+        store.verify_integrity_ledger()
+
+
+def test_ledger_chain_does_not_catch_the_current_tip_being_deleted():
+    """Documented, known limit shared with the rollback problem: deleting
+    the single most-recently-initialized agent's marker AND ledger entry
+    together, when nothing has been chained after it yet, leaves the
+    remaining chain fully self-consistent -- undetectable without an
+    external, host-provided checkpoint (see docs/DURABILITY.md)."""
+    key_provider = InMemoryKeyProvider("k1", b"secret-key-material")
+    store = SQLiteStore(":memory:", key_provider=key_provider)
+    store.initialize_agent_authority(
+        namespace="default", agent_id="agent_a",
+        permissions=[("read_docs", "*", 10)], envelope_fingerprint="fp1",
+    )
+    store.initialize_agent_authority(
+        namespace="default", agent_id="agent_b",
+        permissions=[("read_docs", "*", 10)], envelope_fingerprint="fp1",
+    )
+    # agent_b is the current tip -- delete it and its ledger entry.
+    store._conn.execute("DELETE FROM live_authority_agents WHERE agent_id = 'agent_b'")
+    store._conn.execute("DELETE FROM initialization_ledger WHERE agent_id = 'agent_b'")
+    store._conn.commit()
+
+    store.verify_integrity_ledger()  # does not raise
+    assert store.is_authority_initialized(namespace="default", agent_id="agent_b") is False
+
+
+def test_ledger_key_rotation_does_not_invalidate_existing_entries():
+    """Same rotation guarantee as live_authority rows: an entry written
+    under an old key must still verify after the provider rotates to a new
+    one, via the recorded key_id."""
+    key_provider = InMemoryKeyProvider("k1", b"first-key-material")
+    store = SQLiteStore(":memory:", key_provider=key_provider)
+    store.initialize_agent_authority(
+        namespace="default", agent_id="agent_a",
+        permissions=[("read_docs", "*", 10)], envelope_fingerprint="fp1",
+    )
+    key_provider.rotate("k2", b"second-key-material")
+    store.initialize_agent_authority(
+        namespace="default", agent_id="agent_b",
+        permissions=[("read_docs", "*", 10)], envelope_fingerprint="fp1",
+    )
+    store.verify_integrity_ledger()  # does not raise across the key rotation
+    assert store.is_authority_initialized(namespace="default", agent_id="agent_a") is True
+    assert store.is_authority_initialized(namespace="default", agent_id="agent_b") is True
+
+
+def test_unauthenticated_store_never_writes_to_the_ledger():
+    """Without a key_provider, initialization_ledger stays untouched --
+    authentication (and the ledger it enables) is entirely opt-in."""
+    store = SQLiteStore(":memory:")
+    store.initialize_agent_authority(
+        namespace="default", agent_id="agent_a",
+        permissions=[("read_docs", "*", 10)], envelope_fingerprint="fp1",
+    )
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM initialization_ledger"
+    ).fetchone()[0] == 0
+    store.verify_integrity_ledger()  # no-op, does not raise
+
+
+def test_replace_live_authority_first_time_init_also_writes_a_ledger_entry():
+    """replace_live_authority can itself be the call that first initializes
+    an agent (delegation before the envelope-ceiling seeding path ever
+    ran) -- that path must append a ledger entry too, not just
+    initialize_agent_authority's."""
+    key_provider = InMemoryKeyProvider("k1", b"secret-key-material")
+    store = SQLiteStore(":memory:", key_provider=key_provider)
+    store.replace_live_authority(
+        namespace="default", agent_id="agent_a",
+        permissions=[("write_docs", "*", 5)], source="delegation",
+        envelope_fingerprint="fp1",
+    )
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM initialization_ledger WHERE agent_id = 'agent_a'"
+    ).fetchone()[0] == 1
+    store.verify_integrity_ledger()
+    assert store.is_authority_initialized(namespace="default", agent_id="agent_a") is True
+
+
 _STILL_DESIGN_ONLY = pytest.mark.skip(
     reason="keyed authentication / rollback-checkpoint layer is design-only -- see docs/DURABILITY.md"
 )
-
-
-@_STILL_DESIGN_ONLY
-def test_deleted_row_is_indistinguishable_from_never_having_existed_today_but_wont_be():
-    """Today, deleting a live_authority row and re-initializing looks
-    identical to a first-ever startup (both produce is_authority_initialized
-    -> False for a fresh marker). The integrity layer's initialization
-    marker itself must be authenticated too, so a deleted marker row cannot
-    be used to re-seed authority at the envelope ceiling by making the store
-    look never-initialized."""
 
 
 @_STILL_DESIGN_ONLY

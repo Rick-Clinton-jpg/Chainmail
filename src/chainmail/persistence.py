@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 RECORD_VERSION = 1
 GENESIS_HASH = "0" * 64
+LEDGER_GENESIS = "0" * 64
 
 
 # ============================================================================
@@ -367,7 +368,28 @@ class SQLiteStore:
     # what still is not (a restriction's `status` column is not part of its
     # MAC -- see the comment on impose_restriction/_verify_mac's caller
     # there for why that's a real, documented gap, not an oversight).
-    SCHEMA_VERSION = 7
+    # v8: + initialization_ledger -- a keyed, hash-chained, append-only
+    # ledger of every agent-authority-initialization event, closing (most
+    # of) the "deleted marker row is indistinguishable from never
+    # initialized" gap docs/DURABILITY.md flagged as still open after v6/
+    # v7's per-row MAC coverage. A deleted live_authority_agents marker row
+    # leaves no trace *by itself* (a MAC only verifies a row that's still
+    # present to check) -- but each ledger entry's mac is chained onto the
+    # previous entry's mac (see LEDGER_GENESIS, _append_initialization_
+    # ledger_entry, _verify_ledger_chain), so deleting entry N breaks the
+    # chain at entry N+1 whenever a later agent was ever initialized after
+    # it. is_authority_initialized cross-checks marker-row presence against
+    # ledger-row presence on every call (cheap: one indexed lookup, not a
+    # chain walk) and fails closed on any disagreement; the full O(n) chain
+    # walk (_verify_ledger_chain / verify_integrity_ledger) that would also
+    # catch both being deleted together runs once at SQLiteStore
+    # construction, not on the hot path. Deleting the ledger's current tip
+    # entry (the single most-recently-initialized agent, if it and its
+    # marker are both removed) is NOT caught by this -- that is the same
+    # rollback/truncation gap the design doc already scopes out as needing
+    # an external checkpoint. Opt-in like v6/v7: only written to and
+    # verified when a key_provider is configured.
+    SCHEMA_VERSION = 8
 
     def __init__(self, db_path: str = ":memory:", *, synchronous: str = "FULL",
                  key_provider: Optional[KeyProvider] = None) -> None:
@@ -603,6 +625,29 @@ class SQLiteStore:
                     PRIMARY KEY (deployment_namespace, agent_id)
                 )
             """)
+            # Keyed, hash-chained, append-only ledger of every agent-
+            # authority-initialization event -- see the v8 comment on
+            # SCHEMA_VERSION above. Only written to / verified when a
+            # key_provider is configured (see _append_initialization_
+            # ledger_entry, _mark_agent_initialized). `seq` is the chain
+            # order; `prev_mac` is the previous entry's `mac` (or
+            # LEDGER_GENESIS for the first entry ever written) -- deleting
+            # or reordering an entry breaks the next entry's prev_mac
+            # linkage, detectable without needing anything outside this
+            # table (see _verify_ledger_chain). Never updated or deleted
+            # in place, only appended to.
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS initialization_ledger (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    deployment_namespace TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    initialized_at REAL NOT NULL,
+                    prev_mac TEXT NOT NULL,
+                    mac TEXT,
+                    key_id TEXT,
+                    UNIQUE (deployment_namespace, agent_id)
+                )
+            """)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS live_authority (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -653,6 +698,12 @@ class SQLiteStore:
             if migrating:
                 self._migrate_replay_data_from_v2(c)
             c.commit()
+            # One-time, full verification of the initialization ledger's
+            # hash chain at open (see the v8 SCHEMA_VERSION comment and
+            # _verify_ledger_chain) -- a no-op if no key_provider is
+            # configured, or if the ledger is empty (a fresh database, or
+            # one that's never had a key_provider attached).
+            self._verify_ledger_chain()
 
     def _rename_pre_v3_replay_tables(self, c: sqlite3.Connection) -> None:
         """Rename a pre-v3 (``scope``-column) replay table out of the way so
@@ -1193,20 +1244,155 @@ class SQLiteStore:
                 f"modified outside SQLiteStore's write API"
             )
 
+    def _append_initialization_ledger_entry(self, *, namespace: str, agent_id: str,
+                                            initialized_at: float, key_id: str,
+                                            key: bytes) -> None:
+        """Append one entry to ``initialization_ledger``, chained onto
+        whatever the current tip's ``mac`` is (or ``LEDGER_GENESIS`` for the
+        very first entry ever written). Must be called inside the same
+        transaction as the ``live_authority_agents`` marker insert it
+        accompanies -- see ``_mark_agent_initialized``.
+        """
+        prev = self._conn.execute(
+            "SELECT mac FROM initialization_ledger ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+        prev_mac = prev[0] if prev is not None else LEDGER_GENESIS
+        mac = _row_mac(key, prev_mac, namespace, agent_id, initialized_at)
+        self._conn.execute(
+            "INSERT INTO initialization_ledger (deployment_namespace, agent_id, "
+            "initialized_at, prev_mac, mac, key_id) VALUES (?, ?, ?, ?, ?, ?)",
+            (namespace, agent_id, initialized_at, prev_mac, mac, key_id),
+        )
+
+    def _verify_ledger_chain(self) -> None:
+        """Full verification of ``initialization_ledger``'s hash chain, from
+        genesis to the current tip -- O(n) in the number of agents ever
+        initialized. Run once at construction (see ``_init_db``), not on
+        the per-request hot path (``is_authority_initialized`` does a
+        cheaper single-row cross-check instead, see its docstring). Also
+        exposed as ``verify_integrity_ledger`` for on-demand use.
+
+        Detects any entry deleted, reordered, or inserted without going
+        through ``SQLiteStore``'s own write API, *except* deleting the
+        current tip (the single most-recently-initialized agent's entry):
+        with nothing chained after it yet, the chain up to whatever
+        entry is now the tip stays fully self-consistent. That is the same
+        rollback/truncation gap docs/DURABILITY.md already scopes out as
+        needing an external, host-provided checkpoint -- not something a
+        purely internal hash chain can close on its own.
+        """
+        if self._key_provider is None:
+            return
+        rows = self._conn.execute(
+            "SELECT seq, deployment_namespace, agent_id, initialized_at, prev_mac, mac, "
+            "key_id FROM initialization_ledger ORDER BY seq"
+        ).fetchall()
+        expected_prev = LEDGER_GENESIS
+        for seq, namespace, agent_id, initialized_at, prev_mac, mac, key_id in rows:
+            if prev_mac != expected_prev:
+                raise RowIntegrityError(
+                    f"initialization_ledger(seq={seq}): prev_mac does not match the "
+                    f"preceding entry's mac -- an entry was deleted, reordered, or "
+                    f"inserted without going through SQLiteStore's write API"
+                )
+            self._verify_mac(
+                stored_mac=mac, key_id=key_id, parts=(prev_mac, namespace, agent_id, initialized_at),
+                context=f"initialization_ledger(seq={seq})",
+            )
+            expected_prev = mac
+
+    def verify_integrity_ledger(self) -> None:
+        """Public, on-demand full verification of the initialization
+        ledger's hash chain (see ``_verify_ledger_chain`` for what it does
+        and does not catch). Intended for operator/health-check use --
+        SQLiteStore already runs this once at construction; nothing on the
+        per-request path re-runs the full O(n) walk. Raises
+        ``RowIntegrityError`` on any break; a no-op if no ``key_provider``
+        is configured."""
+        with self._lock:
+            self._verify_ledger_chain()
+
+    def _mark_agent_initialized(self, *, namespace: str, agent_id: str, now: float,
+                               key_id: Optional[str], key: Optional[bytes]) -> bool:
+        """Attempt the ``live_authority_agents`` marker INSERT; on success,
+        atomically append the chained ``initialization_ledger`` entry too
+        (when authenticated) in the same transaction, so the two can never
+        disagree about whether *this* call actually performed the
+        initialization. Returns True if this call performed it, False if
+        the agent was already initialized (a no-op, caller decides what
+        that means -- see ``initialize_agent_authority`` /
+        ``replace_live_authority``).
+        """
+        marker_mac = _row_mac(key, namespace, agent_id, now) if key is not None else None
+        try:
+            self._conn.execute(
+                "INSERT INTO live_authority_agents (deployment_namespace, agent_id, "
+                "initialized_at, mac, key_id) VALUES (?, ?, ?, ?, ?)",
+                (namespace, agent_id, now, marker_mac, key_id),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        if key is not None:
+            self._append_initialization_ledger_entry(
+                namespace=namespace, agent_id=agent_id, initialized_at=now,
+                key_id=key_id, key=key,
+            )
+        return True
+
     def is_authority_initialized(self, *, namespace: str, agent_id: str) -> bool:
+        """Whether ``(namespace, agent_id)`` has ever been initialized.
+
+        When a ``key_provider`` is configured, this also cross-checks the
+        ``live_authority_agents`` marker row's presence against the
+        ``initialization_ledger`` entry's presence for the same
+        ``(namespace, agent_id)`` -- a single indexed lookup, not a chain
+        walk. A marker row deleted directly (bypassing ``SQLiteStore``'s
+        write API) while its ledger entry survives is caught here,
+        immediately, on the very next call: the two disagreeing about
+        whether this agent was ever initialized is itself the tamper
+        signal, raised as ``RowIntegrityError`` (fail closed) rather than
+        silently trusting whichever one says "not initialized" (which
+        would let a deleted marker re-seed authority at the envelope
+        ceiling -- exactly invariant #1's "restart must never increase
+        authority", laundered via direct file tampering instead of a
+        restart). Deleting *both* together isn't caught by this cheap
+        check -- see ``_verify_ledger_chain`` for what closes (most of)
+        that instead, and its own documented limit.
+        """
         with self._lock:
             row = self._conn.execute(
                 "SELECT initialized_at, mac, key_id FROM live_authority_agents "
                 "WHERE deployment_namespace = ? AND agent_id = ?", (namespace, agent_id),
             ).fetchone()
-            if row is None:
-                return False
-            initialized_at, mac, key_id = row
-            self._verify_mac(
-                stored_mac=mac, key_id=key_id, parts=(namespace, agent_id, initialized_at),
-                context=f"live_authority_agents({namespace!r}, {agent_id!r})",
-            )
-            return True
+            marker_exists = row is not None
+            if marker_exists:
+                initialized_at, mac, key_id = row
+                self._verify_mac(
+                    stored_mac=mac, key_id=key_id, parts=(namespace, agent_id, initialized_at),
+                    context=f"live_authority_agents({namespace!r}, {agent_id!r})",
+                )
+            if self._key_provider is not None:
+                ledger_row = self._conn.execute(
+                    "SELECT initialized_at, prev_mac, mac, key_id FROM initialization_ledger "
+                    "WHERE deployment_namespace = ? AND agent_id = ?", (namespace, agent_id),
+                ).fetchone()
+                ledger_exists = ledger_row is not None
+                if ledger_exists:
+                    l_initialized_at, prev_mac, l_mac, l_key_id = ledger_row
+                    self._verify_mac(
+                        stored_mac=l_mac, key_id=l_key_id,
+                        parts=(prev_mac, namespace, agent_id, l_initialized_at),
+                        context=f"initialization_ledger({namespace!r}, {agent_id!r})",
+                    )
+                if marker_exists != ledger_exists:
+                    raise RowIntegrityError(
+                        f"live_authority_agents/initialization_ledger disagree about "
+                        f"whether ({namespace!r}, {agent_id!r}) was ever initialized "
+                        f"-- marker {'exists' if marker_exists else 'is absent'} but "
+                        f"ledger entry {'exists' if ledger_exists else 'is absent'}; a "
+                        f"row was deleted without going through SQLiteStore's write API"
+                    )
+            return marker_exists
 
     def initialize_agent_authority(self, *, namespace: str, agent_id: str,
                                    permissions: Iterable[Tuple[str, str, Optional[int]]],
@@ -1227,14 +1413,8 @@ class SQLiteStore:
         now = time.time()
         key_id, key = self._signing_key()
         with self._lock:
-            marker_mac = _row_mac(key, namespace, agent_id, now) if key is not None else None
-            try:
-                self._conn.execute(
-                    "INSERT INTO live_authority_agents (deployment_namespace, agent_id, "
-                    "initialized_at, mac, key_id) VALUES (?, ?, ?, ?, ?)",
-                    (namespace, agent_id, now, marker_mac, key_id),
-                )
-            except sqlite3.IntegrityError:
+            if not self._mark_agent_initialized(
+                    namespace=namespace, agent_id=agent_id, now=now, key_id=key_id, key=key):
                 self._conn.rollback()
                 return False
             for name, scope, max_budget in permissions:
@@ -1297,15 +1477,11 @@ class SQLiteStore:
         now = time.time()
         key_id, key = self._signing_key()
         with self._lock:
-            marker_mac = _row_mac(key, namespace, agent_id, now) if key is not None else None
-            try:
-                self._conn.execute(
-                    "INSERT INTO live_authority_agents (deployment_namespace, agent_id, "
-                    "initialized_at, mac, key_id) VALUES (?, ?, ?, ?, ?)",
-                    (namespace, agent_id, now, marker_mac, key_id),
-                )
-            except sqlite3.IntegrityError:
-                pass  # already initialized -- this call still replaces the rows below
+            # Already initialized -- this call still replaces the rows
+            # below; no rollback here (unlike initialize_agent_authority's
+            # own use of this helper), the transaction continues.
+            self._mark_agent_initialized(
+                namespace=namespace, agent_id=agent_id, now=now, key_id=key_id, key=key)
             self._conn.execute(
                 "DELETE FROM live_authority WHERE deployment_namespace = ? AND agent_id = ?",
                 (namespace, agent_id),

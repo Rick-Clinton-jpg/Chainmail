@@ -539,6 +539,44 @@ def test_v6_database_upgrades_to_v7_with_mac_columns_usable(tmp_path):
     ).fetchall()) == 1
 
 
+def test_v7_database_upgrades_to_v8_with_initialization_ledger_usable(tmp_path):
+    """A v7 database (no initialization_ledger table at all) upgrades to
+    v8 by creating that table fresh -- no ALTER needed, since it's a brand
+    new table rather than new columns on an existing one -- and a
+    key_provider attached afterwards can immediately use it."""
+    from chainmail.persistence import InMemoryKeyProvider
+
+    db = str(tmp_path / "chainmail.db")
+    store_v7 = SQLiteStore(db)
+    store_v7.initialize_agent_authority(
+        namespace="default", agent_id="agent_research",
+        permissions=[("research", "*", 5)], envelope_fingerprint="fp1")
+    store_v7._conn.execute("DROP TABLE initialization_ledger")
+    store_v7._conn.execute("UPDATE schema_version SET version = 7")
+    store_v7._conn.commit()
+    assert not store_v7._table_exists(store_v7._conn, "initialization_ledger")
+    store_v7.close()
+
+    key_provider = InMemoryKeyProvider("k1", b"secret-key-material")
+    store_v8 = SQLiteStore(db, key_provider=key_provider)
+    assert store_v8._table_exists(store_v8._conn, "initialization_ledger")
+    store_v8.verify_integrity_ledger()  # empty ledger, does not raise
+
+    # agent_research was initialized before authentication was turned on --
+    # no ledger entry exists for it, so the cross-check in
+    # is_authority_initialized must fail closed rather than silently
+    # trusting the pre-existing, now-unverifiable marker row.
+    with pytest.raises(sqlite3.Error):
+        store_v8.is_authority_initialized(namespace="default", agent_id="agent_research")
+
+    # A freshly-initialized agent gets a matching marker + ledger entry.
+    assert store_v8.initialize_agent_authority(
+        namespace="default", agent_id="agent_new",
+        permissions=[("research", "*", 5)], envelope_fingerprint="fp2") is True
+    assert store_v8.is_authority_initialized(namespace="default", agent_id="agent_new") is True
+    store_v8.verify_integrity_ledger()
+
+
 # -- freshness rule: no previously-resolved Authority reused across hops/decisions --
 #
 # ChainmailGovernor._evaluate_locked() fetches live_auth/current_auth once,

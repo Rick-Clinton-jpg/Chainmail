@@ -2,6 +2,65 @@
 
 ## Unreleased
 
+### Added — keyed, hash-chained ledger closing the deleted-marker gap (schema v8)
+
+Third slice of the tamper-detection layer: a per-row MAC can only verify a
+row that's still present to check, so a `live_authority_agents`
+initialization-marker row deleted outright (bypassing `SQLiteStore`'s write
+API) looked identical to a genuine first-ever startup -- re-initializing
+would then re-seed authority at the envelope ceiling, restoring whatever
+was previously delegated away or consumed. This closes most of that gap.
+
+New `initialization_ledger` table: a keyed, hash-chained, append-only log
+of every agent-authority-initialization event (`LEDGER_GENESIS`,
+`_append_initialization_ledger_entry`, `_verify_ledger_chain`,
+`verify_integrity_ledger`). Each entry's `mac` is computed over its own
+content *and* the previous entry's `mac` (or `LEDGER_GENESIS` for the very
+first entry ever written), so deleting or reordering an entry breaks the
+next entry's chain linkage -- detectable without needing anything external.
+
+- `is_authority_initialized` now cross-checks the `live_authority_agents`
+  marker row's presence against the `initialization_ledger` entry's
+  presence for the same `(namespace, agent_id)` on every call -- one cheap
+  indexed lookup, not a chain walk -- and raises `RowIntegrityError` on
+  disagreement. A marker deleted *alone* is caught here immediately.
+- `_verify_ledger_chain` (a full O(n) walk) additionally catches a marker
+  *and* its ledger entry deleted **together**, as long as some other agent
+  was initialized afterward (the next entry's chain linkage breaks). This
+  runs once, automatically, at `SQLiteStore` construction, and is exposed
+  for on-demand use as `verify_integrity_ledger()`.
+- `initialize_agent_authority` and `replace_live_authority`'s first-time-
+  init path both now go through a shared `_mark_agent_initialized` helper
+  that writes the marker row and its ledger entry atomically, in the same
+  transaction.
+
+Honestly documented, not claimed as closed (see updated
+`docs/DURABILITY.md`): deleting the ledger's **current tip** -- the single
+most-recently-initialized agent's marker and ledger entry, removed
+together, with nothing chained after it yet -- leaves the remaining chain
+fully self-consistent and undetectable by this mechanism. That is the same
+rollback/truncation problem already tracked as needing an external,
+host-provided checkpoint, and this ledger doesn't (and can't, on its own)
+close it. `restrictions`'s status-flip gap (a different instance of the
+same underlying "made to vanish from a query" category) is not addressed
+by this commit either -- the same ledger-style cross-check would
+generalize there but hasn't been done yet.
+
+8 new tests in `tests/test_authority_integrity_spec.py`: the deleted-marker
+test itself is un-skipped and passing; new tests cover the both-deleted-
+together case the cheap check misses but the chain walk catches, the
+tip-deletion limit the chain walk itself doesn't catch, key rotation across
+ledger entries, the unauthenticated no-op path, and
+`replace_live_authority`'s first-time-init path also writing a ledger entry.
+New migration test `test_v7_database_upgrades_to_v8_with_initialization_
+ledger_usable` proves a genuine pre-v8 database (no `initialization_ledger`
+table at all) upgrades cleanly and that attaching a `key_provider`
+afterwards fails closed on an agent initialized before authentication was
+turned on (no ledger entry exists for it).
+
+233 passed, 4 skipped (was 225/5 before this commit; only the three
+rollback-checkpoint tests remain skipped now).
+
 ### Added — keyed row authentication for restrictions, replay tables, and step_counters (schema v7)
 
 Second slice of the tamper-detection layer, extending schema v6's

@@ -2,20 +2,23 @@
 
 Status: **partially implemented.** Row-level keyed authentication now covers
 every table `SQLiteStore` treats as authoritative state: `live_authority`/
-`live_authority_agents` (schema v6), and `restrictions`/`replay_nonces`/
+`live_authority_agents` (schema v6), `restrictions`/`replay_nonces`/
 `replay_proposal_ids`/`step_counters` (schema v7) -- `SQLiteStore(key_provider
-=...)`, `KeyProvider`/`InMemoryKeyProvider`, `RowIntegrityError` -- covered by
-the un-skipped tests in `tests/test_authority_integrity_spec.py`. Still not
-implemented: the deleted-marker/status-flip gap (see "What this layer would
-still NOT guarantee" below, and the "known gap" tests in
-`tests/test_authority_integrity_spec.py`) and the entire rollback-checkpoint
-half, which needs external infrastructure this repository does not ship.
-This document specifies what the remaining piece of the keyed-integrity
-layer would need to guarantee, why it is a separate piece of work from the
-durable-authority/budget persistence it builds on, and what it can and
-cannot honestly promise. The still-skipped tests in
-`tests/test_authority_integrity_spec.py` (not deleted) pin down what "done"
-looks like for the rest.
+=...)`, `KeyProvider`/`InMemoryKeyProvider`, `RowIntegrityError`. On top of
+that, a keyed, hash-chained, append-only `initialization_ledger` (schema v8)
+closes most of the "deleted marker row is indistinguishable from never
+initialized" gap for `live_authority_agents` -- see "What this layer would
+need to do" below for exactly what it does and does not catch. All of the
+above is covered by the un-skipped tests in
+`tests/test_authority_integrity_spec.py`. Still not implemented: the
+`restrictions` status-flip gap (same category, not yet given the same
+ledger-style treatment) and the entire rollback-checkpoint half, which needs
+external infrastructure this repository does not ship. This document
+specifies what the remaining piece of the keyed-integrity layer would need
+to guarantee, why it is a separate piece of work from the durable-authority/
+budget persistence it builds on, and what it can and cannot honestly
+promise. The still-skipped tests in `tests/test_authority_integrity_spec.py`
+(not deleted) pin down what "done" looks like for the rest.
 
 ## Why this is out of scope for the durability work it follows
 
@@ -74,28 +77,51 @@ without going through `SQLiteStore`'s own write API. It does **not** detect
 an edit made by someone who also has the key (the key, not the schema, is
 the trust boundary) -- key custody outside the application is what this
 buys you, not protection against a fully compromised host. It also does
-**not** detect a row being deleted, or otherwise made to vanish from the
-specific query a decision reads, rather than edited in place. Two concrete,
-still-open instances of that same gap:
+**not**, by itself, detect a row being deleted, or otherwise made to vanish
+from the specific query a decision reads, rather than edited in place --
+that needs the same kind of durable, independently-verifiable "this
+happened" record `HashChainLog` already provides for the audit trail, and
+is what `initialization_ledger` (below) adds for one of the two known
+instances of this gap.
 
-- `live_authority_agents`'s initialization marker: deleting the marker row
-  and re-initializing looks identical to a genuine first-ever startup (see
+- **`live_authority_agents`'s initialization marker -- closed, with a
+  documented residual limit.** `initialization_ledger` (schema v8) is a
+  keyed, hash-chained, append-only table: every `initialize_agent_authority`
+  / `replace_live_authority` first-time-init call appends an entry chained
+  onto the previous entry's `mac` (`LEDGER_GENESIS` for the very first ever
+  written). `is_authority_initialized` cheaply cross-checks the marker
+  row's presence against the ledger entry's presence for the same
+  `(namespace, agent_id)` on every call (one indexed lookup, not a chain
+  walk) and raises `RowIntegrityError` on disagreement -- so a marker
+  deleted *alone* (its ledger entry left behind) is caught immediately (see
   `test_deleted_row_is_indistinguishable_from_never_having_existed_today_
-  but_wont_be`, still skipped) -- a marker row's own MAC proves the row
-  wasn't tampered with while it existed, not that it should still exist.
-- `restrictions`: `active_restrictions` filters on `status = 'ACTIVE'` in
-  SQL before any MAC is checked, so flipping an ACTIVE row's `status`
-  column directly (rather than one of the columns the query still returns)
-  makes it vanish from the result silently, with no `RowIntegrityError`
-  raised (see `test_restriction_status_flip_bypasses_mac_verification_
-  known_gap`, un-skipped and passing -- it pins down the gap itself, not a
-  guarantee). The MAC still catches a forged *new* ACTIVE restriction or an
-  edited-in-place ACTIVE row.
-
-Closing either needs the same kind of durable, independently-verifiable
-"this happened" record `HashChainLog` already provides for the audit trail
--- cross-referencing against it, or an equivalent append-only ledger, rather
-than anything a per-row MAC alone can provide.
+  but_wont_be`). A full O(n) walk of the entire chain
+  (`verify_integrity_ledger`, also run once automatically at `SQLiteStore`
+  construction) additionally catches a marker *and* its ledger entry
+  deleted **together**, as long as some other agent was initialized
+  afterward (deleting entry N breaks entry N+1's `prev_mac` linkage -- see
+  `test_ledger_chain_catches_a_middle_entry_deleted_even_when_its_marker_
+  is_also_deleted`). What neither check catches: deleting the *current tip*
+  -- the single most-recently-initialized agent's marker and ledger entry,
+  removed together, with nothing chained after it yet -- which leaves the
+  remaining chain fully self-consistent (see
+  `test_ledger_chain_does_not_catch_the_current_tip_being_deleted`). That
+  residual gap is the same rollback/truncation problem as (2) below, and
+  needs the same external checkpoint to close -- a purely internal hash
+  chain cannot bootstrap proof that nothing was ever appended after a given
+  point.
+- **`restrictions` status-flip -- still open.** `active_restrictions`
+  filters on `status = 'ACTIVE'` in SQL before any MAC is checked, so
+  flipping an ACTIVE row's `status` column directly (rather than one of the
+  columns the query still returns) makes it vanish from the result
+  silently, with no `RowIntegrityError` raised (see
+  `test_restriction_status_flip_bypasses_mac_verification_known_gap`,
+  un-skipped and passing -- it pins down the gap itself, not a guarantee).
+  The MAC still catches a forged *new* ACTIVE restriction or an
+  edited-in-place ACTIVE row. The same ledger-style cross-check that closed
+  the marker-deletion instance above would generalize here (an append-only
+  "restriction transition" ledger, cross-checked the same way), but hasn't
+  been done yet -- a natural next slice of this same work.
 
 ### 2. A host-provided monotonic checkpoint for rollback detection
 
@@ -148,12 +174,13 @@ design could provide one.
 
 1. ~~Land `tests/test_authority_integrity_spec.py`'s tests un-skipped, one at
    a time, starting with row-level MAC verification~~ -- done for
-   `live_authority`/`live_authority_agents` (schema v6) and for
+   `live_authority`/`live_authority_agents` (schema v6),
    `restrictions`/`replay_nonces`/`replay_proposal_ids`/`step_counters`
-   (schema v7). Still to un-skip: (a) the deleted-marker/status-flip gap,
-   which needs a design decision first (see above) about how to detect a
-   row made to vanish from a query, not just one that's tampered but still
-   returned; (b) rollback detection, below.
+   (schema v7), and the `live_authority_agents` deleted-marker gap
+   (schema v8's `initialization_ledger`). Still to un-skip: (a) generalize
+   the same ledger-cross-check pattern to `restrictions`'s status-flip gap;
+   (b) rollback detection, below (which also happens to be the residual
+   limit the v8 ledger itself couldn't close -- see above).
 2. ~~Add a `key_provider` seam to `SQLiteStore.__init__`~~ -- done:
    `KeyProvider` (protocol) / `InMemoryKeyProvider` (a process-local
    reference implementation for tests and single-process deployments; a
