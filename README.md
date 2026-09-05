@@ -59,13 +59,35 @@ adversarial mutation harness challenges the boundary on every CI run.
   option. Multi-process quorum and KMS-backed keys are tracked for v6.
 - **No formal proof.** The no-authority-laundering property is tested by example
   and challenged by the mutation harness, not proven.
-- **No tamper-rollback detection yet.** A `SQLiteStore`'s hash chain (via
-  `HashChainLog`) detects insertion/deletion/edits to the *append-only audit
-  log*, but nothing here detects a whole-database swap back to an earlier,
-  internally-valid `SQLiteStore` file (a "replace with yesterday's backup"
-  attack) -- that requires a host-held secret and an external monotonic
-  checkpoint outside SQLite itself, which is not implemented. See
-  `docs/DURABILITY.md` for the design and why it is a separate piece of work.
+- **Row-level tamper detection and rollback detection, but the shipped
+  rollback checkpoint is test-only.** `SQLiteStore(key_provider=...)`
+  (schema v9) authenticates every authoritative row -- `live_authority`,
+  `live_authority_agents`, `restrictions`, `replay_nonces`,
+  `replay_proposal_ids`, `step_counters` -- with a keyed HMAC, detecting a
+  row edited, replaced, or inserted outside `SQLiteStore`'s own write API.
+  Two keyed, hash-chained, append-only ledgers -- `initialization_ledger`
+  and `restriction_ledger` -- close most of a further gap where a per-row
+  MAC alone falls short: a row *deleted* (not tampered), or a restriction's
+  `status` column *flipped* directly (making it silently vanish from
+  `active_restrictions` before any MAC is ever checked). Both are caught
+  immediately when the deleted/forged row is the only thing wrong; both are
+  still caught even when the accompanying ledger entry is deleted too, as
+  long as something else was recorded afterward -- but not when the
+  *current tip* (the single most-recently-written entry) is deleted with
+  nothing chained after it. `SQLiteStore(rollback_checkpoint=...)` (schema
+  v10) closes the remaining case -- a whole-database swap back to an
+  earlier, internally-valid backup -- via a two-phase local/external
+  sequence-number protocol, but **the only implementation this repository
+  ships, `InMemoryRollbackCheckpoint`, provides zero real protection**
+  (its state lives in the same process, exactly as untrustworthy as the
+  file it's meant to be independent of); a real deployment must supply its
+  own `RollbackCheckpoint` backed by genuinely external, trusted state (a
+  TPM/secure-enclave counter, a remote attestation service, ...), and
+  decide its own cadence for calling `advance_checkpoint()` -- neither is
+  something this repository can decide generically. `HashChainLog`'s hash
+  chain remains the only tamper-evidence for the *append-only audit log*,
+  unrelated to any of this. See `docs/DURABILITY.md` for the full design
+  and what a deployment still has to bring itself.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full list of fixes. The v4 code is
 under [`legacy/`](legacy/) and is unmaintained.
@@ -352,8 +374,11 @@ depends on, stated precisely:
   which always names exactly what's still in-memory-only for a given
   governor instance.
 * **What durability does *not* mean.** Durable and atomic is not the same as
-  tamper-evident against a whole-file rollback. See "No tamper-rollback
-  detection yet" above and `docs/DURABILITY.md`.
+  tamper-evident against direct row edits (closed, with documented residual
+  limits) or against a whole-file rollback (mechanism implemented, but
+  requires a real deployment to supply a genuinely external
+  `RollbackCheckpoint` -- see "Row-level tamper detection..." above). See
+  `docs/DURABILITY.md`.
 
 Development mode (no `SQLiteStore`, or `GovernorConfig()` instead of
 `GovernorConfig.production()`) trades all of this away for a simpler local
@@ -547,7 +572,7 @@ copyright holder.
 | Must | Network quorum transport (Raft / PBFT) with real peer governors |
 | Must | mTLS / SPIFFE identity for the service instead of shared/per-caller tokens |
 | Must | Durable STEP_BUDGET-policy restriction budgets and `provenance` (`live_authority`, permission budgets, and fleet/per-agent step budgets are durable as of schema v5 — see "Durability" above) |
-| Must | Keyed row authentication and a host-external rollback checkpoint for the durable-authority store (design in `docs/DURABILITY.md`, not yet implemented) |
+| Must | A genuinely external `RollbackCheckpoint` implementation (a TPM/secure-enclave counter, a remote attestation service, ...) — the checkpoint *mechanism* itself (schema v10), plus everything else in the keyed-integrity layer, is done — see `docs/DURABILITY.md`; `InMemoryRollbackCheckpoint` is test-only and provides no real protection |
 | Should | Encrypted key material at rest in `KeyRegistry`; HSM/KMS backend |
 | Should | Formal TLA+ model of the delegation invariants |
 | Should | Wall-clock fleet budgets and sliding-window rate limits |

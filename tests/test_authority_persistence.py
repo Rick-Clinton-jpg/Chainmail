@@ -9,7 +9,7 @@ policy/envelope fingerprint change does not restore consumed authority, a
 long delegation chain cannot launder authority beyond the original root
 ceiling, contextual similarity cannot expand authority, and schema
 migration from v4 leaves v5's new tables usable without disturbing existing
-data.
+data (and v5 -> v6's additive mac/key_id columns are usable the same way).
 """
 
 import sqlite3
@@ -381,8 +381,10 @@ def test_v4_database_upgrades_to_v5_without_disturbing_existing_data(tmp_path):
     store_v4._conn.commit()
     store_v4.close()
 
-    store_v5 = SQLiteStore(db)  # triggers the (no-op, purely additive) v4->v5 hop
-    assert store_v5.SCHEMA_VERSION == 5
+    store_v5 = SQLiteStore(db)  # triggers the (no-op, purely additive) v4->current hop
+    assert store_v5._conn.execute(
+        "SELECT version FROM schema_version"
+    ).fetchone()[0] == SQLiteStore.SCHEMA_VERSION
     # Pre-existing v4 data survived untouched.
     assert store_v5.active_restrictions(namespace="default", agent_id="agent_research")
     assert store_v5.claim_nonce(namespace="default", agent_id="agent_research", nonce="n1") is False
@@ -391,6 +393,256 @@ def test_v4_database_upgrades_to_v5_without_disturbing_existing_data(tmp_path):
     assert store_v5.initialize_agent_authority(
         namespace="default", agent_id="agent_research",
         permissions=[("research", "*", None)], envelope_fingerprint="fp1") is True
+
+
+def test_v5_database_upgrades_to_v6_with_mac_columns_usable(tmp_path):
+    """A v5 database (live_authority/live_authority_agents without mac/
+    key_id columns) upgrades to v6 by adding those columns -- purely
+    additive, no data migration -- and a key_provider attached afterwards
+    can immediately read/write authenticated rows against it."""
+    from chainmail.persistence import InMemoryKeyProvider
+
+    db = str(tmp_path / "chainmail.db")
+    store_v5 = SQLiteStore(db)
+    store_v5.initialize_agent_authority(
+        namespace="default", agent_id="agent_research",
+        permissions=[("research", "*", 5)], envelope_fingerprint="fp1")
+    # Simulate a genuine pre-v6 table shape (no mac/key_id columns yet) --
+    # SQLiteStore always creates the current (v6) shape, so rebuild the
+    # table the way v5 actually left it before the migration this test
+    # exercises existed.
+    store_v5._conn.executescript("""
+        ALTER TABLE live_authority RENAME TO live_authority_v5;
+        CREATE TABLE live_authority (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            deployment_namespace TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            permission_name TEXT NOT NULL,
+            permission_scope TEXT NOT NULL,
+            max_budget INTEGER,
+            remaining INTEGER,
+            source TEXT NOT NULL,
+            envelope_fingerprint TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE (deployment_namespace, agent_id, permission_name, permission_scope)
+        );
+        INSERT INTO live_authority (deployment_namespace, agent_id, permission_name,
+            permission_scope, max_budget, remaining, source, envelope_fingerprint,
+            created_at, updated_at)
+        SELECT deployment_namespace, agent_id, permission_name, permission_scope,
+            max_budget, remaining, source, envelope_fingerprint, created_at, updated_at
+        FROM live_authority_v5;
+        DROP TABLE live_authority_v5;
+    """)
+    store_v5._conn.execute("UPDATE schema_version SET version = 5")
+    store_v5._conn.commit()
+    cols_before = {row[1] for row in
+                   store_v5._conn.execute("PRAGMA table_info(live_authority)").fetchall()}
+    assert "mac" not in cols_before
+    store_v5.close()
+
+    key_provider = InMemoryKeyProvider("k1", b"secret-key-material")
+    store_v6 = SQLiteStore(db, key_provider=key_provider)
+    cols_after = {row[1] for row in
+                  store_v6._conn.execute("PRAGMA table_info(live_authority)").fetchall()}
+    assert {"mac", "key_id"} <= cols_after
+    # Pre-existing v5 row has no mac yet -- reading it with a key_provider
+    # now attached must fail closed, not silently trust an unauthenticated
+    # legacy row now that authentication is turned on.
+    with pytest.raises(sqlite3.Error):
+        store_v6.get_live_authority_rows(namespace="default", agent_id="agent_research")
+    # A freshly written row is authenticated and readable.
+    store_v6.replace_live_authority(
+        namespace="default", agent_id="agent_research",
+        permissions=[("research", "*", 5)], source="delegation", envelope_fingerprint="fp2")
+    rows = store_v6.get_live_authority_rows(namespace="default", agent_id="agent_research")
+    assert rows[0]["remaining"] == 5
+
+
+def test_v6_database_upgrades_to_v7_with_mac_columns_usable(tmp_path):
+    """A v6 database (restrictions/replay_nonces/replay_proposal_ids/
+    step_counters without mac/key_id columns -- only live_authority/
+    live_authority_agents had them at v6) upgrades to v7 by adding those
+    columns to the remaining tables -- purely additive, no data migration
+    -- and a key_provider attached afterwards can immediately read/write
+    authenticated rows against them."""
+    from chainmail.persistence import InMemoryKeyProvider
+
+    db = str(tmp_path / "chainmail.db")
+    store_v6 = SQLiteStore(db)
+    store_v6.impose_restriction(
+        namespace="default", agent_id="agent_research", permission_name="research",
+        permission_scope="*", permission_max_budget=None, reason_code="TEST",
+        source_proposal_id="p1", envelope_fingerprint="fp1", expiry_kind="human",
+        expiry_value=None,
+    )
+    # Simulate a genuine pre-v7 `restrictions` shape (no mac/key_id yet).
+    store_v6._conn.executescript("""
+        ALTER TABLE restrictions RENAME TO restrictions_v6;
+        CREATE TABLE restrictions (
+            restriction_id TEXT PRIMARY KEY,
+            deployment_namespace TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            permission_name TEXT NOT NULL,
+            permission_scope TEXT NOT NULL,
+            permission_max_budget INTEGER,
+            status TEXT NOT NULL,
+            reason_code TEXT NOT NULL,
+            source_proposal_id TEXT NOT NULL,
+            envelope_fingerprint TEXT,
+            expiry_kind TEXT NOT NULL,
+            expiry_value REAL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            cleared_by TEXT,
+            cleared_reason TEXT,
+            cleared_policy_version TEXT
+        );
+        INSERT INTO restrictions (restriction_id, deployment_namespace, agent_id,
+            permission_name, permission_scope, permission_max_budget, status,
+            reason_code, source_proposal_id, envelope_fingerprint, expiry_kind,
+            expiry_value, created_at, updated_at, cleared_by, cleared_reason,
+            cleared_policy_version)
+        SELECT restriction_id, deployment_namespace, agent_id, permission_name,
+            permission_scope, permission_max_budget, status, reason_code,
+            source_proposal_id, envelope_fingerprint, expiry_kind, expiry_value,
+            created_at, updated_at, cleared_by, cleared_reason, cleared_policy_version
+        FROM restrictions_v6;
+        DROP TABLE restrictions_v6;
+    """)
+    store_v6._conn.execute("UPDATE schema_version SET version = 6")
+    store_v6._conn.commit()
+    cols_before = {row[1] for row in
+                   store_v6._conn.execute("PRAGMA table_info(restrictions)").fetchall()}
+    assert "mac" not in cols_before
+    store_v6.close()
+
+    key_provider = InMemoryKeyProvider("k1", b"secret-key-material")
+    store_v7 = SQLiteStore(db, key_provider=key_provider)
+    cols_after = {row[1] for row in
+                  store_v7._conn.execute("PRAGMA table_info(restrictions)").fetchall()}
+    assert {"mac", "key_id"} <= cols_after
+    # Pre-existing v6 row has no mac -- reading it now that authentication
+    # is turned on must fail closed, not silently trust it.
+    with pytest.raises(sqlite3.Error):
+        store_v7.active_restrictions(namespace="default", agent_id="agent_research")
+    # A freshly-imposed restriction is authenticated and readable.
+    store_v7.impose_restriction(
+        namespace="default", agent_id="agent_research", permission_name="research",
+        permission_scope="*", permission_max_budget=None, reason_code="TEST2",
+        source_proposal_id="p2", envelope_fingerprint="fp2", expiry_kind="human",
+        expiry_value=None,
+    )
+    assert len(store_v7._conn.execute(
+        "SELECT 1 FROM restrictions WHERE reason_code = 'TEST2'"
+    ).fetchall()) == 1
+
+
+def test_v7_database_upgrades_to_v8_with_initialization_ledger_usable(tmp_path):
+    """A v7 database (no initialization_ledger table at all) upgrades to
+    v8 by creating that table fresh -- no ALTER needed, since it's a brand
+    new table rather than new columns on an existing one -- and a
+    key_provider attached afterwards can immediately use it."""
+    from chainmail.persistence import InMemoryKeyProvider
+
+    db = str(tmp_path / "chainmail.db")
+    store_v7 = SQLiteStore(db)
+    store_v7.initialize_agent_authority(
+        namespace="default", agent_id="agent_research",
+        permissions=[("research", "*", 5)], envelope_fingerprint="fp1")
+    store_v7._conn.execute("DROP TABLE initialization_ledger")
+    store_v7._conn.execute("UPDATE schema_version SET version = 7")
+    store_v7._conn.commit()
+    assert not store_v7._table_exists(store_v7._conn, "initialization_ledger")
+    store_v7.close()
+
+    key_provider = InMemoryKeyProvider("k1", b"secret-key-material")
+    store_v8 = SQLiteStore(db, key_provider=key_provider)
+    assert store_v8._table_exists(store_v8._conn, "initialization_ledger")
+    store_v8.verify_integrity_ledger()  # empty ledger, does not raise
+
+    # agent_research was initialized before authentication was turned on --
+    # no ledger entry exists for it, so the cross-check in
+    # is_authority_initialized must fail closed rather than silently
+    # trusting the pre-existing, now-unverifiable marker row.
+    with pytest.raises(sqlite3.Error):
+        store_v8.is_authority_initialized(namespace="default", agent_id="agent_research")
+
+    # A freshly-initialized agent gets a matching marker + ledger entry.
+    assert store_v8.initialize_agent_authority(
+        namespace="default", agent_id="agent_new",
+        permissions=[("research", "*", 5)], envelope_fingerprint="fp2") is True
+    assert store_v8.is_authority_initialized(namespace="default", agent_id="agent_new") is True
+    store_v8.verify_integrity_ledger()
+
+
+def test_v8_database_upgrades_to_v9_with_restriction_ledger_usable(tmp_path):
+    """A v8 database (no restriction_ledger table at all) upgrades to v9
+    by creating that table fresh, same as v7->v8 -- and a key_provider
+    attached afterwards can immediately use it."""
+    from chainmail.persistence import InMemoryKeyProvider
+
+    db = str(tmp_path / "chainmail.db")
+    store_v8 = SQLiteStore(db)
+    store_v8.impose_restriction(
+        namespace="default", agent_id="agent_research", permission_name="research",
+        permission_scope="*", permission_max_budget=None, reason_code="TEST",
+        source_proposal_id="p1", envelope_fingerprint="fp1", expiry_kind="human",
+        expiry_value=None,
+    )
+    store_v8._conn.execute("DROP TABLE restriction_ledger")
+    store_v8._conn.execute("UPDATE schema_version SET version = 8")
+    store_v8._conn.commit()
+    assert not store_v8._table_exists(store_v8._conn, "restriction_ledger")
+    store_v8.close()
+
+    key_provider = InMemoryKeyProvider("k1", b"secret-key-material")
+    store_v9 = SQLiteStore(db, key_provider=key_provider)
+    assert store_v9._table_exists(store_v9._conn, "restriction_ledger")
+    store_v9.verify_integrity_ledger()  # empty restriction_ledger, does not raise
+
+    # The restriction imposed before authentication was turned on has no
+    # ledger entry -- the cross-check in active_restrictions must fail
+    # closed rather than silently trusting it.
+    with pytest.raises(sqlite3.Error):
+        store_v9.active_restrictions(namespace="default", agent_id="agent_research")
+
+    # A freshly-imposed restriction gets a matching ledger entry.
+    store_v9.impose_restriction(
+        namespace="default", agent_id="agent_new", permission_name="research",
+        permission_scope="*", permission_max_budget=None, reason_code="TEST2",
+        source_proposal_id="p2", envelope_fingerprint="fp2", expiry_kind="human",
+        expiry_value=None,
+    )
+    assert store_v9.active_restrictions(namespace="default", agent_id="agent_new")
+    store_v9.verify_integrity_ledger()
+
+
+def test_v9_database_upgrades_to_v10_with_rollback_checkpoint_state_usable(tmp_path):
+    """A v9 database (no rollback_checkpoint_state table at all) upgrades
+    to v10 by creating that table fresh, same as the earlier ledger
+    tables -- and a rollback_checkpoint attached afterwards can
+    immediately use it."""
+    from chainmail.persistence import InMemoryRollbackCheckpoint
+
+    db = str(tmp_path / "chainmail.db")
+    store_v9 = SQLiteStore(db)
+    store_v9._conn.execute("DROP TABLE rollback_checkpoint_state")
+    store_v9._conn.execute("UPDATE schema_version SET version = 9")
+    store_v9._conn.commit()
+    assert not store_v9._table_exists(store_v9._conn, "rollback_checkpoint_state")
+    store_v9.close()
+
+    checkpoint = InMemoryRollbackCheckpoint()
+    store_v10 = SQLiteStore(db, rollback_checkpoint=checkpoint)
+    assert store_v10._table_exists(store_v10._conn, "rollback_checkpoint_state")
+    assert store_v10.rollback_protected is True
+    # Fresh row (seq=0) matches the fresh checkpoint (0) -- no rollback,
+    # construction succeeded (already proven by reaching this line).
+    new_seq = store_v10.advance_checkpoint()
+    assert new_seq == 1
+    assert checkpoint.read() == 1
 
 
 # -- freshness rule: no previously-resolved Authority reused across hops/decisions --

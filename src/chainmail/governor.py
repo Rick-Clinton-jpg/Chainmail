@@ -304,6 +304,41 @@ class ChainmailGovernor:
             "not affect the authoritative delegated-authority state itself, which "
             "is durable when a SQLiteStore is wired in -- see CHANGELOG.md"
         )
+        # Row-level tamper detection (keyed MAC + hash-chained ledgers,
+        # schema v6-v9) and rollback detection (schema v10) are two
+        # separate, independently opt-in properties of the durable store --
+        # see docs/DURABILITY.md. Reported only when a SQLiteStore is wired
+        # in at all (durable_authority); with no durable store, neither
+        # question applies (there is no durable row to authenticate or
+        # roll back). Deliberately does NOT imply row authentication alone
+        # covers rollback -- a keyed MAC on every row still cannot detect a
+        # whole-database swap back to an earlier, internally-valid backup,
+        # which is exactly why rollback_checkpoint_configured is reported
+        # and warned about separately, never folded into the same flag.
+        row_authentication_configured: Optional[bool] = None
+        rollback_checkpoint_configured: Optional[bool] = None
+        if durable_authority:
+            row_authentication_configured = self.audit.sqlite.row_authentication_configured
+            rollback_checkpoint_configured = self.audit.sqlite.rollback_protected
+            if not row_authentication_configured:
+                weaknesses.append(
+                    "durable authority/restriction/replay rows are not authenticated "
+                    "-- something with direct filesystem access to the SQLite file "
+                    "can edit, replace, or insert a row without going through "
+                    "SQLiteStore's write API; wire a KeyProvider via "
+                    "SQLiteStore(key_provider=...) for keyed row authentication"
+                )
+            if not rollback_checkpoint_configured:
+                weaknesses.append(
+                    "no rollback checkpoint is configured -- even with row "
+                    "authentication enabled, nothing detects the SQLite file being "
+                    "restored to an earlier, internally-valid backup (every row in "
+                    "it was validly written, just earlier); wire a RollbackCheckpoint "
+                    "backed by genuinely external, trusted state (a TPM/secure-"
+                    "enclave counter, a remote attestation service, ...) via "
+                    "SQLiteStore(rollback_checkpoint=...) -- see docs/DURABILITY.md, "
+                    "which this repository does not ship an implementation of"
+                )
         return {
             "governor_id": self.governor_id,
             "signature_required": self.config.require_signature,
@@ -319,6 +354,8 @@ class ChainmailGovernor:
             "durable_replay_protection": durable_replay,
             "durable_restriction_protection": durable_restrictions,
             "durable_authority_and_budgets": durable_authority,
+            "row_authentication_configured": row_authentication_configured,
+            "rollback_checkpoint_configured": rollback_checkpoint_configured,
             "production_mode": self.config.production_mode,
             "deployment_namespace": self.deployment_namespace,
             "weaknesses": weaknesses,

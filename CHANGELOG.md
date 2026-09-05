@@ -2,6 +2,294 @@
 
 ## Unreleased
 
+### Added — rollback-checkpoint mechanism (schema v10)
+
+Fifth and final slice of `docs/DURABILITY.md`'s keyed-integrity layer: a
+whole-database rollback (restoring an earlier, internally-valid backup) is
+now detectable, closing the one gap row-level MACs and the two hash-chained
+ledgers (schema v6-v9) cannot -- every row in a restored backup was validly
+written, just earlier, so nothing about the rows themselves looks wrong.
+
+New `rollback_checkpoint_state` table (schema v10, single row): this
+database file's own locally-recorded checkpoint sequence number. New
+`RollbackCheckpoint` protocol (`read()`/`advance()`, backed by storage
+*outside* the SQLite file), `InMemoryRollbackCheckpoint` (a reference
+implementation -- see the caveat below), `RollbackDetectedError`, and
+`SQLiteStore.advance_checkpoint()`:
+
+- `advance_checkpoint()` is a two-phase protocol: the local sequence bump
+  commits first (a real, atomic SQLite transaction), then that exact value
+  is pushed to the external checkpoint's `advance()`. A crash or failure
+  between the two phases leaves local ahead of external -- self-healed at
+  the next construction (not treated as rollback, since local-ahead means
+  "further along than the checkpoint currently knows", not "restored to an
+  earlier state").
+- At construction, `_check_rollback_checkpoint` compares local against
+  external: local < external raises `RollbackDetectedError` (construction
+  fails closed, like `SchemaVersionError`) -- exactly what restoring an
+  earlier backup looks like; local > external self-heals; local == external
+  is the steady state.
+- New `SQLiteStore.rollback_protected` / `row_authentication_configured`
+  properties, surfaced through `ChainmailGovernor.security_report()` as
+  `rollback_checkpoint_configured` / `row_authentication_configured`, with
+  new weaknesses when a durable store is wired in but either is missing --
+  deliberately worded so enabling row authentication alone is never mistaken
+  for rollback protection, and vice versa.
+
+**Important caveat, honestly documented (see updated `docs/DURABILITY.md`):**
+the checkpoint *mechanism* is implemented and correct, but
+`InMemoryRollbackCheckpoint` -- the only implementation this repository
+ships -- provides **no real protection**: its state lives in the same
+process as the database it's supposed to be independent of. A real
+deployment must supply its own `RollbackCheckpoint` backed by genuinely
+external, trusted state (a TPM/secure-enclave counter, a remote attestation
+service, an operator-verified value), and decide its own cadence for
+calling `advance_checkpoint()` -- this repository does not wire it into any
+write path automatically, since the right cadence depends entirely on the
+cost of whichever external mechanism a deployment actually has. Also
+documented as a real, current limitation: `rollback_checkpoint_state`'s
+sequence number is independent of the ledgers' own content, so it does not
+by itself close the `initialization_ledger`/`restriction_ledger`
+tip-deletion gap noted in the previous two commits -- a surgical, live edit
+to just the ledger's tip row leaves the checkpoint sequence untouched.
+
+Un-skips the three remaining tests in `tests/test_authority_integrity_spec.py`
+(`test_rollback_to_an_earlier_valid_database_is_detected_with_a_checkpoint_
+configured`, `test_rollback_without_a_configured_checkpoint_is_honestly_
+unsupported`, `test_checkpoint_advances_atomically_with_the_state_it_
+protects`) -- every test in that file is now un-skipped. New migration test
+proves a genuine pre-v10 database upgrades cleanly. New governor-level
+tests prove `security_report()` distinguishes row authentication from
+rollback protection rather than conflating them, and omits both fields
+entirely when no durable store is wired in at all.
+
+246 passed, 1 skipped (was 239/4 before this commit; the remaining skip is
+unrelated -- an optional embedding dependency not installed in this
+environment).
+
+### Added — generalize the ledger fix to restrictions' status-flip gap (schema v9)
+
+Fourth slice of the tamper-detection layer: generalizes schema v8's
+`initialization_ledger` mechanism to `restrictions`, closing the gap
+noted when v7's row-level MAC coverage landed -- `active_restrictions`
+filters on `status = 'ACTIVE'` in SQL *before* any MAC is checked, so an
+attacker who flipped an ACTIVE row's `status` column directly (rather
+than editing one of the columns the query still returns) made it vanish
+from the result silently, with no `RowIntegrityError` raised.
+
+New `restriction_ledger` table: a keyed, hash-chained, append-only log of
+every restriction IMPOSED/EXPIRED/CLEARED transition, same mechanism as
+`initialization_ledger` (each entry's `mac` chained onto the previous
+entry's, `LEDGER_GENESIS` for the first ever written). The chain-walk
+logic itself was factored out into a shared `_verify_hash_chain` once a
+second ledger needed it, rather than duplicating the loop.
+
+- `active_restrictions` now cross-checks, per call: for every
+  `restriction_id` this agent's ledger has ever recorded a transition
+  for, look at only its *latest* entry (one query per agent, not a full
+  chain walk) -- if that latest transition is IMPOSED ("should still be
+  ACTIVE") but the restriction_id is missing from what the ACTIVE query
+  just returned, that disagreement is exactly a status flip without a
+  matching ledger entry.
+- `impose_restriction`/`mark_expired`/`clear_restriction` each append a
+  ledger entry (IMPOSED/EXPIRED/CLEARED respectively) in the same
+  transaction as the `restrictions` row write.
+- `_verify_restriction_ledger_chain` (a full O(n) walk, part of
+  `verify_integrity_ledger` and also run once automatically at
+  `SQLiteStore` construction) additionally catches a status flip whose
+  ledger entry was deleted too, as long as another restriction's
+  transition was recorded afterward.
+
+Same residual limit as `initialization_ledger`, honestly documented (see
+updated `docs/DURABILITY.md`): deleting the chain's current tip -- the
+single most-recent transition, nothing chained after it yet -- is not
+caught. Still the same rollback/truncation problem tracked as needing an
+external checkpoint.
+
+Rewrote `test_restriction_status_flip_bypasses_mac_verification_known_gap`
+(which asserted the old, now-fixed behavior) into
+`test_restriction_status_flip_is_now_caught_by_the_ledger_cross_check`;
+added 6 more tests covering the non-adversarial legitimate-transition
+path, a forged ledger entry planted to hide a flip (still fails its own
+mac), the middle-entry-deleted chain break, the tip-deletion limit, and
+the unauthenticated no-op path. New migration test
+`test_v8_database_upgrades_to_v9_with_restriction_ledger_usable` proves a
+genuine pre-v9 database upgrades cleanly and that attaching a
+`key_provider` afterwards fails closed on a restriction imposed before
+authentication was turned on.
+
+239 passed, 4 skipped (was 233/4 before this commit; only the three
+rollback-checkpoint tests and one unrelated pre-existing skip remain).
+
+### Added — keyed, hash-chained ledger closing the deleted-marker gap (schema v8)
+
+Third slice of the tamper-detection layer: a per-row MAC can only verify a
+row that's still present to check, so a `live_authority_agents`
+initialization-marker row deleted outright (bypassing `SQLiteStore`'s write
+API) looked identical to a genuine first-ever startup -- re-initializing
+would then re-seed authority at the envelope ceiling, restoring whatever
+was previously delegated away or consumed. This closes most of that gap.
+
+New `initialization_ledger` table: a keyed, hash-chained, append-only log
+of every agent-authority-initialization event (`LEDGER_GENESIS`,
+`_append_initialization_ledger_entry`, `_verify_ledger_chain`,
+`verify_integrity_ledger`). Each entry's `mac` is computed over its own
+content *and* the previous entry's `mac` (or `LEDGER_GENESIS` for the very
+first entry ever written), so deleting or reordering an entry breaks the
+next entry's chain linkage -- detectable without needing anything external.
+
+- `is_authority_initialized` now cross-checks the `live_authority_agents`
+  marker row's presence against the `initialization_ledger` entry's
+  presence for the same `(namespace, agent_id)` on every call -- one cheap
+  indexed lookup, not a chain walk -- and raises `RowIntegrityError` on
+  disagreement. A marker deleted *alone* is caught here immediately.
+- `_verify_ledger_chain` (a full O(n) walk) additionally catches a marker
+  *and* its ledger entry deleted **together**, as long as some other agent
+  was initialized afterward (the next entry's chain linkage breaks). This
+  runs once, automatically, at `SQLiteStore` construction, and is exposed
+  for on-demand use as `verify_integrity_ledger()`.
+- `initialize_agent_authority` and `replace_live_authority`'s first-time-
+  init path both now go through a shared `_mark_agent_initialized` helper
+  that writes the marker row and its ledger entry atomically, in the same
+  transaction.
+
+Honestly documented, not claimed as closed (see updated
+`docs/DURABILITY.md`): deleting the ledger's **current tip** -- the single
+most-recently-initialized agent's marker and ledger entry, removed
+together, with nothing chained after it yet -- leaves the remaining chain
+fully self-consistent and undetectable by this mechanism. That is the same
+rollback/truncation problem already tracked as needing an external,
+host-provided checkpoint, and this ledger doesn't (and can't, on its own)
+close it. `restrictions`'s status-flip gap (a different instance of the
+same underlying "made to vanish from a query" category) is not addressed
+by this commit either -- the same ledger-style cross-check would
+generalize there but hasn't been done yet.
+
+8 new tests in `tests/test_authority_integrity_spec.py`: the deleted-marker
+test itself is un-skipped and passing; new tests cover the both-deleted-
+together case the cheap check misses but the chain walk catches, the
+tip-deletion limit the chain walk itself doesn't catch, key rotation across
+ledger entries, the unauthenticated no-op path, and
+`replace_live_authority`'s first-time-init path also writing a ledger entry.
+New migration test `test_v7_database_upgrades_to_v8_with_initialization_
+ledger_usable` proves a genuine pre-v8 database (no `initialization_ledger`
+table at all) upgrades cleanly and that attaching a `key_provider`
+afterwards fails closed on an agent initialized before authentication was
+turned on (no ledger entry exists for it).
+
+233 passed, 4 skipped (was 225/5 before this commit; only the three
+rollback-checkpoint tests remain skipped now).
+
+### Added — keyed row authentication for restrictions, replay tables, and step_counters (schema v7)
+
+Second slice of the tamper-detection layer, extending schema v6's
+`live_authority`/`live_authority_agents` row authentication to every
+remaining table `SQLiteStore` treats as authoritative state:
+`restrictions`, `replay_nonces`, `replay_proposal_ids`, `step_counters`.
+Same opt-in, purely-additive shape (`mac`/`key_id` -- `mac_key_id` on
+`replay_nonces`, which already has an unrelated `key_id` column for the
+signing key that verified the claimed proposal's signature) and same
+fail-closed contract (`RowIntegrityError`, a `sqlite3.Error` subclass) as
+v6.
+
+- `active_restrictions` verifies the MAC on every ACTIVE row it returns;
+  `impose_restriction`/`mark_expired`/`clear_restriction` write or refresh
+  a valid MAC on every write, including the ACTIVE -> EXPIRED/CLEARED
+  transitions.
+- `claim_nonce`/`claim_proposal_id` write a MAC on a new claim, and now
+  verify the *existing* row when a claim hits the UNIQUE conflict --
+  a row an attacker planted to pre-emptively block a nonce/proposal_id a
+  legitimate agent hasn't used yet no longer looks like a genuine prior
+  claim.
+- `increment_step_counter`/`peek_step_counter` verify the pre-existing
+  count before building on top of it (so a count reset to renew a step
+  budget is caught) and refresh the MAC after every increment, inside the
+  same transaction as the increment itself.
+
+Honestly documented, not claimed as closed (see updated
+`docs/DURABILITY.md`): `active_restrictions` filters on
+`status = 'ACTIVE'` in SQL *before* any MAC is checked, so an attacker who
+flips an ACTIVE row's `status` column directly (rather than editing one of
+the columns the query still returns) makes it vanish from the result
+silently -- the same category of gap as a deleted
+`live_authority_agents` marker. New test
+`test_restriction_status_flip_bypasses_mac_verification_known_gap` pins
+this down explicitly rather than leaving it merely described in prose.
+
+New migration test `test_v6_database_upgrades_to_v7_with_mac_columns_
+usable` proves a genuine pre-v7 `restrictions` table upgrades cleanly and
+that attaching a `key_provider` afterwards fails closed on a pre-existing
+unauthenticated row.
+
+9 new tests in `tests/test_authority_integrity_spec.py` (tampered/forged
+rows for restrictions, replay_nonces, replay_proposal_ids, and
+step_counters; the documented status-flip gap; transition/rotation/
+non-adversarial regression coverage), plus the migration test above in
+`tests/test_authority_persistence.py`.
+
+225 passed, 5 skipped (was 215/5 before this commit).
+
+### Added — keyed row authentication for durable live authority (schema v6)
+
+First implemented slice of the tamper-detection layer `docs/DURABILITY.md`
+scoped out of the original durable-authority/budget work (schema v5):
+`live_authority` and `live_authority_agents` rows can now be authenticated
+with a keyed HMAC, closing the gap where something with direct filesystem
+access to the SQLite file could edit, replace, or insert a row without going
+through `SQLiteStore`'s own write API.
+
+New, additive-only schema v6: `mac`/`key_id` columns on both tables, both
+nullable so a `SQLiteStore` opened without a `key_provider` (the default)
+reads/writes exactly as schema v5 did -- authentication is entirely opt-in.
+Existing v5 databases upgrade in place (`ALTER TABLE ... ADD COLUMN`, no
+data migration needed).
+
+New: `KeyProvider` (a `(key_id, key_bytes)` protocol -- `current()` for
+signing, `get(key_id)` for verifying rows written under an earlier,
+possibly-rotated-out key), `InMemoryKeyProvider` (a process-local reference
+implementation for tests and single-process deployments), and
+`RowIntegrityError`, deliberately a subclass of `sqlite3.Error` so every
+existing `except sqlite3.Error` call site in `ChainmailGovernor` already
+treats a failed-verification row exactly like any other durable-store
+failure and fails closed (HUMAN, `AUTHORITY_STORE_UNAVAILABLE`) without
+needing a new exception path threaded through the governor.
+
+`get_live_authority_rows` and `is_authority_initialized` recompute and check
+the MAC on every read that feeds an authorization decision.
+`initialize_agent_authority`, `replace_live_authority`, and
+`consume_permission_budget` write/refresh a valid MAC on every authoritative
+write; `consume_permission_budget`'s MAC refresh happens via the same
+`UPDATE ... RETURNING` statement's transaction as the budget decrement
+itself, so no reader can ever observe a decremented `remaining` whose MAC
+still reflects the pre-consume value.
+
+Still open, and explicitly not claimed here (see the updated
+`docs/DURABILITY.md`): `restrictions`/`replay_nonces`/`replay_proposal_ids`/
+`step_counters` remain unauthenticated; a `live_authority_agents` marker row
+that is *deleted* (not tampered, just absent) is still indistinguishable
+from "never initialized" -- a per-row MAC cannot prove a row used to exist;
+and rollback-to-an-older-database detection remains entirely unimplemented
+(it needs external, host-provided trusted state this repository does not
+ship).
+
+Six of the seven tests in `tests/test_authority_integrity_spec.py` (design
+spec, previously all skipped) are now un-skipped and real:
+`test_tampered_live_authority_row_is_rejected`,
+`test_tampered_row_without_the_key_cannot_forge_a_valid_mac`,
+`test_unauthenticated_store_is_unaffected_by_row_verification`,
+`test_consume_permission_budget_keeps_the_mac_current`,
+`test_replace_live_authority_keeps_the_mac_current`,
+`test_key_rotation_does_not_invalidate_existing_rows`. The remaining four
+(the deleted-marker gap and the three rollback-checkpoint tests) stay
+skipped, unchanged from before. New migration test
+`test_v5_database_upgrades_to_v6_with_mac_columns_usable` (in `tests/
+test_authority_persistence.py`) also asserts a genuine v5-shaped database
+(no mac/key_id columns) upgrades cleanly and that attaching a
+`key_provider` afterwards fails closed on the pre-existing unauthenticated
+row rather than silently trusting it.
+
+215 passed, 5 skipped (was 208/8 before this commit).
+
 ### Added — register_delegation(merge=True) to accumulate authority from multiple delegators
 
 The previous commit documented that `register_delegation` replaces the
