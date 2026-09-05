@@ -2,6 +2,67 @@
 
 ## Unreleased
 
+### Added — keyed row authentication for durable live authority (schema v6)
+
+First implemented slice of the tamper-detection layer `docs/DURABILITY.md`
+scoped out of the original durable-authority/budget work (schema v5):
+`live_authority` and `live_authority_agents` rows can now be authenticated
+with a keyed HMAC, closing the gap where something with direct filesystem
+access to the SQLite file could edit, replace, or insert a row without going
+through `SQLiteStore`'s own write API.
+
+New, additive-only schema v6: `mac`/`key_id` columns on both tables, both
+nullable so a `SQLiteStore` opened without a `key_provider` (the default)
+reads/writes exactly as schema v5 did -- authentication is entirely opt-in.
+Existing v5 databases upgrade in place (`ALTER TABLE ... ADD COLUMN`, no
+data migration needed).
+
+New: `KeyProvider` (a `(key_id, key_bytes)` protocol -- `current()` for
+signing, `get(key_id)` for verifying rows written under an earlier,
+possibly-rotated-out key), `InMemoryKeyProvider` (a process-local reference
+implementation for tests and single-process deployments), and
+`RowIntegrityError`, deliberately a subclass of `sqlite3.Error` so every
+existing `except sqlite3.Error` call site in `ChainmailGovernor` already
+treats a failed-verification row exactly like any other durable-store
+failure and fails closed (HUMAN, `AUTHORITY_STORE_UNAVAILABLE`) without
+needing a new exception path threaded through the governor.
+
+`get_live_authority_rows` and `is_authority_initialized` recompute and check
+the MAC on every read that feeds an authorization decision.
+`initialize_agent_authority`, `replace_live_authority`, and
+`consume_permission_budget` write/refresh a valid MAC on every authoritative
+write; `consume_permission_budget`'s MAC refresh happens via the same
+`UPDATE ... RETURNING` statement's transaction as the budget decrement
+itself, so no reader can ever observe a decremented `remaining` whose MAC
+still reflects the pre-consume value.
+
+Still open, and explicitly not claimed here (see the updated
+`docs/DURABILITY.md`): `restrictions`/`replay_nonces`/`replay_proposal_ids`/
+`step_counters` remain unauthenticated; a `live_authority_agents` marker row
+that is *deleted* (not tampered, just absent) is still indistinguishable
+from "never initialized" -- a per-row MAC cannot prove a row used to exist;
+and rollback-to-an-older-database detection remains entirely unimplemented
+(it needs external, host-provided trusted state this repository does not
+ship).
+
+Six of the seven tests in `tests/test_authority_integrity_spec.py` (design
+spec, previously all skipped) are now un-skipped and real:
+`test_tampered_live_authority_row_is_rejected`,
+`test_tampered_row_without_the_key_cannot_forge_a_valid_mac`,
+`test_unauthenticated_store_is_unaffected_by_row_verification`,
+`test_consume_permission_budget_keeps_the_mac_current`,
+`test_replace_live_authority_keeps_the_mac_current`,
+`test_key_rotation_does_not_invalidate_existing_rows`. The remaining four
+(the deleted-marker gap and the three rollback-checkpoint tests) stay
+skipped, unchanged from before. New migration test
+`test_v5_database_upgrades_to_v6_with_mac_columns_usable` (in `tests/
+test_authority_persistence.py`) also asserts a genuine v5-shaped database
+(no mac/key_id columns) upgrades cleanly and that attaching a
+`key_provider` afterwards fails closed on the pre-existing unauthenticated
+row rather than silently trusting it.
+
+215 passed, 5 skipped (was 208/8 before this commit).
+
 ### Added — register_delegation(merge=True) to accumulate authority from multiple delegators
 
 The previous commit documented that `register_delegation` replaces the

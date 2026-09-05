@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -28,7 +29,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Set, Tuple
 
 from .redaction import scrub_pii
 
@@ -98,6 +99,82 @@ class SchemaVersionError(ValueError):
     """Raised when a SQLiteStore database's schema_version is newer than this
     code's SQLiteStore.SCHEMA_VERSION -- opening it would risk misreading or
     corrupting a shape this code has no knowledge of."""
+
+
+class RowIntegrityError(sqlite3.Error):
+    """Raised when a durable row's keyed MAC does not match its own
+    contents, or a row that must be authenticated has no usable MAC/key_id
+    at all (a legacy row from before authentication was enabled, or a
+    key_id no ``KeyProvider.get`` can resolve). This is exactly the
+    keyed-authentication guarantee described in docs/DURABILITY.md: a row
+    edited directly, replaced, or inserted without going through
+    ``SQLiteStore``'s own write API fails verification here.
+
+    Deliberately a subclass of ``sqlite3.Error``: every call site in
+    ``ChainmailGovernor`` that reads durable authority state already wraps
+    the call in ``except sqlite3.Error`` and fails closed (HUMAN,
+    AUTHORITY_STORE_UNAVAILABLE) -- a row that fails its MAC is exactly as
+    untrustworthy as a store that raised a disk-I/O error, so it is treated
+    the same way rather than needing its own exception-handling path
+    threaded through the governor.
+    """
+
+
+class KeyProvider(Protocol):
+    """The external MAC key used to authenticate durable rows (see
+    docs/DURABILITY.md). Never implement this by storing the key inside the
+    same SQLite file it protects -- an environment variable, an OS keyring
+    entry, or an external KMS are the intended sources.
+    """
+
+    def current(self) -> Tuple[str, bytes]:
+        """Return ``(key_id, key_bytes)`` to use for new/refreshed MACs."""
+        ...
+
+    def get(self, key_id: str) -> Optional[bytes]:
+        """Resolve the key bytes previously used under ``key_id`` (so rows
+        written before a rotation still verify). Return ``None`` if this
+        ``key_id`` is unknown -- the caller must treat that as verification
+        failure (fail closed), never as "unauthenticated, trust it"."""
+        ...
+
+
+class InMemoryKeyProvider:
+    """A minimal, process-local ``KeyProvider`` -- keys live only in this
+    object's memory, never written to the SQLite file. Suitable for tests
+    and single-process deployments; a real deployment wanting the key to
+    survive a process restart (so rotated-out keys can still verify old
+    rows) must supply its own ``KeyProvider`` backed by a keyring, env var,
+    or KMS, per docs/DURABILITY.md.
+    """
+
+    def __init__(self, key_id: str, key: bytes) -> None:
+        self._current_id = key_id
+        self._keys: Dict[str, bytes] = {key_id: key}
+
+    def current(self) -> Tuple[str, bytes]:
+        return self._current_id, self._keys[self._current_id]
+
+    def get(self, key_id: str) -> Optional[bytes]:
+        return self._keys.get(key_id)
+
+    def rotate(self, key_id: str, key: bytes) -> None:
+        """Make ``(key_id, key)`` the current signing key. Previously
+        registered key_ids remain resolvable via ``get`` -- rotation must
+        never make an existing, legitimately-unmodified row fail
+        verification (see docs/DURABILITY.md's key-rotation guarantee)."""
+        self._keys[key_id] = key
+        self._current_id = key_id
+
+
+def _row_mac(key: bytes, *parts: Any) -> str:
+    """HMAC-SHA256 over ``parts`` (each rendered as its own field, joined by
+    a separator that cannot appear inside any individual ``str(part)`` for
+    the value types this is called with -- ints, floats, and short
+    identifier strings). Keyed by an external secret held outside the
+    SQLite file (see ``KeyProvider``)."""
+    canonical = "\x1f".join("" if p is None else str(p) for p in parts)
+    return hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 class HashChainLog:
@@ -266,12 +343,30 @@ class SQLiteStore:
     # consume_permission_budget / increment_step_counter). Purely additive
     # over v1-v4; no existing table changes shape, so no data migration is
     # needed for this hop (unlike v2->v3's replay-table rebuild).
-    SCHEMA_VERSION = 5
+    # v6: + live_authority.mac/key_id, live_authority_agents.mac/key_id --
+    # keyed-MAC row authentication for the durable live-authority tables
+    # (see KeyProvider, RowIntegrityError, docs/DURABILITY.md). Purely
+    # additive columns, both nullable: a SQLiteStore opened without a
+    # `key_provider` reads/writes these tables exactly as it did at v5 (mac
+    # and key_id simply stay NULL). This is the first, narrowest slice of
+    # the tamper-detection layer docs/DURABILITY.md describes -- it covers
+    # only live_authority/live_authority_agents, not restrictions or the
+    # replay tables, and it does not address rollback-to-an-older-database
+    # (see docs/DURABILITY.md's "Smallest correct next step" for the
+    # deliberately staged remainder).
+    SCHEMA_VERSION = 6
 
-    def __init__(self, db_path: str = ":memory:", *, synchronous: str = "FULL") -> None:
+    def __init__(self, db_path: str = ":memory:", *, synchronous: str = "FULL",
+                 key_provider: Optional[KeyProvider] = None) -> None:
         if synchronous.upper() not in ("FULL", "NORMAL", "OFF"):
             raise ValueError(f"synchronous must be FULL, NORMAL, or OFF, got {synchronous!r}")
         self.db_path = db_path
+        # Optional: when set, live_authority/live_authority_agents rows are
+        # authenticated with a keyed MAC on every authoritative write and
+        # verified on every read that feeds an authorization decision (see
+        # KeyProvider, RowIntegrityError). None preserves exactly the
+        # unauthenticated schema-v5 behaviour.
+        self._key_provider = key_provider
         # WAL + synchronous=NORMAL is the common performance-oriented combo,
         # but it can still lose the most recently committed transaction(s)
         # on an OS crash or power loss between the WAL write and its
@@ -326,6 +421,7 @@ class SQLiteStore:
                 # the record that must survive a migration.
                 logger.info("migrating SQLiteStore schema %s -> %s", row[0], self.SCHEMA_VERSION)
                 self._rename_pre_v3_replay_tables(c)
+                self._add_v6_mac_columns(c)
                 c.execute("UPDATE schema_version SET version = ?", (self.SCHEMA_VERSION,))
                 migrating = True
             c.execute("""
@@ -476,6 +572,8 @@ class SQLiteStore:
                     deployment_namespace TEXT NOT NULL,
                     agent_id TEXT NOT NULL,
                     initialized_at REAL NOT NULL,
+                    mac TEXT,
+                    key_id TEXT,
                     PRIMARY KEY (deployment_namespace, agent_id)
                 )
             """)
@@ -492,6 +590,8 @@ class SQLiteStore:
                     envelope_fingerprint TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
+                    mac TEXT,
+                    key_id TEXT,
                     UNIQUE (deployment_namespace, agent_id, permission_name, permission_scope)
                 )
             """)
@@ -544,6 +644,21 @@ class SQLiteStore:
             cols = {row[1] for row in c.execute(f"PRAGMA table_info({table})").fetchall()}
             if "scope" in cols:
                 c.execute(f"ALTER TABLE {table} RENAME TO {table}_pre_v3")
+
+    def _add_v6_mac_columns(self, c: sqlite3.Connection) -> None:
+        """Additively add the v6 ``mac``/``key_id`` columns to an
+        existing (pre-v6) ``live_authority``/``live_authority_agents``
+        table. A no-op for a fresh database (created with the columns
+        already present by the ``CREATE TABLE`` statements above) or one
+        already at v6+ (columns already exist)."""
+        for table in ("live_authority_agents", "live_authority"):
+            if not self._table_exists(c, table):
+                continue
+            cols = {row[1] for row in c.execute(f"PRAGMA table_info({table})").fetchall()}
+            if "mac" not in cols:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN mac TEXT")
+            if "key_id" not in cols:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN key_id TEXT")
 
     def _migrate_replay_data_from_v2(self, c: sqlite3.Connection) -> None:
         """Copy claim rows forward from a table renamed by
@@ -889,13 +1004,58 @@ class SQLiteStore:
     # reaches these methods directly, only ChainmailGovernor's own resolved
     # (namespace, agent_id, name, scope) keys do.
 
+    def _signing_key(self) -> Tuple[Optional[str], Optional[bytes]]:
+        """The current ``(key_id, key)`` to MAC new/updated rows with, or
+        ``(None, None)`` when no ``KeyProvider`` is configured (unauthenticated
+        mode -- rows are written with ``mac``/``key_id`` left NULL, exactly
+        the schema-v5 behaviour)."""
+        if self._key_provider is None:
+            return None, None
+        return self._key_provider.current()
+
+    def _verify_mac(self, *, stored_mac: Optional[str], key_id: Optional[str],
+                    parts: Tuple[Any, ...], context: str) -> None:
+        """Recompute the MAC over ``parts`` and compare to ``stored_mac``,
+        raising ``RowIntegrityError`` on any mismatch. No-op if no
+        ``KeyProvider`` is configured -- authentication is opt-in, and an
+        unconfigured store must keep reading rows exactly as schema v5 did.
+        """
+        if self._key_provider is None:
+            return
+        if key_id is None or stored_mac is None:
+            raise RowIntegrityError(
+                f"{context}: keyed authentication is enabled but this row has no "
+                f"mac/key_id (a legacy row from before authentication was enabled, "
+                f"or a row inserted without going through SQLiteStore's write API) "
+                f"-- refusing to trust it"
+            )
+        key = self._key_provider.get(key_id)
+        if key is None:
+            raise RowIntegrityError(
+                f"{context}: no key registered for key_id={key_id!r} -- cannot "
+                f"verify this row's mac; refusing to trust it"
+            )
+        expected = _row_mac(key, *parts)
+        if not hmac.compare_digest(expected, stored_mac):
+            raise RowIntegrityError(
+                f"{context}: mac does not match row contents -- the row was "
+                f"modified outside SQLiteStore's write API"
+            )
+
     def is_authority_initialized(self, *, namespace: str, agent_id: str) -> bool:
         with self._lock:
             row = self._conn.execute(
-                "SELECT 1 FROM live_authority_agents WHERE deployment_namespace = ? "
-                "AND agent_id = ?", (namespace, agent_id),
+                "SELECT initialized_at, mac, key_id FROM live_authority_agents "
+                "WHERE deployment_namespace = ? AND agent_id = ?", (namespace, agent_id),
             ).fetchone()
-            return row is not None
+            if row is None:
+                return False
+            initialized_at, mac, key_id = row
+            self._verify_mac(
+                stored_mac=mac, key_id=key_id, parts=(namespace, agent_id, initialized_at),
+                context=f"live_authority_agents({namespace!r}, {agent_id!r})",
+            )
+            return True
 
     def initialize_agent_authority(self, *, namespace: str, agent_id: str,
                                    permissions: Iterable[Tuple[str, str, Optional[int]]],
@@ -914,23 +1074,30 @@ class SQLiteStore:
         leave a marked-initialized agent with a partial permission set.
         """
         now = time.time()
+        key_id, key = self._signing_key()
         with self._lock:
+            marker_mac = _row_mac(key, namespace, agent_id, now) if key is not None else None
             try:
                 self._conn.execute(
                     "INSERT INTO live_authority_agents (deployment_namespace, agent_id, "
-                    "initialized_at) VALUES (?, ?, ?)", (namespace, agent_id, now),
+                    "initialized_at, mac, key_id) VALUES (?, ?, ?, ?, ?)",
+                    (namespace, agent_id, now, marker_mac, key_id),
                 )
             except sqlite3.IntegrityError:
                 self._conn.rollback()
                 return False
             for name, scope, max_budget in permissions:
+                row_mac = (
+                    _row_mac(key, namespace, agent_id, name, scope, max_budget, max_budget)
+                    if key is not None else None
+                )
                 self._conn.execute(
                     "INSERT INTO live_authority (deployment_namespace, agent_id, "
                     "permission_name, permission_scope, max_budget, remaining, source, "
-                    "envelope_fingerprint, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, 'envelope_ceiling', ?, ?, ?)",
+                    "envelope_fingerprint, created_at, updated_at, mac, key_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'envelope_ceiling', ?, ?, ?, ?, ?)",
                     (namespace, agent_id, name, scope, max_budget, max_budget,
-                     envelope_fingerprint, now, now),
+                     envelope_fingerprint, now, now, row_mac, key_id),
                 )
             self._conn.commit()
             return True
@@ -945,12 +1112,24 @@ class SQLiteStore:
         """
         with self._lock:
             cur = self._conn.execute(
-                "SELECT permission_name, permission_scope, max_budget, remaining "
+                "SELECT permission_name, permission_scope, max_budget, remaining, mac, key_id "
                 "FROM live_authority WHERE deployment_namespace = ? AND agent_id = ?",
                 (namespace, agent_id),
             )
             cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, row)) for row in cur.fetchall()]
+            rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+            for row in rows:
+                self._verify_mac(
+                    stored_mac=row["mac"], key_id=row["key_id"],
+                    parts=(namespace, agent_id, row["permission_name"], row["permission_scope"],
+                           row["max_budget"], row["remaining"]),
+                    context=(
+                        f"live_authority({namespace!r}, {agent_id!r}, "
+                        f"{row['permission_name']!r}, {row['permission_scope']!r})"
+                    ),
+                )
+                del row["mac"], row["key_id"]
+            return rows
 
     def replace_live_authority(self, *, namespace: str, agent_id: str,
                                permissions: Iterable[Tuple[str, str, Optional[int]]],
@@ -965,11 +1144,14 @@ class SQLiteStore:
         re-seeds from the envelope ceiling over this.
         """
         now = time.time()
+        key_id, key = self._signing_key()
         with self._lock:
+            marker_mac = _row_mac(key, namespace, agent_id, now) if key is not None else None
             try:
                 self._conn.execute(
                     "INSERT INTO live_authority_agents (deployment_namespace, agent_id, "
-                    "initialized_at) VALUES (?, ?, ?)", (namespace, agent_id, now),
+                    "initialized_at, mac, key_id) VALUES (?, ?, ?, ?, ?)",
+                    (namespace, agent_id, now, marker_mac, key_id),
                 )
             except sqlite3.IntegrityError:
                 pass  # already initialized -- this call still replaces the rows below
@@ -978,13 +1160,17 @@ class SQLiteStore:
                 (namespace, agent_id),
             )
             for name, scope, max_budget in permissions:
+                row_mac = (
+                    _row_mac(key, namespace, agent_id, name, scope, max_budget, max_budget)
+                    if key is not None else None
+                )
                 self._conn.execute(
                     "INSERT INTO live_authority (deployment_namespace, agent_id, "
                     "permission_name, permission_scope, max_budget, remaining, source, "
-                    "envelope_fingerprint, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "envelope_fingerprint, created_at, updated_at, mac, key_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (namespace, agent_id, name, scope, max_budget, max_budget,
-                     source, envelope_fingerprint, now, now),
+                     source, envelope_fingerprint, now, now, row_mac, key_id),
                 )
             self._conn.commit()
 
@@ -1004,17 +1190,38 @@ class SQLiteStore:
         treat False as "do not proceed" (fail closed), never retry with the
         same amount expecting a different outcome.
         """
+        key_id, key = self._signing_key()
         with self._lock:
+            # RETURNING keeps the mac refresh (below) inside the same
+            # transaction as the consume itself -- both happen under the
+            # single write lock this connection already holds for the
+            # whole call, so no concurrent consumer can observe a row whose
+            # `remaining` was decremented but whose `mac` still reflects
+            # the pre-consume value (which would itself look like tampering
+            # to the next verifying read).
             cur = self._conn.execute(
                 "UPDATE live_authority SET "
                 "remaining = CASE WHEN max_budget IS NULL THEN remaining ELSE remaining - ? END, "
                 "updated_at = ? "
                 "WHERE deployment_namespace = ? AND agent_id = ? AND permission_name = ? "
-                "AND permission_scope = ? AND (max_budget IS NULL OR remaining >= ?)",
+                "AND permission_scope = ? AND (max_budget IS NULL OR remaining >= ?) "
+                "RETURNING id, max_budget, remaining",
                 (amount, time.time(), namespace, agent_id, permission_name, permission_scope, amount),
             )
+            row = cur.fetchone()
+            if row is None:
+                self._conn.commit()
+                return False
+            if key is not None:
+                row_id, max_budget, remaining = row
+                new_mac = _row_mac(key, namespace, agent_id, permission_name, permission_scope,
+                                   max_budget, remaining)
+                self._conn.execute(
+                    "UPDATE live_authority SET mac = ?, key_id = ? WHERE id = ?",
+                    (new_mac, key_id, row_id),
+                )
             self._conn.commit()
-            return bool(cur.rowcount)
+            return True
 
     # -- durable step (runtime) budgets -----------------------------------
 

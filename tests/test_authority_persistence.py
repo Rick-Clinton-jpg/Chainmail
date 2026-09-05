@@ -9,7 +9,7 @@ policy/envelope fingerprint change does not restore consumed authority, a
 long delegation chain cannot launder authority beyond the original root
 ceiling, contextual similarity cannot expand authority, and schema
 migration from v4 leaves v5's new tables usable without disturbing existing
-data.
+data (and v5 -> v6's additive mac/key_id columns are usable the same way).
 """
 
 import sqlite3
@@ -381,8 +381,10 @@ def test_v4_database_upgrades_to_v5_without_disturbing_existing_data(tmp_path):
     store_v4._conn.commit()
     store_v4.close()
 
-    store_v5 = SQLiteStore(db)  # triggers the (no-op, purely additive) v4->v5 hop
-    assert store_v5.SCHEMA_VERSION == 5
+    store_v5 = SQLiteStore(db)  # triggers the (no-op, purely additive) v4->current hop
+    assert store_v5._conn.execute(
+        "SELECT version FROM schema_version"
+    ).fetchone()[0] == SQLiteStore.SCHEMA_VERSION
     # Pre-existing v4 data survived untouched.
     assert store_v5.active_restrictions(namespace="default", agent_id="agent_research")
     assert store_v5.claim_nonce(namespace="default", agent_id="agent_research", nonce="n1") is False
@@ -391,6 +393,71 @@ def test_v4_database_upgrades_to_v5_without_disturbing_existing_data(tmp_path):
     assert store_v5.initialize_agent_authority(
         namespace="default", agent_id="agent_research",
         permissions=[("research", "*", None)], envelope_fingerprint="fp1") is True
+
+
+def test_v5_database_upgrades_to_v6_with_mac_columns_usable(tmp_path):
+    """A v5 database (live_authority/live_authority_agents without mac/
+    key_id columns) upgrades to v6 by adding those columns -- purely
+    additive, no data migration -- and a key_provider attached afterwards
+    can immediately read/write authenticated rows against it."""
+    from chainmail.persistence import InMemoryKeyProvider
+
+    db = str(tmp_path / "chainmail.db")
+    store_v5 = SQLiteStore(db)
+    store_v5.initialize_agent_authority(
+        namespace="default", agent_id="agent_research",
+        permissions=[("research", "*", 5)], envelope_fingerprint="fp1")
+    # Simulate a genuine pre-v6 table shape (no mac/key_id columns yet) --
+    # SQLiteStore always creates the current (v6) shape, so rebuild the
+    # table the way v5 actually left it before the migration this test
+    # exercises existed.
+    store_v5._conn.executescript("""
+        ALTER TABLE live_authority RENAME TO live_authority_v5;
+        CREATE TABLE live_authority (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            deployment_namespace TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            permission_name TEXT NOT NULL,
+            permission_scope TEXT NOT NULL,
+            max_budget INTEGER,
+            remaining INTEGER,
+            source TEXT NOT NULL,
+            envelope_fingerprint TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE (deployment_namespace, agent_id, permission_name, permission_scope)
+        );
+        INSERT INTO live_authority (deployment_namespace, agent_id, permission_name,
+            permission_scope, max_budget, remaining, source, envelope_fingerprint,
+            created_at, updated_at)
+        SELECT deployment_namespace, agent_id, permission_name, permission_scope,
+            max_budget, remaining, source, envelope_fingerprint, created_at, updated_at
+        FROM live_authority_v5;
+        DROP TABLE live_authority_v5;
+    """)
+    store_v5._conn.execute("UPDATE schema_version SET version = 5")
+    store_v5._conn.commit()
+    cols_before = {row[1] for row in
+                   store_v5._conn.execute("PRAGMA table_info(live_authority)").fetchall()}
+    assert "mac" not in cols_before
+    store_v5.close()
+
+    key_provider = InMemoryKeyProvider("k1", b"secret-key-material")
+    store_v6 = SQLiteStore(db, key_provider=key_provider)
+    cols_after = {row[1] for row in
+                  store_v6._conn.execute("PRAGMA table_info(live_authority)").fetchall()}
+    assert {"mac", "key_id"} <= cols_after
+    # Pre-existing v5 row has no mac yet -- reading it with a key_provider
+    # now attached must fail closed, not silently trust an unauthenticated
+    # legacy row now that authentication is turned on.
+    with pytest.raises(sqlite3.Error):
+        store_v6.get_live_authority_rows(namespace="default", agent_id="agent_research")
+    # A freshly written row is authenticated and readable.
+    store_v6.replace_live_authority(
+        namespace="default", agent_id="agent_research",
+        permissions=[("research", "*", 5)], source="delegation", envelope_fingerprint="fp2")
+    rows = store_v6.get_live_authority_rows(namespace="default", agent_id="agent_research")
+    assert rows[0]["remaining"] == 5
 
 
 # -- freshness rule: no previously-resolved Authority reused across hops/decisions --

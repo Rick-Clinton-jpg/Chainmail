@@ -59,13 +59,20 @@ adversarial mutation harness challenges the boundary on every CI run.
   option. Multi-process quorum and KMS-backed keys are tracked for v6.
 - **No formal proof.** The no-authority-laundering property is tested by example
   and challenged by the mutation harness, not proven.
-- **No tamper-rollback detection yet.** A `SQLiteStore`'s hash chain (via
-  `HashChainLog`) detects insertion/deletion/edits to the *append-only audit
-  log*, but nothing here detects a whole-database swap back to an earlier,
-  internally-valid `SQLiteStore` file (a "replace with yesterday's backup"
-  attack) -- that requires a host-held secret and an external monotonic
-  checkpoint outside SQLite itself, which is not implemented. See
-  `docs/DURABILITY.md` for the design and why it is a separate piece of work.
+- **Row-level tamper detection for live authority only, no rollback
+  detection.** `SQLiteStore(key_provider=...)` (schema v6) authenticates
+  `live_authority`/`live_authority_agents` rows with a keyed HMAC, detecting
+  a row edited, replaced, or inserted outside `SQLiteStore`'s own write API
+  -- but `restrictions`, the replay tables, and `step_counters` are not yet
+  covered, a deleted (not tampered) initialization-marker row is still
+  indistinguishable from "never initialized", and nothing here detects a
+  whole-database swap back to an earlier, internally-valid `SQLiteStore`
+  file (a "replace with yesterday's backup" attack) -- that requires a
+  host-held secret and an external monotonic checkpoint outside SQLite
+  itself, which is not implemented. `HashChainLog`'s hash chain remains the
+  only tamper-evidence for the *append-only audit log*, unrelated to this.
+  See `docs/DURABILITY.md` for the design, what's implemented so far, and
+  why the remainder is a separate piece of work.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full list of fixes. The v4 code is
 under [`legacy/`](legacy/) and is unmaintained.
@@ -352,8 +359,9 @@ depends on, stated precisely:
   which always names exactly what's still in-memory-only for a given
   governor instance.
 * **What durability does *not* mean.** Durable and atomic is not the same as
-  tamper-evident against a whole-file rollback. See "No tamper-rollback
-  detection yet" above and `docs/DURABILITY.md`.
+  tamper-evident against direct row edits (partially closed, see "Row-level
+  tamper detection..." above) or against a whole-file rollback (still open).
+  See `docs/DURABILITY.md`.
 
 Development mode (no `SQLiteStore`, or `GovernorConfig()` instead of
 `GovernorConfig.production()`) trades all of this away for a simpler local
@@ -547,7 +555,7 @@ copyright holder.
 | Must | Network quorum transport (Raft / PBFT) with real peer governors |
 | Must | mTLS / SPIFFE identity for the service instead of shared/per-caller tokens |
 | Must | Durable STEP_BUDGET-policy restriction budgets and `provenance` (`live_authority`, permission budgets, and fleet/per-agent step budgets are durable as of schema v5 — see "Durability" above) |
-| Must | Keyed row authentication and a host-external rollback checkpoint for the durable-authority store (design in `docs/DURABILITY.md`, not yet implemented) |
+| Must | Keyed row authentication for the rest of the durable-authority store (`restrictions`, replay tables, `step_counters`) and a host-external rollback checkpoint (`live_authority`/`live_authority_agents` row authentication is done as of storage schema v6 — see `docs/DURABILITY.md`) |
 | Should | Encrypted key material at rest in `KeyRegistry`; HSM/KMS backend |
 | Should | Formal TLA+ model of the delegation invariants |
 | Should | Wall-clock fleet budgets and sliding-window rate limits |
